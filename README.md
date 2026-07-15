@@ -1,5 +1,7 @@
 # Codex History Suite
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 Codex History Suite turns local Codex transcripts into a portable, evidence-first knowledge base. One core engine powers two Codex Skills:
 
 - `build-codex-history`: initialize, discover, plan, build, incrementally update, audit, migrate, repair, and back up.
@@ -7,7 +9,7 @@ Codex History Suite turns local Codex transcripts into a portable, evidence-firs
 
 The builder never edits source transcripts. It snapshots them into fixed-size content-addressed chunks, externalizes inline images into an artifact CAS, preserves canonical raw events, derives turns and Evidence, builds SQLite FTS and optional Chroma embeddings, audits the staging database, and atomically promotes `active.json` only after success.
 
-For installation and first-use instructions intended for end users, see [QUICKSTART.zh-CN.md](QUICKSTART.zh-CN.md).
+For a more detailed Chinese installation and first-use guide, see [QUICKSTART.zh-CN.md](QUICKSTART.zh-CN.md).
 
 ## Install The Plugin
 
