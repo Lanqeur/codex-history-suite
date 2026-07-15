@@ -51,6 +51,26 @@ _SEMANTIC_COLLECTION_CACHE: dict[str, Any] = {}
 _SEMANTIC_WARNING_SHOWN = False
 
 
+def _environment_path_mappings() -> list[dict[str, str]]:
+    try:
+        value = json.loads(os.environ.get("CODEX_HISTORY_PATH_MAPPINGS", "[]"))
+    except json.JSONDecodeError:
+        return []
+    return [
+        {
+            "original_prefix": str(item.get("original_prefix") or ""),
+            "local_prefix": str(item.get("local_prefix") or ""),
+        }
+        for item in value
+        if isinstance(item, dict)
+        and item.get("original_prefix")
+        and item.get("local_prefix")
+    ]
+
+
+PATH_MAPPINGS = _environment_path_mappings()
+
+
 def compact_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -64,6 +84,55 @@ def truncate(text: str, limit: int) -> str:
 
 def parse_json(value: str) -> Any:
     return json.loads(value) if value else None
+
+
+def remap_path(value: str) -> tuple[str, str | None]:
+    if not value:
+        return value, None
+    normalized = value.replace("\\", "/")
+    best: tuple[int, str, str] | None = None
+    for mapping in PATH_MAPPINGS:
+        original = mapping["original_prefix"]
+        local = mapping["local_prefix"]
+        candidate = original.replace("\\", "/")
+        case_insensitive = bool(re.match(r"^[A-Za-z]:/", candidate))
+        source_value = normalized.casefold() if case_insensitive else normalized
+        source_prefix = candidate.casefold() if case_insensitive else candidate
+        if source_value == source_prefix or source_value.startswith(source_prefix.rstrip("/") + "/"):
+            match = (len(candidate), candidate, local)
+            if best is None or match[0] >= best[0]:
+                best = match
+    if best is None:
+        return value, None
+    suffix = normalized[len(best[1]) :].lstrip("/")
+    mapped = str(Path(best[2]) / Path(suffix)) if suffix else best[2]
+    return mapped, value
+
+
+def remap_path_fields(value: Any) -> Any:
+    path_keys = {
+        "path",
+        "source_path",
+        "source_open_path",
+        "queue_path",
+        "manifest_path",
+        "overview_path",
+        "ledger_path",
+    }
+    if isinstance(value, list):
+        return [remap_path_fields(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    result = dict(value)
+    for key, item in list(result.items()):
+        if key in path_keys and isinstance(item, str):
+            mapped, original = remap_path(item)
+            result[key] = mapped
+            if original is not None:
+                result[f"{key}_original"] = original
+        elif isinstance(item, (dict, list)):
+            result[key] = remap_path_fields(item)
+    return result
 
 
 def connect(path: Path) -> sqlite3.Connection:
@@ -205,7 +274,7 @@ def decode_knowledge(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     value["evidence_refs"] = parse_json(value.pop("evidence_refs_json")) or []
     value["metadata"] = parse_json(value.pop("metadata_json")) or {}
     value.pop("rank", None)
-    return value
+    return remap_path_fields(value)
 
 
 def sql_filters(
@@ -301,7 +370,16 @@ def semantic_row_scores(
             if str(row["trigger_text"]).casefold() in query.casefold()
         ]
         semantic_query = " ".join([query.strip(), *hints]).strip()
-        cache_key = hashlib.sha256(semantic_query.encode("utf-8")).hexdigest()
+        cache_key = hashlib.sha256(
+            "\x1f".join(
+                (
+                    semantic_query,
+                    SEMANTIC_MODEL,
+                    str(SEMANTIC_DIMENSIONS),
+                    os.environ.get("CODEX_HISTORY_EMBEDDING_ENDPOINT", ""),
+                )
+            ).encode("utf-8")
+        ).hexdigest()
         vector = _QUERY_VECTOR_CACHE.get(cache_key)
         if vector is None:
             vector = query_embedding(semantic_query)
@@ -1051,6 +1129,7 @@ def command_trace(args: argparse.Namespace, connection: sqlite3.Connection) -> i
         occurrences[item["evidence_id"]] = evidence_occurrences(
             connection, item["evidence_id"]
         )
+    raw_sources = remap_path_fields(raw_sources)
 
     if args.json:
         print(
@@ -1213,7 +1292,7 @@ def command_artifacts(args: argparse.Namespace, connection: sqlite3.Connection) 
             """,
             [*(f"%{term}%" for term in terms), args.limit],
         ).fetchall()
-    artifacts = [dict(row) for row in rows]
+    artifacts = [remap_path_fields(dict(row)) for row in rows]
     for row in artifacts:
         row.pop("rank", None)
 
@@ -1224,7 +1303,7 @@ def command_artifacts(args: argparse.Namespace, connection: sqlite3.Connection) 
         ledger_params.extend(args.scope)
     ledger_params.append(args.limit)
     ledger_rows = [
-        dict(row)
+        remap_path_fields(dict(row))
         for row in connection.execute(
             f"SELECT * FROM ledger_artifacts WHERE {' AND '.join(ledger_filters)} "
             "ORDER BY scope_id,ref LIMIT ?",

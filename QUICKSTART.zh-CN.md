@@ -139,7 +139,28 @@ py -3 -m pip install ".[semantic]"
 
 不要把生成后的数据库、CAS 或 transcript 和插件 ZIP 一起转发。它们属于个人数据，插件本身不需要这些内容即可在另一台电脑重新建库。
 
-## 9. 更新插件
+## 9. 多设备迁移与合并
+
+先给每台设备设置名称并导出完整 bundle：
+
+```bash
+python3 scripts/codex_history.py library device --name '工作笔记本' --json
+python3 scripts/codex_history.py --profile default library export D:\CodexHistory\work-laptop.zip --json
+```
+
+在另一台设备导入后，系统会自动命名并做完整 SHA-256 校验：
+
+```bash
+python3 scripts/codex_history.py library import D:\CodexHistory\work-laptop.zip --json
+python3 scripts/codex_history.py library list --json
+python3 scripts/codex_history.py library search '项目 决策' --deep --json
+```
+
+联合检索不会重建数据，适合先直接使用。确实需要一个统一知识库时，再运行 `library merge`；第一次不要加 `--build`，先审阅返回的冲突分类、Token、费用和磁盘计划。确认后再用 `--build --max-cost-cny N`。两个来源 profile 始终保持不变。
+
+需要让两台设备得到同一份合并库时，使用 `library sync` 导出收敛 bundle，并把同一个 bundle 分别导入两端。后续重复同步会按稳定 library ID 更新导入版本，旧版保存在 `backups/imports`。完整说明见[多设备参考](skills/build-codex-history/references/multi-device.md)。
+
+## 10. 更新插件
 
 GitHub marketplace 安装可执行：
 

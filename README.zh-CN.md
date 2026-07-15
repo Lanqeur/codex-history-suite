@@ -5,7 +5,7 @@
 Codex History Suite 将本地 Codex 会话记录提炼成可移植、证据优先的知识库。两个 Codex Skill 共用同一个核心引擎：
 
 - `build-codex-history`：初始化、发现、规划、完整建库、增量更新、审计、迁移、修复与备份。
-- `codex-history`：只读的渐进式检索、上下文组装、claim 检查、证据回溯、比较和历史文件查询。
+- `codex-history`：只读的渐进式与联合检索、上下文组装、claim 检查、证据回溯、比较和历史文件查询。
 
 构建器不会修改源 transcript。它会把会话切成固定大小的内容寻址快照，将内联图片外置到 artifact CAS，保留规范化原始事件，派生 turn 和 Evidence，建立 SQLite FTS 与可选的 Chroma embedding，并在暂存数据库通过审计后才原子更新 `active.json`。
 
@@ -57,6 +57,36 @@ python3 scripts/codex_history.py plan --mode full --json
 `plan` 和 `update --dry-run` 会统计 transcript 总体积、新增或需要重处理的字节数、摘要输入的期望值与保守上限、缓存输入、输出和 embedding Token、期望成本与保守成本上限，并把预计磁盘体积分解为 snapshot、SQLite、artifact CAS、语义索引和模型响应缓存。内联 data-URI base64 会被扫描并从模型 Token 估算中排除，但仍计入 snapshot 存储估算。即使 `auto` 因缺少 Key 而回退，报告仍会给出“启用模型后”的潜在成本，因此估价本身不需要 API Key。
 
 构建完成后，返回结果还会提供实际 `usage` 汇总，包括模型输入、模型提供商缓存输入、输出、embedding Token、Codex History 响应缓存命中和人民币成本；`storage` 则同时给出 active 核心组件与保留历史 build 后整个 profile 的真实占用。
+
+## 多设备知识库
+
+v0.3 增加了带完整校验的 library bundle 和非破坏式多设备工作流。先给每台电脑设置稳定身份，再导出 active profile；这些 bundle 可以导入任一电脑，也可以统一导入一台中转设备：
+
+```bash
+python3 scripts/codex_history.py library device --name '工作笔记本' --json
+python3 scripts/codex_history.py --profile default library export ~/work-laptop.zip --json
+python3 scripts/codex_history.py library import ~/work-laptop.zip --json
+python3 scripts/codex_history.py library list --json
+python3 scripts/codex_history.py library search '发布 决策' --deep --json
+```
+
+导入 profile 默认按“来源设备名 + 原 profile 名”自动命名，重名时自动追加数字。稳定的 `library_id` 会识别同一个设备库的后续版本：新 bundle 会更新对应 profile，同时把旧代保存在 `backups/imports`。bundle 内每个文件都执行 SHA-256 校验，并拒绝危险压缩路径；不可变 transcript chunk、artifact、语义索引和模型缓存会进入全局内容寻址 blob 仓库，在文件系统允许时通过硬链接实现物理去重。
+
+联合检索会同时查询多个独立的 SQLite/Chroma 权威库，按知识内容折叠完全重复项，并保留所有命中的 profile 和 Record ID。它不重建知识库，可以导入后立刻使用。合并则是另一件事：系统按稳定 thread ID 重建 transcript，依次采用完全相同、最长前缀或确定性事件并集策略，将结果写入新的生成 profile，两个来源库都不会被修改：
+
+```bash
+python3 scripts/codex_history.py library merge \
+  --from work-laptop-default --from desktop-default \
+  --as personal-history --json
+# 先审阅返回的 full plan，再允许模型调用：
+python3 scripts/codex_history.py library merge \
+  --from work-laptop-default --from desktop-default \
+  --as personal-history --build --max-cost-cny 30 --json
+```
+
+`library sync` 会完成合并、构建并导出一份收敛 bundle；将同一个 bundle 导入两台设备即可完成离线双向收敛。重复导入和重复合并会按 library lineage 与内容摘要保持幂等。历史绝对路径仍作为证据保留，自动生成的文件/根路径映射和可选 `--path-map 'OLD=NEW'` 会在查询显示层提供本机可访问路径，不会篡改原始 provenance。
+
+完整 bundle 格式、冲突规则、离线双向同步和恢复流程见[多设备参考](skills/build-codex-history/references/multi-device.md)。
 
 安装 `.[semantic]` 可启用 ChromaDB。模型摘要和语义检索相互独立：模型优先摘要可继续搭配 SQLite 词法检索，Chroma 可按需单独启用。
 

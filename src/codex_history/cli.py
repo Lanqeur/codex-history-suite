@@ -119,6 +119,75 @@ def _management_parser() -> argparse.ArgumentParser:
     backup = subparsers.add_parser("backup", help="copy the active database and active manifest")
     backup.add_argument("destination", type=Path)
     backup.add_argument("--json", action="store_true")
+
+    library = subparsers.add_parser(
+        "library", help="move, search, deduplicate, merge, and synchronize device libraries"
+    )
+    library_commands = library.add_subparsers(dest="library_command", required=True)
+
+    device = library_commands.add_parser("device", help="show or name this device identity")
+    device.add_argument("--name", default="")
+    device.add_argument("--json", action="store_true")
+
+    library_list = library_commands.add_parser("list", help="list local and imported libraries")
+    library_list.add_argument("--json", action="store_true")
+
+    library_export = library_commands.add_parser(
+        "export", help="export a verified, portable library bundle"
+    )
+    library_export.add_argument("destination", type=Path)
+    library_export.add_argument("--without-semantic", action="store_true")
+    library_export.add_argument("--without-model-cache", action="store_true")
+    library_export.add_argument("--json", action="store_true")
+
+    library_import = library_commands.add_parser(
+        "import", help="verify and import a device library with automatic naming"
+    )
+    library_import.add_argument("bundle", type=Path)
+    library_import.add_argument("--as", dest="as_name", default="")
+    library_import.add_argument(
+        "--path-map", action="append", default=[], metavar="OLD=NEW",
+        help="add a display-time absolute path prefix mapping; repeatable",
+    )
+    library_import.add_argument("--json", action="store_true")
+
+    library_verify = library_commands.add_parser("verify", help="verify every bundled file hash")
+    library_verify.add_argument("bundle", type=Path)
+    library_verify.add_argument("--json", action="store_true")
+
+    library_search = library_commands.add_parser(
+        "search", help="search multiple libraries and collapse duplicate knowledge"
+    )
+    library_search.add_argument("query")
+    library_search.add_argument("--from", dest="source_profiles", action="append", default=[])
+    library_search.add_argument("--limit", type=int, default=10)
+    library_search.add_argument("--deep", action="store_true")
+    library_search.add_argument("--retrieval", choices=("lexical", "hybrid", "semantic"), default="hybrid")
+    library_search.add_argument("--all", dest="query_mode", action="store_const", const="all")
+    library_search.set_defaults(query_mode="any")
+    library_search.add_argument("--since", default="")
+    library_search.add_argument("--until", default="")
+    library_search.add_argument("--time-match", choices=("overlaps", "contained"), default="overlaps")
+    library_search.add_argument("--as-of", default="")
+    library_search.add_argument("--json", action="store_true")
+
+    library_merge = library_commands.add_parser(
+        "merge", help="materialize an idempotent, non-destructive merged profile"
+    )
+    library_merge.add_argument("--from", dest="source_profiles", action="append", required=True)
+    library_merge.add_argument("--as", dest="as_name", default="merged-history")
+    library_merge.add_argument("--build", action="store_true")
+    library_merge.add_argument("--max-cost-cny", type=float, default=None)
+    library_merge.add_argument("--json", action="store_true")
+
+    library_sync = library_commands.add_parser(
+        "sync", help="merge, build, and export one convergence bundle for both devices"
+    )
+    library_sync.add_argument("destination", type=Path)
+    library_sync.add_argument("--from", dest="source_profiles", action="append", required=True)
+    library_sync.add_argument("--as", dest="as_name", default="shared-history")
+    library_sync.add_argument("--max-cost-cny", type=float, default=None)
+    library_sync.add_argument("--json", action="store_true")
     return parser
 
 
@@ -328,7 +397,19 @@ def _query_main(
         config.embedding_input_price_cny
     )
     os.environ["CODEX_HISTORY_EMBEDDING_ENV_FILE"] = config.embedding_env_file
+    os.environ["CODEX_HISTORY_PATH_MAPPINGS"] = json.dumps(
+        [
+            {"original_prefix": old, "local_prefix": new}
+            for old, new in config.path_mappings
+        ],
+        ensure_ascii=False,
+    )
     from . import query
+
+    query.PATH_MAPPINGS = [
+        {"original_prefix": old, "local_prefix": new}
+        for old, new in config.path_mappings
+    ]
 
     return query.main(["--db", str(database), *argv])
 
@@ -413,6 +494,110 @@ def main(argv: list[str] | None = None) -> int:
             as_json=args.json,
         )
         return 0
+
+    if args.command == "library":
+        from .library import (
+            configure_device,
+            export_library,
+            federated_search,
+            import_library,
+            list_libraries,
+            merge_libraries,
+            sync_libraries,
+            verify_bundle,
+        )
+
+        if args.library_command == "device":
+            _print(configure_device(home, args.name), as_json=args.json)
+            return 0
+        if args.library_command == "list":
+            _print(list_libraries(home), as_json=args.json)
+            return 0
+        if args.library_command == "verify":
+            value = verify_bundle(args.bundle)
+            _print(value, as_json=args.json)
+            return 0 if value["passed"] else 2
+        if args.library_command == "import":
+            mappings: list[tuple[str, str]] = []
+            for value in args.path_map:
+                if "=" not in value:
+                    raise SystemExit("--path-map must use OLD=NEW")
+                old, new = value.split("=", 1)
+                if not old or not new:
+                    raise SystemExit("--path-map must use non-empty OLD=NEW values")
+                mappings.append((old, new))
+            _print(
+                import_library(home, args.bundle, as_name=args.as_name, path_mappings=mappings),
+                as_json=args.json,
+            )
+            return 0
+        if args.library_command == "export":
+            config = load_config(home, args.profile)
+            _print(
+                export_library(
+                    config,
+                    args.destination,
+                    include_semantic=not args.without_semantic,
+                    include_model_cache=not args.without_model_cache,
+                ),
+                as_json=args.json,
+            )
+            return 0
+        if args.library_command == "search":
+            value = federated_search(
+                home,
+                args.query,
+                profiles=args.source_profiles,
+                limit=args.limit,
+                deep=args.deep,
+                retrieval=args.retrieval,
+                query_mode=args.query_mode,
+                since=args.since,
+                until=args.until,
+                time_match=args.time_match,
+                as_of=args.as_of,
+            )
+            if args.json:
+                _print(value, as_json=True)
+            else:
+                print(
+                    f"Searched {value['profile_count']} libraries; "
+                    f"{value['duplicates_collapsed']} duplicate matches collapsed."
+                )
+                for index, row in enumerate(value["results"], 1):
+                    profiles = ", ".join(
+                        sorted({item["profile"] for item in row["library_matches"]})
+                    )
+                    print(
+                        f"{index}. [{row['tier']} | {row['status_group']}] "
+                        f"{row['text']}\n   Libraries: {profiles}"
+                    )
+            return 0
+        if args.library_command == "merge":
+            _print(
+                merge_libraries(
+                    home,
+                    args.source_profiles,
+                    as_name=args.as_name,
+                    build=args.build,
+                    max_cost_cny=args.max_cost_cny,
+                ),
+                as_json=args.json,
+            )
+            return 0
+        if args.library_command == "sync":
+            _print(
+                sync_libraries(
+                    home,
+                    args.source_profiles,
+                    args.destination,
+                    as_name=args.as_name,
+                    max_cost_cny=args.max_cost_cny,
+                ),
+                as_json=args.json,
+            )
+            return 0
+        raise AssertionError(args.library_command)
 
     config = load_config(home, args.profile)
     _maybe_reexec_runtime(config, argv)

@@ -5,7 +5,7 @@
 Codex History Suite turns local Codex transcripts into a portable, evidence-first knowledge base. One core engine powers two Codex Skills:
 
 - `build-codex-history`: initialize, discover, plan, build, incrementally update, audit, migrate, repair, and back up.
-- `codex-history`: read-only progressive search, context assembly, claim inspection, evidence trace, comparison, and artifact lookup.
+- `codex-history`: read-only progressive and federated search, context assembly, claim inspection, evidence trace, comparison, and artifact lookup.
 
 The builder never edits source transcripts. It snapshots them into fixed-size content-addressed chunks, externalizes inline images into an artifact CAS, preserves canonical raw events, derives turns and Evidence, builds SQLite FTS and optional Chroma embeddings, audits the staging database, and atomically promotes `active.json` only after success.
 
@@ -57,6 +57,36 @@ The generated prices are editable planning inputs. As of 2026-07-15, Alibaba Clo
 `plan` and `update --dry-run` report transcript bytes, new/reprocessed bytes, expected and upper summary tokens, expected cached input, output and embedding tokens, expected and conservative CNY cost, and a low/expected/upper disk estimate split into snapshots, SQLite, artifact CAS, semantic index, and model-response cache. Inline data-URI base64 payloads are scanned and excluded from model-token estimates while remaining in snapshot storage estimates. The report still shows the potential model cost when `auto` has fallen back, so a key is not required just to budget a build.
 
 Completed builds return an actual `usage` summary for model input, provider-cached input, output, embedding tokens, response-cache hits, and CNY cost, plus `storage` totals for the active core components and the whole retained profile.
+
+## Multiple Devices
+
+Version 0.3 adds a verified library bundle and non-destructive multi-device workflow. Give each machine a stable identity, export its active profile, and import both bundles on either machine or on a separate hub:
+
+```bash
+python3 scripts/codex_history.py library device --name 'Work laptop' --json
+python3 scripts/codex_history.py --profile default library export ~/work-laptop.zip --json
+python3 scripts/codex_history.py library import ~/work-laptop.zip --json
+python3 scripts/codex_history.py library list --json
+python3 scripts/codex_history.py library search 'release decision' --deep --json
+```
+
+Imported profiles are named from the source device and profile, with collision suffixes added automatically. A stable `library_id` recognizes later generations of the same library; a newer import updates that profile while preserving the prior generation under `backups/imports`. Every bundle entry is verified with SHA-256, unsafe archive paths are rejected, and immutable transcript chunks, artifacts, semantic files, and model-cache entries share a global content-addressed blob store through hard links when the filesystem permits it.
+
+Federated search queries independent SQLite/Chroma authorities and collapses exact knowledge duplicates while retaining every matching profile and Record ID. It is immediately useful and does not rebuild anything. A merge is different: it reconstructs transcript snapshots by stable thread ID, chooses exact or longest-prefix variants, performs a deterministic event union for divergent copies, and writes a new generated profile without changing either source:
+
+```bash
+python3 scripts/codex_history.py library merge \
+  --from work-laptop-default --from desktop-default \
+  --as personal-history --json
+# Review the returned full plan before allowing model work:
+python3 scripts/codex_history.py library merge \
+  --from work-laptop-default --from desktop-default \
+  --as personal-history --build --max-cost-cny 30 --json
+```
+
+`library sync` performs the merge/build and exports one convergence bundle. Import that same bundle on both devices. Repeated imports and merges are idempotent by library lineage and content digest. Absolute paths remain in provenance; automatic exact-file/root mappings and optional `--path-map 'OLD=NEW'` mappings expose usable local paths at query time without rewriting historical evidence.
+
+See [the multi-device reference](skills/build-codex-history/references/multi-device.md) for the bundle format, conflict rules, offline two-way synchronization, and recovery procedure.
 
 Install `.[semantic]` to enable ChromaDB. Model summarization and semantic retrieval are independent: the recommended model-first summaries work with lexical SQLite retrieval, while Chroma can be enabled separately.
 

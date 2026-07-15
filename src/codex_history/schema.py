@@ -7,7 +7,7 @@ from .util import utc_now
 
 
 SCHEMA_NAME = "codex-history-suite"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 BASE_SCHEMA = r"""
@@ -464,6 +464,16 @@ CREATE TABLE IF NOT EXISTS source_checkpoints(
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS path_mappings(
+    mapping_id TEXT PRIMARY KEY,
+    original_prefix TEXT NOT NULL,
+    local_prefix TEXT NOT NULL,
+    mapping_kind TEXT NOT NULL DEFAULT 'prefix',
+    source_device_id TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    UNIQUE(original_prefix,local_prefix,source_device_id)
+);
+
 CREATE TABLE IF NOT EXISTS pending_turns(
     thread_id TEXT NOT NULL,
     turn_id TEXT NOT NULL,
@@ -636,7 +646,7 @@ def initialize(connection: sqlite3.Connection) -> None:
     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     connection.execute(
         "INSERT OR IGNORE INTO schema_migrations(version,applied_at,description) VALUES(?,?,?)",
-        (SCHEMA_VERSION, utc_now(), "Initial portable Codex History Suite schema"),
+        (SCHEMA_VERSION, utc_now(), "Add portable library path mappings"),
     )
     values = {
         "schema_name": SCHEMA_NAME,

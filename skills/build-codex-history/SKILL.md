@@ -1,6 +1,6 @@
 ---
 name: build-codex-history
-description: Initialize, discover, cost-plan, build, incrementally update, audit, repair, back up, or migrate a local Codex History knowledge base. Use when the user explicitly wants to create or maintain the evidence-first database from Codex CLI, IDE, or desktop transcripts on Windows, WSL, macOS, or Linux. This skill performs stateful operations and model calls only after a dry-run and an explicit cost limit.
+description: Initialize, discover, cost-plan, build, incrementally update, audit, repair, migrate, export, import, deduplicate, merge, or synchronize local Codex History knowledge bases. Use when the user wants to create, maintain, move, or combine evidence-first databases from Codex CLI, IDE, or desktop transcripts on Windows, WSL, macOS, or Linux. This skill performs stateful operations and model calls only after a dry-run and an explicit cost limit.
 ---
 
 # Build Codex History
@@ -45,5 +45,17 @@ Use `migrate --from-db PATH` for an existing v2.1/v2.1.1 SQLite authority. Migra
 Use `status` to inspect failed stages. Use `repair` only after reading [references/recovery.md](references/recovery.md). Never delete the last passing build or clear a lock while a process is alive.
 
 Read [references/configuration.md](references/configuration.md) when configuring model providers, embeddings, WSL storage, or multiple profiles. Read [references/lifecycle.md](references/lifecycle.md) when diagnosing change classification, checkpoints, promotion, or equivalence.
+
+## Device Libraries
+
+Use `library device`, `library export`, `library import`, and `library verify` for portable device libraries. Never treat the old `backup` command as a complete portable export; it contains only SQLite and the active manifest.
+
+Use `library search` when the user wants immediate cross-device retrieval without rebuilding. It preserves independent authorities and collapses exact duplicate knowledge while returning every source profile and Record ID.
+
+Use `library merge` only after explaining that it creates or updates a separate generated profile. Run it without `--build` first and report the transcript merge methods plus the returned full/incremental cost plan. Add `--build --max-cost-cny N` only after explicit approval. Never modify either source profile.
+
+Use `library sync DESTINATION --from A --from B` when the user wants offline two-way convergence. It produces one merged, audited bundle; the same bundle must be imported on both devices. A later bundle with the same stable `library_id` updates the imported generation and preserves the previous one under `backups/imports`.
+
+Read [references/multi-device.md](references/multi-device.md) before handling divergent transcript copies, path mappings, repeated synchronization, or import recovery.
 
 `auto` may fall back only when required model configuration or the API key is absent. A provider error, malformed response, exhausted budget, or interrupted request must fail the staging build rather than silently replacing model output with extractive output.

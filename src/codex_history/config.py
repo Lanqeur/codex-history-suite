@@ -5,9 +5,9 @@ import sys
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
-from .util import atomic_write_text
+from .util import atomic_write_text, read_json
 
 
 CONFIG_SCHEMA_VERSION = 1
@@ -102,6 +102,7 @@ class ProfileConfig:
     artifact_capture_paths: bool = False
     artifact_max_file_bytes: int = 100 * 1024 * 1024
     runtime_python: str = ""
+    path_mappings: tuple[tuple[str, str], ...] = ()
 
     @property
     def root(self) -> Path:
@@ -142,6 +143,10 @@ class ProfileConfig:
 
 def config_path(home: Path) -> Path:
     return home / "config.toml"
+
+
+def catalog_path(home: Path) -> Path:
+    return home / "catalog.json"
 
 
 def _toml_string(value: str) -> str:
@@ -210,25 +215,25 @@ python = ""
     return path
 
 
-def load_config(home: Path | None = None, profile: str | None = None) -> ProfileConfig:
-    home = (home or default_data_home()).expanduser().resolve()
-    path = config_path(home)
-    if not path.exists():
-        raise FileNotFoundError(f"Codex History is not initialized: {path}")
-    raw = tomllib.loads(path.read_text(encoding="utf-8"))
-    if raw.get("schema_version") != CONFIG_SCHEMA_VERSION:
-        raise ValueError(f"Unsupported config schema: {raw.get('schema_version')}")
-    profile = profile or raw.get("active_profile", "default")
-    profiles = raw.get("profiles", {})
-    if profile not in profiles:
-        raise KeyError(f"Unknown profile: {profile}")
-    item = profiles[profile]
+def _profile_from_item(home: Path, profile: str, item: Mapping[str, Any]) -> ProfileConfig:
     summary = item.get("summarization", {})
     estimation = item.get("estimation", {})
     embedding = item.get("embedding", {})
     artifacts = item.get("artifacts", {})
     runtime = item.get("runtime", {})
+    mappings = item.get("path_mappings", [])
     roots = tuple(Path(value).expanduser() for value in item.get("source_roots", []))
+    parsed_mappings: list[tuple[str, str]] = []
+    for mapping in mappings:
+        if isinstance(mapping, dict):
+            original = str(mapping.get("original_prefix") or "")
+            local = str(mapping.get("local_prefix") or "")
+        elif isinstance(mapping, (list, tuple)) and len(mapping) == 2:
+            original, local = str(mapping[0]), str(mapping[1])
+        else:
+            continue
+        if original and local:
+            parsed_mappings.append((original, local))
     config = ProfileConfig(
         home=home,
         name=profile,
@@ -277,9 +282,54 @@ def load_config(home: Path | None = None, profile: str | None = None) -> Profile
         artifact_capture_paths=bool(artifacts.get("capture_existing_paths", False)),
         artifact_max_file_bytes=int(artifacts.get("max_file_bytes", 100 * 1024 * 1024)),
         runtime_python=str(runtime.get("python", "")),
+        path_mappings=tuple(parsed_mappings),
     )
     _validate_profile(config)
     return config
+
+
+def profile_names(home: Path | None = None) -> list[str]:
+    home = (home or default_data_home()).expanduser().resolve()
+    names: set[str] = set()
+    path = config_path(home)
+    if path.exists():
+        raw = tomllib.loads(path.read_text(encoding="utf-8"))
+        names.update(str(name) for name in raw.get("profiles", {}))
+    catalog = read_json(catalog_path(home), {}) or {}
+    names.update(
+        str(name)
+        for name, item in catalog.get("profiles", {}).items()
+        if item.get("enabled", True)
+    )
+    return sorted(names)
+
+
+def load_config(home: Path | None = None, profile: str | None = None) -> ProfileConfig:
+    home = (home or default_data_home()).expanduser().resolve()
+    path = config_path(home)
+    raw: dict[str, Any] = {}
+    if path.exists():
+        raw = tomllib.loads(path.read_text(encoding="utf-8"))
+        if raw.get("schema_version") != CONFIG_SCHEMA_VERSION:
+            raise ValueError(f"Unsupported config schema: {raw.get('schema_version')}")
+    catalog = read_json(catalog_path(home), {}) or {}
+    if not raw and not catalog:
+        raise FileNotFoundError(f"Codex History is not initialized: {path}")
+    profile = profile or raw.get("active_profile")
+    if not profile:
+        enabled = [
+            name
+            for name, item in catalog.get("profiles", {}).items()
+            if item.get("enabled", True)
+        ]
+        profile = sorted(enabled)[0] if enabled else "default"
+    profiles = raw.get("profiles", {})
+    if profile in profiles:
+        return _profile_from_item(home, profile, profiles[profile])
+    catalog_item = catalog.get("profiles", {}).get(profile)
+    if not catalog_item or not catalog_item.get("enabled", True):
+        raise KeyError(f"Unknown profile: {profile}")
+    return _profile_from_item(home, profile, catalog_item.get("config", {}))
 
 
 def _validate_profile(config: ProfileConfig) -> None:

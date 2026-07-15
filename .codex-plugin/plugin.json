@@ -1,7 +1,7 @@
 {
   "name": "codex-history-suite",
-  "version": "0.2.0+codex.20260715022134",
-  "description": "Build, incrementally maintain, audit, migrate, search, and trace a portable evidence-first knowledge base from local Codex transcripts.",
+  "version": "0.3.0+codex.20260715041957",
+  "description": "Build, incrementally maintain, move, merge, search, and trace portable evidence-first knowledge bases from local Codex transcripts.",
   "author": {
     "name": "Lanqeur",
     "url": "https://github.com/Lanqeur"
@@ -20,7 +20,7 @@
   "interface": {
     "displayName": "Codex History Suite",
     "shortDescription": "Portable, evidence-first memory for Codex history.",
-    "longDescription": "Codex History Suite provides a checkpointed cross-platform builder and a read-only progressive retrieval Skill over local Codex transcripts, Evidence, claims, tool traces, and artifact CAS.",
+    "longDescription": "Codex History Suite provides a checkpointed cross-platform builder, verified multi-device bundles, non-destructive synchronization, and progressive retrieval over local Codex transcripts, Evidence, claims, tool traces, and artifact CAS.",
     "developerName": "Lanqeur",
     "category": "Productivity",
     "capabilities": [],
