@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-history-suite"
+version = "0.1.0"
+description = "Portable, evidence-first knowledge base for local Codex transcripts"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Lanqeur" }]
+dependencies = []
+
+[project.optional-dependencies]
+semantic = ["chromadb>=1.0,<2"]
+dev = ["pytest>=8", "pytest-cov>=5"]
+
+[project.scripts]
+codex-history = "codex_history.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

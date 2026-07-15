@@ -1,0 +1,29 @@
+{
+  "name": "codex-history-suite",
+  "version": "0.1.0+codex.20260715012956",
+  "description": "Build, incrementally maintain, audit, migrate, search, and trace a portable evidence-first knowledge base from local Codex transcripts.",
+  "author": {
+    "name": "Lanqeur",
+    "url": "https://github.com/Lanqeur"
+  },
+  "homepage": "https://github.com/Lanqeur/codex-history-suite",
+  "repository": "https://github.com/Lanqeur/codex-history-suite",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "history",
+    "knowledge-base",
+    "sqlite",
+    "transcripts"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex History Suite",
+    "shortDescription": "Portable, evidence-first memory for Codex history.",
+    "longDescription": "Codex History Suite provides a checkpointed cross-platform builder and a read-only progressive retrieval Skill over local Codex transcripts, Evidence, claims, tool traces, and artifact CAS.",
+    "developerName": "Lanqeur",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": "Build or query my local Codex history knowledge base with evidence tracing."
+  }
+}

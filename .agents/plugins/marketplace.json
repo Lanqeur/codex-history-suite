@@ -1,0 +1,20 @@
+{
+  "name": "codex-history-suite",
+  "interface": {
+    "displayName": "Codex History Suite"
+  },
+  "plugins": [
+    {
+      "name": "codex-history-suite",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

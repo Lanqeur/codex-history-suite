@@ -1,0 +1,6 @@
+interface:
+  display_name: "Build Codex History"
+  short_description: "Build, update, audit, and migrate Codex history"
+  default_prompt: "Use $build-codex-history to initialize or safely update my local history knowledge base."
+policy:
+  allow_implicit_invocation: false
