@@ -30,7 +30,7 @@ codex plugin add codex-history-suite@codex-history-suite
 python3 scripts/codex_history.py doctor --json
 python3 scripts/codex_history.py init --source ~/.codex --json
 python3 scripts/codex_history.py plan --mode full --json
-python3 scripts/codex_history.py build --max-cost-cny 0 --json
+python3 scripts/codex_history.py build --max-cost-cny 30 --json  # 将 30 改为审核后的费用上限
 python3 scripts/codex_history.py search '项目 决策' --json
 ```
 
@@ -43,7 +43,22 @@ python3 -m pip install .
 codex-history doctor
 ```
 
-安装 `.[semantic]` 可启用 ChromaDB。默认的 `extractive` 摘要模式成本为零；切换到 `openai-compatible` 前，需要在 `config.toml` 中配置模型提供商。
+新建 profile 默认使用模型优先的 `auto` 摘要模式。生成的配置推荐百炼非思考模式 `deepseek-v4-flash`；如果找不到 `DASHSCOPE_API_KEY`，系统会说明原因并自动回退到确定性的 `extractive` 规则摘要。回退保证首次使用仍能完成建库，但为了得到更好的跨 turn 归纳、长期资产和带证据引用的 Overview，强烈建议优先配置模型。
+
+插件升级不会改写已有 profile。旧用户如需采用新策略，应把[配置参考](skills/build-codex-history/references/configuration.md)中的 summarization 和 estimation 两节合并到现有 `config.toml`，再重新运行 `plan`。
+
+```bash
+export DASHSCOPE_API_KEY='你的-key'  # PowerShell：$env:DASHSCOPE_API_KEY='你的-key'
+python3 scripts/codex_history.py plan --mode full --json
+```
+
+生成配置中的价格只是可编辑的估算输入。以 2026-07-15 为基准，阿里云百炼中国内地部署的 `deepseek-v4-flash` 公示价为输入 1 元/百万 Token、输出 2 元/百万 Token；实际使用前请复核[百炼最新模型价格](https://help.aliyun.com/zh/model-studio/model-pricing)。直连 DeepSeek API 也可使用其 OpenAI 兼容端点，并根据 [DeepSeek 官方价格页](https://api-docs.deepseek.com/quick_start/pricing)把价格换算成人民币后填入配置。
+
+`plan` 和 `update --dry-run` 会统计 transcript 总体积、新增或需要重处理的字节数、摘要输入的期望值与保守上限、缓存输入、输出和 embedding Token、期望成本与保守成本上限，并把预计磁盘体积分解为 snapshot、SQLite、artifact CAS、语义索引和模型响应缓存。内联 data-URI base64 会被扫描并从模型 Token 估算中排除，但仍计入 snapshot 存储估算。即使 `auto` 因缺少 Key 而回退，报告仍会给出“启用模型后”的潜在成本，因此估价本身不需要 API Key。
+
+构建完成后，返回结果还会提供实际 `usage` 汇总，包括模型输入、模型提供商缓存输入、输出、embedding Token、Codex History 响应缓存命中和人民币成本；`storage` 则同时给出 active 核心组件与保留历史 build 后整个 profile 的真实占用。
+
+安装 `.[semantic]` 可启用 ChromaDB。模型摘要和语义检索相互独立：模型优先摘要可继续搭配 SQLite 词法检索，Chroma 可按需单独启用。
 
 如果语义检索依赖安装在独立虚拟环境中，可将 `profiles.<name>.runtime.python` 指向该环境的 Python。启用 embedding 后，CLI 会自动切换到该解释器；当前解释器已经安装 ChromaDB 或只使用词法检索时可留空。
 
@@ -54,6 +69,8 @@ discover -> snapshot -> ingest -> lineage -> summarize -> index -> audit -> prom
 ```
 
 每个阶段都会在暂存 SQLite 数据库和 `runs/<build-id>/run.json` 中记录检查点。任何阶段失败时，上一份 active build 仍然可用。
+
+付费构建必须在审阅 dry-run 后显式传入 `--max-cost-cny`。Codex History 自身的精确模型响应缓存命中费用为零；模型提供商的输入缓存按用户录入的缓存单价和预期命中率单独估算。API 调用失败时不会悄悄把原本的模型构建降级成规则式结果。
 
 ## 增量等价约束
 

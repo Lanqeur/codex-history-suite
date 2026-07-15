@@ -4,6 +4,8 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 from codex_history.cli import main as cli_main
 from codex_history.audit import audit_database
 from codex_history.pipeline import (
@@ -19,6 +21,23 @@ from codex_history.source import classify_changes, discover_sources, snapshot_so
 from conftest import add_transcript, goal_row
 
 
+def test_model_first_build_requires_an_explicit_cost_limit(portable_profile, monkeypatch):
+    config, codex_home = portable_profile
+    add_transcript(
+        codex_home,
+        "thread-paid-guard",
+        "Paid guard",
+        timestamp="2026-07-14T00:30:00Z",
+        label="paid-guard",
+    )
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-only")
+    build_plan = plan(config, mode="full")
+    assert build_plan["effective_summarization_mode"] == "openai-compatible"
+    assert build_plan["estimated_cost_cny"] > 0
+    with pytest.raises(RuntimeError, match="explicit --max-cost-cny"):
+        build_full(config)
+
+
 def test_full_build_incremental_update_and_equivalence(portable_profile):
     config, codex_home = portable_profile
     add_transcript(
@@ -30,9 +49,17 @@ def test_full_build_incremental_update_and_equivalence(portable_profile):
         image=True,
     )
 
+    initial_plan = plan(config, mode="full")
+    source_estimate = initial_plan["estimate"]["source"]
+    assert source_estimate["inline_base64_payload_bytes_excluded_from_model_estimate"] > 0
+    assert source_estimate["model_relevant_bytes"] < source_estimate["new_or_reprocessed_bytes"]
+
     first = build_full(config)
     assert first["status"] == "complete"
     assert first["audit"]["passed"] is True
+    assert first["usage"]["total_api_tokens"] == 0
+    assert first["storage"]["core_components_bytes"]["active_sqlite_build"] > 0
+    assert first["storage"]["profile_total_bytes"] >= first["storage"]["core_total_bytes"]
     first_database = Path(first["database"])
     connection = connect(first_database, readonly=True)
     try:
@@ -81,6 +108,11 @@ def test_full_build_incremental_update_and_equivalence(portable_profile):
     assert dry_run["change_counts"] == {"added": 1, "unchanged": 1}
     assert dry_run["actionable_count"] == 1
     assert dry_run["estimated_cost_cny"] == 0
+    assert dry_run["effective_summarization_mode"] == "extractive"
+    assert dry_run["summarization"]["fallback"] is True
+    assert dry_run["estimated_summary_cost_cny_if_model_enabled"] > 0
+    assert dry_run["estimate"]["tokens"]["summary"]["input_expected"] > 0
+    assert dry_run["estimated_storage_bytes"] > dry_run["estimate"]["source"]["total_bytes"]
 
     second = update_incremental(config)
     assert second["status"] == "complete"

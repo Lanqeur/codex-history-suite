@@ -5,7 +5,6 @@ import importlib.util
 import json
 import os
 import platform
-import shutil
 import sqlite3
 import subprocess
 import sys
@@ -19,10 +18,10 @@ from .config import (
     default_data_home,
     ensure_profile_dirs,
     load_config,
+    resolve_summarization,
     write_initial_config,
 )
 from .pipeline import (
-    STAGES,
     active_database,
     active_info,
     build_full,
@@ -172,6 +171,12 @@ def _doctor(home: Path, profile_name: str | None) -> dict[str, Any]:
             {"path": str(path), "exists": path.exists()} for path in config.source_roots
         ]
         result["active"] = active_info(config)
+        result["summarization"] = resolve_summarization(config)
+        if result["summarization"]["fallback"]:
+            result["warnings"].append(
+                "Model-first summarization is falling back to extractive mode: "
+                + str(result["summarization"]["fallback_reason"])
+            )
         runtime = _runtime_probe(config.runtime_python)
         result["configured_runtime"] = runtime
         semantic_available = result["chromadb_available"] or bool(runtime.get("chromadb"))
@@ -399,6 +404,11 @@ def main(argv: list[str] | None = None) -> int:
                 "config": str(path),
                 "profile": profile_name,
                 "source_roots": [str(path) for path in config.source_roots],
+                "summarization": resolve_summarization(config),
+                "next_step": (
+                    "Set DASHSCOPE_API_KEY for the recommended DeepSeek V4 Flash summaries, "
+                    "then run `plan --mode full`. Without a key, auto mode falls back to extractive."
+                ),
             },
             as_json=args.json,
         )

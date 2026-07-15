@@ -55,7 +55,7 @@ def default_codex_homes(
             candidates.append(users / windows_user / ".codex")
         elif users.is_dir():
             for child in sorted(users.iterdir()):
-                if child.is_dir() and not child.name.lower() in {"all users", "default", "public"}:
+                if child.is_dir() and child.name.lower() not in {"all users", "default", "public"}:
                     candidates.append(child / ".codex")
     unique: list[Path] = []
     seen: set[str] = set()
@@ -74,14 +74,23 @@ class ProfileConfig:
     source_roots: tuple[Path, ...]
     include_archived: bool = True
     snapshot_chunk_bytes: int = 4 * 1024 * 1024
-    summary_mode: str = "extractive"
-    summary_provider: str = ""
-    summary_model: str = ""
-    summary_endpoint: str = ""
-    summary_api_key_env: str = ""
+    summary_mode: str = "auto"
+    summary_provider: str = "dashscope"
+    summary_model: str = "deepseek-v4-flash"
+    summary_endpoint: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    summary_api_key_env: str = "DASHSCOPE_API_KEY"
     summary_env_file: str = ""
-    summary_input_price_cny: float = 0.0
-    summary_output_price_cny: float = 0.0
+    summary_thinking_enabled: bool | None = False
+    summary_input_price_cny: float = 1.0
+    summary_cached_input_price_cny: float = 0.2
+    summary_output_price_cny: float = 2.0
+    estimate_bytes_per_token: float = 3.0
+    estimate_summary_input_ratio: float = 0.30
+    estimate_summary_output_ratio: float = 0.08
+    estimate_cached_input_ratio: float = 0.0
+    estimate_sqlite_to_source_ratio: float = 0.18
+    estimate_artifact_to_source_ratio: float = 0.08
+    estimate_semantic_to_source_ratio: float = 0.05
     embedding_enabled: bool = False
     embedding_provider: str = "dashscope"
     embedding_model: str = "text-embedding-v4"
@@ -160,14 +169,25 @@ include_archived = true
 snapshot_chunk_bytes = 4194304
 
 [profiles.{profile}.summarization]
-mode = "extractive"
-provider = ""
-model = ""
-endpoint = ""
-api_key_env = ""
+mode = "auto"
+provider = "dashscope"
+model = "deepseek-v4-flash"
+endpoint = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+api_key_env = "DASHSCOPE_API_KEY"
 env_file = ""
-input_price_cny_per_million = 0.0
-output_price_cny_per_million = 0.0
+thinking_enabled = false
+input_price_cny_per_million = 1.0
+cached_input_price_cny_per_million = 0.2
+output_price_cny_per_million = 2.0
+
+[profiles.{profile}.estimation]
+bytes_per_token = 3.0
+summary_input_ratio = 0.30
+summary_output_ratio = 0.08
+cached_input_ratio = 0.0
+sqlite_to_source_ratio = 0.18
+artifact_to_source_ratio = 0.08
+semantic_to_source_ratio = 0.05
 
 [profiles.{profile}.embedding]
 enabled = false
@@ -204,24 +224,46 @@ def load_config(home: Path | None = None, profile: str | None = None) -> Profile
         raise KeyError(f"Unknown profile: {profile}")
     item = profiles[profile]
     summary = item.get("summarization", {})
+    estimation = item.get("estimation", {})
     embedding = item.get("embedding", {})
     artifacts = item.get("artifacts", {})
     runtime = item.get("runtime", {})
     roots = tuple(Path(value).expanduser() for value in item.get("source_roots", []))
-    return ProfileConfig(
+    config = ProfileConfig(
         home=home,
         name=profile,
         source_roots=roots,
         include_archived=bool(item.get("include_archived", True)),
         snapshot_chunk_bytes=int(item.get("snapshot_chunk_bytes", 4 * 1024 * 1024)),
-        summary_mode=str(summary.get("mode", "extractive")),
-        summary_provider=str(summary.get("provider", "")),
-        summary_model=str(summary.get("model", "")),
-        summary_endpoint=str(summary.get("endpoint", "")),
-        summary_api_key_env=str(summary.get("api_key_env", "")),
+        summary_mode=str(summary.get("mode", "auto")),
+        summary_provider=str(summary.get("provider", "dashscope")),
+        summary_model=str(summary.get("model", "deepseek-v4-flash")),
+        summary_endpoint=str(
+            summary.get("endpoint", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+        ),
+        summary_api_key_env=str(summary.get("api_key_env", "DASHSCOPE_API_KEY")),
         summary_env_file=str(summary.get("env_file", "")),
-        summary_input_price_cny=float(summary.get("input_price_cny_per_million", 0.0)),
-        summary_output_price_cny=float(summary.get("output_price_cny_per_million", 0.0)),
+        summary_thinking_enabled=(
+            bool(summary["thinking_enabled"]) if "thinking_enabled" in summary else None
+        ),
+        summary_input_price_cny=float(summary.get("input_price_cny_per_million", 1.0)),
+        summary_cached_input_price_cny=float(
+            summary.get("cached_input_price_cny_per_million", 0.2)
+        ),
+        summary_output_price_cny=float(summary.get("output_price_cny_per_million", 2.0)),
+        estimate_bytes_per_token=float(estimation.get("bytes_per_token", 3.0)),
+        estimate_summary_input_ratio=float(estimation.get("summary_input_ratio", 0.30)),
+        estimate_summary_output_ratio=float(estimation.get("summary_output_ratio", 0.08)),
+        estimate_cached_input_ratio=float(estimation.get("cached_input_ratio", 0.0)),
+        estimate_sqlite_to_source_ratio=float(
+            estimation.get("sqlite_to_source_ratio", 0.18)
+        ),
+        estimate_artifact_to_source_ratio=float(
+            estimation.get("artifact_to_source_ratio", 0.08)
+        ),
+        estimate_semantic_to_source_ratio=float(
+            estimation.get("semantic_to_source_ratio", 0.05)
+        ),
         embedding_enabled=bool(embedding.get("enabled", False)),
         embedding_provider=str(embedding.get("provider", "dashscope")),
         embedding_model=str(embedding.get("model", "text-embedding-v4")),
@@ -236,6 +278,113 @@ def load_config(home: Path | None = None, profile: str | None = None) -> Profile
         artifact_max_file_bytes=int(artifacts.get("max_file_bytes", 100 * 1024 * 1024)),
         runtime_python=str(runtime.get("python", "")),
     )
+    _validate_profile(config)
+    return config
+
+
+def _validate_profile(config: ProfileConfig) -> None:
+    errors: list[str] = []
+    if config.summary_mode.strip().lower() not in {
+        "auto",
+        "extractive",
+        "openai-compatible",
+    }:
+        errors.append("summarization.mode must be auto, extractive, or openai-compatible")
+    for label, value in (
+        ("summarization.input_price_cny_per_million", config.summary_input_price_cny),
+        (
+            "summarization.cached_input_price_cny_per_million",
+            config.summary_cached_input_price_cny,
+        ),
+        ("summarization.output_price_cny_per_million", config.summary_output_price_cny),
+        ("embedding.input_price_cny_per_million", config.embedding_input_price_cny),
+        ("estimation.summary_input_ratio", config.estimate_summary_input_ratio),
+        ("estimation.summary_output_ratio", config.estimate_summary_output_ratio),
+        ("estimation.sqlite_to_source_ratio", config.estimate_sqlite_to_source_ratio),
+        ("estimation.artifact_to_source_ratio", config.estimate_artifact_to_source_ratio),
+        ("estimation.semantic_to_source_ratio", config.estimate_semantic_to_source_ratio),
+    ):
+        if value < 0:
+            errors.append(f"{label} must be non-negative")
+    if config.estimate_bytes_per_token <= 0:
+        errors.append("estimation.bytes_per_token must be greater than zero")
+    if not 0 <= config.estimate_cached_input_ratio <= 1:
+        errors.append("estimation.cached_input_ratio must be between 0 and 1")
+    if config.snapshot_chunk_bytes <= 0:
+        errors.append("snapshot_chunk_bytes must be greater than zero")
+    if config.embedding_dimensions <= 0:
+        errors.append("embedding.dimensions must be greater than zero")
+    if config.artifact_max_file_bytes <= 0:
+        errors.append("artifacts.max_file_bytes must be greater than zero")
+    if errors:
+        raise ValueError("Invalid Codex History profile: " + "; ".join(errors))
+
+
+def configured_secret(name: str, env_file: str = "") -> str:
+    """Read a configured secret without ever returning it in reports."""
+    if not name:
+        return ""
+    value = os.environ.get(name, "")
+    if value or not env_file:
+        return value
+    path = Path(env_file).expanduser()
+    if not path.is_file():
+        return ""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return ""
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, candidate = line.split("=", 1)
+        if key.strip() == name:
+            return candidate.strip().strip("'\"")
+    return ""
+
+
+def resolve_summarization(config: ProfileConfig) -> dict[str, object]:
+    requested = config.summary_mode.strip().lower()
+    if requested not in {"auto", "extractive", "openai-compatible"}:
+        raise ValueError(f"Unsupported summarization mode: {config.summary_mode}")
+    missing = [
+        label
+        for label, value in (
+            ("endpoint", config.summary_endpoint),
+            ("model", config.summary_model),
+            ("api_key_env", config.summary_api_key_env),
+        )
+        if not value
+    ]
+    key_available = bool(
+        configured_secret(config.summary_api_key_env, config.summary_env_file)
+    )
+    if not missing and not key_available:
+        missing.append(f"${config.summary_api_key_env}")
+
+    if requested == "extractive":
+        effective = "extractive"
+        fallback_reason = "extractive mode was explicitly selected"
+    elif not missing:
+        effective = "openai-compatible"
+        fallback_reason = ""
+    elif requested == "auto":
+        effective = "extractive"
+        fallback_reason = "missing " + ", ".join(missing)
+    else:
+        effective = "unavailable"
+        fallback_reason = "missing " + ", ".join(missing)
+    return {
+        "requested_mode": requested,
+        "effective_mode": effective,
+        "provider": config.summary_provider,
+        "model": config.summary_model,
+        "api_key_env": config.summary_api_key_env,
+        "api_key_available": key_available,
+        "fallback": requested == "auto" and effective == "extractive",
+        "fallback_reason": fallback_reason,
+    }
 
 
 def ensure_profile_dirs(config: ProfileConfig) -> None:

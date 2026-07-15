@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import random
 import re
 import sqlite3
@@ -10,15 +9,14 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Iterable
 
-from .config import ProfileConfig
+from .config import ProfileConfig, configured_secret, resolve_summarization
 from .knowledge import apply_model_scope_summary
 from .util import atomic_write_json, canonical_json, read_json, stable_id, utc_now
 
 
-SUMMARY_STAGE_VERSION = "evidence-linked-writer-v1"
+SUMMARY_STAGE_VERSION = "evidence-linked-writer-v2"
 MAX_CHUNK_CHARS = 60_000
 
 
@@ -45,22 +43,28 @@ Keep decisions, verified outcomes, failures, recoveries, unresolved work, constr
 
 @dataclass(frozen=True)
 class ChatSettings:
+    provider: str
     endpoint: str
     api_key_env: str
     model: str
     input_price_cny: float
+    cached_input_price_cny: float
     output_price_cny: float
     env_file: str
+    thinking_enabled: bool | None
 
     @classmethod
     def from_config(cls, config: ProfileConfig) -> "ChatSettings":
         return cls(
+            provider=config.summary_provider,
             endpoint=config.summary_endpoint,
             api_key_env=config.summary_api_key_env,
             model=config.summary_model,
             input_price_cny=config.summary_input_price_cny,
+            cached_input_price_cny=config.summary_cached_input_price_cny,
             output_price_cny=config.summary_output_price_cny,
             env_file=config.summary_env_file,
+            thinking_enabled=config.summary_thinking_enabled,
         )
 
 
@@ -71,18 +75,7 @@ class ChatClient:
             raise RuntimeError("summarization.endpoint is not configured")
         if not settings.model:
             raise RuntimeError("summarization.model is not configured")
-        self.api_key = os.environ.get(settings.api_key_env, "")
-        if not self.api_key and settings.env_file:
-            path = Path(settings.env_file).expanduser()
-            if path.is_file():
-                for raw in path.read_text(encoding="utf-8").splitlines():
-                    line = raw.strip()
-                    if not line or line.startswith("#") or "=" not in line:
-                        continue
-                    key, value = line.split("=", 1)
-                    if key.strip() == settings.api_key_env:
-                        self.api_key = value.strip().strip("'\"")
-                        break
+        self.api_key = configured_secret(settings.api_key_env, settings.env_file)
         if not self.api_key:
             raise RuntimeError(f"Summarization API key is missing from ${settings.api_key_env}")
         endpoint = settings.endpoint.rstrip("/")
@@ -90,16 +83,22 @@ class ChatClient:
         self.timeout = timeout
 
     def complete(self, prompt: str) -> tuple[dict[str, Any], dict[str, int]]:
+        body: dict[str, Any] = {
+            "model": self.settings.model,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0,
+            "stream": False,
+        }
+        if (
+            self.settings.provider.strip().lower() == "dashscope"
+            and self.settings.thinking_enabled is not None
+        ):
+            body["enable_thinking"] = self.settings.thinking_enabled
         payload = json.dumps(
-            {
-                "model": self.settings.model,
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                "temperature": 0,
-                "stream": False,
-            },
+            body,
             ensure_ascii=False,
         ).encode("utf-8")
         request = urllib.request.Request(
@@ -123,8 +122,15 @@ class ChatClient:
         content = choices[0].get("message", {}).get("content", "")
         result = parse_json_object(str(content))
         usage = body.get("usage") or {}
+        details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details") or {}
         return result, {
             "input_tokens": int(usage.get("prompt_tokens") or 0),
+            "cached_input_tokens": int(
+                details.get("cached_tokens")
+                or details.get("cache_read_input_tokens")
+                or usage.get("cached_input_tokens")
+                or 0
+            ),
             "output_tokens": int(usage.get("completion_tokens") or 0),
         }
 
@@ -166,16 +172,27 @@ def _cache_key(settings: ChatSettings, stage: str, payload: Any) -> str:
     return stable_id(
         "model",
         SUMMARY_STAGE_VERSION,
+        settings.provider,
+        settings.endpoint,
         settings.model,
+        settings.thinking_enabled,
         stage,
         hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest(),
         length=48,
     )
 
 
-def _cost(settings: ChatSettings, input_tokens: int, output_tokens: int) -> float:
+def _cost(
+    settings: ChatSettings,
+    input_tokens: int,
+    output_tokens: int,
+    cached_input_tokens: int = 0,
+) -> float:
+    cached = min(max(0, cached_input_tokens), max(0, input_tokens))
+    uncached = max(0, input_tokens - cached)
     return (
-        input_tokens / 1_000_000 * settings.input_price_cny
+        uncached / 1_000_000 * settings.input_price_cny
+        + cached / 1_000_000 * settings.cached_input_price_cny
         + output_tokens / 1_000_000 * settings.output_price_cny
     )
 
@@ -207,7 +224,12 @@ def _call_cached(
     for attempt in range(1, 4):
         try:
             response, usage = client.complete(prompt)
-            actual = _cost(settings, usage["input_tokens"], usage["output_tokens"])
+            actual = _cost(
+                settings,
+                usage["input_tokens"],
+                usage["output_tokens"],
+                usage.get("cached_input_tokens", 0),
+            )
             record = {
                 "schema_version": "codex-history-model-cache-v1",
                 "created_at": utc_now(),
@@ -278,16 +300,26 @@ def summarize_scopes(
     max_cost_cny: float | None,
     client: ChatClient | None = None,
 ) -> dict[str, Any]:
-    if config.summary_mode == "extractive":
-        return {"enabled": False, "mode": "extractive", "scopes": 0, "cost_cny": 0.0}
-    if config.summary_mode != "openai-compatible":
-        raise ValueError(f"Unsupported summarization mode: {config.summary_mode}")
+    resolution = resolve_summarization(config)
+    if resolution["effective_mode"] == "extractive":
+        return {
+            "enabled": False,
+            "mode": config.summary_mode,
+            "effective_mode": "extractive",
+            "fallback": bool(resolution["fallback"]),
+            "fallback_reason": resolution["fallback_reason"],
+            "scopes": 0,
+            "cost_cny": 0.0,
+        }
     settings = ChatSettings.from_config(config)
     client = client or ChatClient(settings)
     total_cost = 0.0
     calls = 0
     cache_hits = 0
     summarized = 0
+    input_tokens = 0
+    cached_input_tokens = 0
+    output_tokens = 0
     details: list[dict[str, Any]] = []
     for scope_id in scope_ids:
         records = _scope_records(connection, scope_id)
@@ -315,6 +347,9 @@ def summarize_scopes(
                 total_cost += float(meta["cost_cny"])
                 calls += int(not meta["cache_hit"])
                 cache_hits += int(meta["cache_hit"])
+                input_tokens += int(meta.get("input_tokens", 0))
+                cached_input_tokens += int(meta.get("cached_input_tokens", 0))
+                output_tokens += int(meta.get("output_tokens", 0))
             writer_input = {"scope_id": scope_id, "condensed_ledgers": ledgers}
         remaining = None if max_cost_cny is None else max_cost_cny - total_cost
         result, meta = _call_cached(
@@ -330,6 +365,9 @@ def summarize_scopes(
         total_cost += float(meta["cost_cny"])
         calls += int(not meta["cache_hit"])
         cache_hits += int(meta["cache_hit"])
+        input_tokens += int(meta.get("input_tokens", 0))
+        cached_input_tokens += int(meta.get("cached_input_tokens", 0))
+        output_tokens += int(meta.get("output_tokens", 0))
         normalized = _normalize_result(result)
         applied = apply_model_scope_summary(
             connection,
@@ -345,10 +383,15 @@ def summarize_scopes(
     return {
         "enabled": True,
         "mode": config.summary_mode,
+        "effective_mode": "openai-compatible",
         "model": settings.model,
         "scopes": summarized,
         "api_calls": calls,
         "cache_hits": cache_hits,
+        "input_tokens": input_tokens,
+        "cached_input_tokens": cached_input_tokens,
+        "uncached_input_tokens": max(0, input_tokens - cached_input_tokens),
+        "output_tokens": output_tokens,
         "cost_cny": round(total_cost, 6),
         "details": details,
     }

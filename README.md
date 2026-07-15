@@ -30,7 +30,7 @@ The plugin is self-contained and can run without installing a package:
 python3 scripts/codex_history.py doctor --json
 python3 scripts/codex_history.py init --source ~/.codex --json
 python3 scripts/codex_history.py plan --mode full --json
-python3 scripts/codex_history.py build --max-cost-cny 0 --json
+python3 scripts/codex_history.py build --max-cost-cny 30 --json  # replace 30 with the reviewed upper limit
 python3 scripts/codex_history.py search 'project decision' --json
 ```
 
@@ -43,7 +43,22 @@ python3 -m pip install .
 codex-history doctor
 ```
 
-Install `.[semantic]` to enable ChromaDB. Configure a model provider in `config.toml` before switching summarization from the default zero-cost `extractive` mode to `openai-compatible`.
+New profiles use model-first `auto` summarization. The generated preset recommends DashScope's non-thinking `deepseek-v4-flash`; when `DASHSCOPE_API_KEY` is unavailable, it reports the reason and falls back to deterministic `extractive` summaries. This keeps first use functional, but model summaries are strongly recommended for better cross-turn synthesis, durable assets, and evidence-linked overviews.
+
+Existing profiles are never rewritten during a plugin upgrade. To adopt the new behavior, copy the summarization and estimation sections from [the configuration reference](skills/build-codex-history/references/configuration.md) into the existing `config.toml`, then rerun `plan`.
+
+```bash
+export DASHSCOPE_API_KEY='your-key'  # PowerShell: $env:DASHSCOPE_API_KEY='your-key'
+python3 scripts/codex_history.py plan --mode full --json
+```
+
+The generated prices are editable planning inputs. As of 2026-07-15, Alibaba Cloud lists `deepseek-v4-flash` at CNY 1 per million input tokens and CNY 2 per million output tokens in the Chinese mainland deployment; always verify the [current Model Studio pricing](https://help.aliyun.com/zh/model-studio/model-pricing). Direct DeepSeek API users can use its OpenAI-compatible endpoint and enter converted CNY prices from the [official DeepSeek pricing page](https://api-docs.deepseek.com/quick_start/pricing).
+
+`plan` and `update --dry-run` report transcript bytes, new/reprocessed bytes, expected and upper summary tokens, expected cached input, output and embedding tokens, expected and conservative CNY cost, and a low/expected/upper disk estimate split into snapshots, SQLite, artifact CAS, semantic index, and model-response cache. Inline data-URI base64 payloads are scanned and excluded from model-token estimates while remaining in snapshot storage estimates. The report still shows the potential model cost when `auto` has fallen back, so a key is not required just to budget a build.
+
+Completed builds return an actual `usage` summary for model input, provider-cached input, output, embedding tokens, response-cache hits, and CNY cost, plus `storage` totals for the active core components and the whole retained profile.
+
+Install `.[semantic]` to enable ChromaDB. Model summarization and semantic retrieval are independent: the recommended model-first summaries work with lexical SQLite retrieval, while Chroma can be enabled separately.
 
 When semantic dependencies live in a dedicated virtual environment, set
 `profiles.<name>.runtime.python` to that environment's Python executable. The
@@ -57,6 +72,8 @@ discover -> snapshot -> ingest -> lineage -> summarize -> index -> audit -> prom
 ```
 
 Every stage is checkpointed in the staging SQLite database and in `runs/<build-id>/run.json`. The prior active build remains available after any failure.
+
+Paid builds require an explicit `--max-cost-cny` after reviewing the dry-run. Exact model-response cache hits cost zero; provider-side cached input is costed separately using the user-entered cached-input price and expected hit ratio. API failures never silently downgrade a paid model build to extractive mode.
 
 ## Incremental Invariant
 

@@ -41,6 +41,16 @@ class FailingChatClient:
         raise AssertionError("cache was not reused")
 
 
+class CachedTokenChatClient(FakeChatClient):
+    def complete(self, prompt: str):
+        response, _usage = super().complete(prompt)
+        return response, {
+            "input_tokens": 100,
+            "cached_input_tokens": 80,
+            "output_tokens": 40,
+        }
+
+
 def test_evidence_linked_model_summary_and_cache(portable_profile):
     config, codex_home = portable_profile
     add_transcript(
@@ -141,6 +151,9 @@ def test_model_pipeline_incremental_equals_clean_full(portable_profile, monkeypa
     )
     first = build_full(model_config, max_cost_cny=1.0)
     assert first["run"]["stages"]["summarize"]["report"]["api_calls"] == 1
+    assert first["usage"]["summary_input_tokens"] == 20
+    assert first["usage"]["summary_output_tokens"] == 10
+    assert first["usage"]["total_cost_cny"] > 0
 
     add_transcript(
         codex_home,
@@ -155,3 +168,44 @@ def test_model_pipeline_incremental_equals_clean_full(portable_profile, monkeypa
     assert len(calls) == 3
     assert equivalence_audit(model_config)["passed"] is True
     assert len(calls) == 3
+
+
+def test_provider_cache_tokens_use_the_configured_discount(portable_profile):
+    config, codex_home = portable_profile
+    add_transcript(
+        codex_home,
+        "thread-cached-price",
+        "Cached price",
+        timestamp="2026-07-14T01:00:00Z",
+        label="cache-price",
+    )
+    built = build_full(config)
+    model_config = replace(
+        config,
+        summary_mode="openai-compatible",
+        summary_endpoint="https://example.invalid/v1",
+        summary_api_key_env="FAKE_KEY",
+        summary_model="fake-cached-price-model",
+        summary_input_price_cny=10.0,
+        summary_cached_input_price_cny=2.0,
+        summary_output_price_cny=20.0,
+    )
+    connection = connect(Path(built["database"]))
+    try:
+        record_id = connection.execute(
+            "SELECT record_id FROM knowledge WHERE scope_id='thread-cached-price' "
+            "AND tier='fact_block'"
+        ).fetchone()[0]
+        report = summarize_scopes(
+            model_config,
+            connection,
+            scope_ids=["thread-cached-price"],
+            max_cost_cny=1.0,
+            client=CachedTokenChatClient(record_id),
+        )
+        assert report["input_tokens"] == 100
+        assert report["cached_input_tokens"] == 80
+        assert report["uncached_input_tokens"] == 20
+        assert report["cost_cny"] == 0.00116
+    finally:
+        connection.close()

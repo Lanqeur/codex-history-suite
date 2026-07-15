@@ -1,17 +1,16 @@
 from __future__ import annotations
 
-import json
 import shutil
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
 from .audit import audit_connection, compare_databases
-from .config import ProfileConfig, config_path, ensure_profile_dirs
+from .config import ProfileConfig, config_path, ensure_profile_dirs, resolve_summarization
+from .estimate import actual_managed_storage, estimate_build
 from .knowledge import (
     delete_thread,
     insert_parsed_thread,
@@ -35,7 +34,6 @@ from .util import (
     file_lock,
     read_json,
     sha256_file,
-    stable_id,
     utc_now,
 )
 
@@ -118,24 +116,41 @@ def plan(config: ProfileConfig, *, mode: str) -> dict[str, Any]:
     else:
         changes = classify_changes(sources, previous)
     actionable = [change for change in changes if change.kind != "unchanged"]
-    changed_bytes = sum(
-        change.source.size_bytes if change.source else int(change.previous.get("size_bytes", 0))
-        for change in actionable
+    summarization = resolve_summarization(config)
+    estimate = estimate_build(
+        config,
+        sources=sources,
+        changes=changes,
+        database=database,
+        summarization=summarization,
     )
-    model_input_tokens = int(changed_bytes / 4) if config.summary_mode != "extractive" else 0
-    model_output_tokens = int(model_input_tokens * 0.08) if model_input_tokens else 0
-    summary_cost = (
-        model_input_tokens / 1_000_000 * config.summary_input_price_cny
-        + model_output_tokens / 1_000_000 * config.summary_output_price_cny
-    )
-    embedding_tokens = int(changed_bytes / 2) if config.embedding_enabled else 0
-    embedding_cost = embedding_tokens / 1_000_000 * config.embedding_input_price_cny
-    estimated_cost = summary_cost + embedding_cost
     counts: dict[str, int] = {}
     for change in changes:
         counts[change.kind] = counts.get(change.kind, 0) + 1
     active = active_info(config) or {}
     incremental_ready = not bool(active.get("migrated_from"))
+    warnings: list[str] = []
+    if mode != "full" and not incremental_ready:
+        warnings.append(
+            "The active database is a query-compatible legacy migration. "
+            "Run a full build before the first incremental update."
+        )
+    if summarization["fallback"]:
+        warnings.append(
+            "Model-first auto mode will fall back to deterministic extractive summaries because "
+            + str(summarization["fallback_reason"])
+            + ". Configure the model API key for the recommended higher-quality build."
+        )
+    elif summarization["effective_mode"] == "unavailable":
+        warnings.append(
+            "Strict model summarization cannot start because "
+            + str(summarization["fallback_reason"])
+            + "."
+        )
+    token_estimate = estimate["tokens"]
+    cost_estimate = estimate["cost_cny"]
+    storage_estimate = estimate["storage"]
+    summary_tokens = token_estimate["summary"]
     return {
         "schema_version": "codex-history-plan-v1",
         "created_at": utc_now(),
@@ -143,25 +158,37 @@ def plan(config: ProfileConfig, *, mode: str) -> dict[str, Any]:
         "mode": mode,
         "active_build_id": active.get("build_id"),
         "incremental_ready": incremental_ready,
-        "warnings": (
-            []
-            if mode == "full" or incremental_ready
-            else [
-                "The active database is a query-compatible legacy migration. "
-                "Run a full build before the first incremental update."
-            ]
-        ),
+        "warnings": warnings,
         "source_count": len(sources),
         "change_counts": counts,
         "actionable_count": len(actionable),
-        "changed_bytes": changed_bytes,
+        "changed_bytes": estimate["source"]["actionable_source_bytes"],
+        "new_or_reprocessed_bytes": estimate["source"]["new_or_reprocessed_bytes"],
         "summarization_mode": config.summary_mode,
-        "estimated_input_tokens_upper_bound": model_input_tokens,
-        "estimated_output_tokens": model_output_tokens,
-        "estimated_embedding_tokens_upper_bound": embedding_tokens,
-        "estimated_summary_cost_cny": round(summary_cost, 6),
-        "estimated_embedding_cost_cny": round(embedding_cost, 6),
-        "estimated_cost_cny": round(estimated_cost, 6),
+        "effective_summarization_mode": summarization["effective_mode"],
+        "summarization": summarization,
+        "estimated_input_tokens_upper_bound": (
+            summary_tokens["input_upper"] if summary_tokens["would_call_model"] else 0
+        ),
+        "estimated_input_tokens_if_model_enabled": summary_tokens["input_expected"],
+        "estimated_output_tokens": (
+            summary_tokens["output_expected"] if summary_tokens["would_call_model"] else 0
+        ),
+        "estimated_output_tokens_if_model_enabled": summary_tokens["output_expected"],
+        "estimated_embedding_tokens_upper_bound": token_estimate["embedding_input_upper"],
+        "estimated_summary_cost_cny": cost_estimate["summary_upper_no_cache"],
+        "estimated_summary_cost_cny_if_model_enabled": cost_estimate[
+            "summary_if_model_enabled_upper_no_cache"
+        ],
+        "estimated_embedding_cost_cny": cost_estimate["embedding_upper"],
+        "estimated_cost_cny_expected": cost_estimate["total_expected"],
+        "estimated_cost_cny": cost_estimate["total_upper"],
+        "estimated_storage_bytes": storage_estimate["expected_bytes"],
+        "estimated_storage_bytes_range": [
+            storage_estimate["low_bytes"],
+            storage_estimate["upper_bytes"],
+        ],
+        "estimate": estimate,
         "changes": [_change_public(change) for change in changes],
         "sources": [_source_public(source) for source in sources],
     }
@@ -309,6 +336,11 @@ def _build_locked(
     max_cost_cny: float | None,
 ) -> dict[str, Any]:
     build_plan = plan(config, mode="full" if kind == "full" else "incremental")
+    if max_cost_cny is None and build_plan["estimated_cost_cny"] > 0:
+        raise RuntimeError(
+            "This build can call paid APIs. Review `codex-history plan --json` and pass an "
+            "explicit --max-cost-cny limit."
+        )
     if max_cost_cny is not None and build_plan["estimated_cost_cny"] > max_cost_cny:
         raise RuntimeError(
             f"Estimated cost {build_plan['estimated_cost_cny']:.6f} CNY exceeds limit {max_cost_cny:.6f} CNY"
@@ -329,7 +361,6 @@ def _build_locked(
     )
     run = RunState(config, build_id, kind, build_dir)
     sources = discover_sources(config)
-    source_by_id = {source.source_id: source for source in sources}
     snapshots: dict[str, Any] = {}
     changes: list[SourceChange]
     try:
@@ -556,6 +587,31 @@ def _build_locked(
                 (utc_now(), promoted_at, build_id),
             )
         run.complete()
+        summary_report = run.data["stages"]["summarize"].get("report", {})
+        semantic_report = (
+            run.data["stages"]["index"].get("report", {}).get("semantic", {})
+        )
+        summary_input = int(summary_report.get("input_tokens", 0))
+        summary_output = int(summary_report.get("output_tokens", 0))
+        embedding_input = int(semantic_report.get("input_tokens", 0))
+        summary_cost = float(summary_report.get("cost_cny", 0.0))
+        embedding_cost = float(semantic_report.get("actual_cost_cny", 0.0))
+        usage = {
+            "summary_input_tokens": summary_input,
+            "summary_cached_input_tokens": int(
+                summary_report.get("cached_input_tokens", 0)
+            ),
+            "summary_uncached_input_tokens": int(
+                summary_report.get("uncached_input_tokens", summary_input)
+            ),
+            "summary_output_tokens": summary_output,
+            "embedding_input_tokens": embedding_input,
+            "total_api_tokens": summary_input + summary_output + embedding_input,
+            "summary_cost_cny": round(summary_cost, 6),
+            "embedding_cost_cny": round(embedding_cost, 6),
+            "total_cost_cny": round(summary_cost + embedding_cost, 6),
+            "model_response_cache_hits": int(summary_report.get("cache_hits", 0)),
+        }
         return {
             "status": "complete",
             "build_id": build_id,
@@ -564,6 +620,8 @@ def _build_locked(
             "build_dir": str(build_dir),
             "promoted": promote,
             "plan": build_plan,
+            "usage": usage,
+            "storage": actual_managed_storage(config, database),
             "audit": read_json(build_dir / "audit.json"),
             "run": read_json(run.path),
         }
