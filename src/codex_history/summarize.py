@@ -574,9 +574,37 @@ def _validate_writer_response(
             refs = {str(value) for value in item.get("record_ids") or []}
             if not refs or not refs <= allowed_ids:
                 raise ValueError(f"incremental writer {section} item has invalid references")
-            if section == "claims" and str(item.get("text") or "") not in normalized["overview"]:
-                raise ValueError("incremental writer claim text is absent from overview")
+            if section == "claims":
+                claim_text = _claim_text_from_overview(
+                    normalized["overview"], str(item.get("text") or "")
+                )
+                if claim_text is None:
+                    raise ValueError("incremental writer claim text is absent from overview")
+                item["text"] = claim_text
     return normalized
+
+
+_CLAIM_TERMINAL_PUNCTUATION = "。.!！?？;；:："
+
+
+def _claim_text_from_overview(overview: str, claim_text: str) -> str | None:
+    claim_text = claim_text.strip()
+    if claim_text and claim_text in overview:
+        return claim_text
+    stem = claim_text.rstrip(_CLAIM_TERMINAL_PUNCTUATION).rstrip()
+    if not stem or stem == claim_text:
+        return None
+    start = overview.find(stem)
+    if start < 0 or overview.find(stem, start + 1) >= 0:
+        return None
+    end = start + len(stem)
+    if end == len(overview):
+        return overview[start:end]
+    if overview[end] not in _CLAIM_TERMINAL_PUNCTUATION:
+        return None
+    while end < len(overview) and overview[end] in _CLAIM_TERMINAL_PUNCTUATION:
+        end += 1
+    return overview[start:end]
 
 
 def _record_call(totals: dict[str, Any], meta: dict[str, Any]) -> None:

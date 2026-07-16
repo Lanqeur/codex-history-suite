@@ -646,6 +646,13 @@ def _insert_record(
         "INSERT OR IGNORE INTO semantic_documents(document_id,content_sha256,document_text,record_count,created_at) VALUES(?,?,?,?,?)",
         (document_id, content_sha, semantic_text, 0, now),
     )
+    document = connection.execute(
+        "SELECT document_id FROM semantic_documents WHERE content_sha256=?",
+        (content_sha,),
+    ).fetchone()
+    if document is None:
+        raise RuntimeError("Semantic document insert did not produce a resolvable row")
+    document_id = str(document["document_id"])
     connection.execute(
         "INSERT OR REPLACE INTO semantic_document_records(document_id,record_id) VALUES(?,?)",
         (document_id, record_id),

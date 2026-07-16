@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import replace
 from pathlib import Path
 
 from codex_history.pipeline import build_full
 from codex_history.pipeline import active_info, equivalence_audit, plan, update_incremental
-from codex_history.knowledge import _semantic_projection
+from codex_history.knowledge import _semantic_projection, insert_model_ledger_items
 from codex_history.schema import connect
-from codex_history.summarize import summarize_scopes
+from codex_history.summarize import _validate_writer_response, summarize_scopes
 
 from conftest import add_transcript
 
@@ -97,6 +98,75 @@ def test_semantic_projection_bounds_provider_input_without_changing_authority_te
     assert "MIDDLE" in projected
     assert projected.endswith("-TAIL")
     assert len(text) > len(projected)
+
+
+def test_model_ledger_reuses_legacy_semantic_document_id(portable_profile):
+    config, codex_home = portable_profile
+    add_transcript(
+        codex_home,
+        "thread-legacy-semantic",
+        "Legacy semantic ID",
+        timestamp="2026-07-14T01:00:00Z",
+        label="legacy-semantic",
+    )
+    built = build_full(config)
+    connection = connect(Path(built["database"]))
+    try:
+        source_record_id = connection.execute(
+            "SELECT record_id FROM knowledge WHERE scope_id='thread-legacy-semantic' "
+            "AND tier='fact_block'"
+        ).fetchone()[0]
+        text = "A legacy semantic document ID remains reusable by a new ledger record."
+        content_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        connection.execute(
+            "INSERT INTO semantic_documents(document_id,content_sha256,document_text,record_count,created_at) "
+            "VALUES(?,?,?,?,?)",
+            ("legacy-document-id", content_sha, text, 0, "2026-07-14T01:00:00Z"),
+        )
+        record_ids = insert_model_ledger_items(
+            connection,
+            scope_id="thread-legacy-semantic",
+            items=[
+                {
+                    "text": text,
+                    "status": "executed",
+                    "category": "implementation",
+                    "record_ids": [source_record_id],
+                }
+            ],
+            generation_id="legacy-generation",
+            build_id=str(built["build_id"]),
+            model="fake-model",
+            cache_key="fake-cache-key",
+        )
+        mapped = connection.execute(
+            "SELECT document_id FROM semantic_document_records WHERE record_id=?",
+            (record_ids[0],),
+        ).fetchone()[0]
+        assert mapped == "legacy-document-id"
+    finally:
+        connection.close()
+
+
+def test_writer_claim_reconciles_only_terminal_punctuation():
+    response = {
+        "overview": "The baseline was verified; the delta remains pending.",
+        "claims": [
+            {
+                "text": "The baseline was verified.",
+                "record_ids": ["record-1"],
+            }
+        ],
+        "assets": [],
+    }
+    normalized = _validate_writer_response(response, {"record-1"})
+    assert normalized["claims"][0]["text"] == "The baseline was verified;"
+
+    import pytest
+
+    response["claims"][0]["text"] = "The baseline was not verified."
+    with pytest.raises(ValueError, match="absent from overview"):
+        _validate_writer_response(response, {"record-1"})
 
 
 def test_evidence_linked_model_summary_and_cache(portable_profile, monkeypatch):
