@@ -239,7 +239,7 @@ def _deduplicated_join(values: Iterable[str]) -> str:
 
 def parse_snapshot(snapshot: SnapshotFile, config: ProfileConfig) -> ParsedThread:
     events: list[ParsedEvent] = []
-    artifacts: list[dict[str, Any]] = []
+    artifacts: list[dict[str, Any]] = [dict(item) for item in snapshot.artifacts]
     errors: list[dict[str, Any]] = []
     content_occurrences: Counter[str] = Counter()
     current_turn_seq: int | None = None

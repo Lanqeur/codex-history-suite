@@ -7,7 +7,7 @@ from .util import utc_now
 
 
 SCHEMA_NAME = "codex-history-suite"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 BASE_SCHEMA = r"""
@@ -62,6 +62,9 @@ CREATE TABLE IF NOT EXISTS source_files(
     mtime_ns INTEGER NOT NULL,
     content_sha256 TEXT NOT NULL,
     prefix_sha256 TEXT NOT NULL,
+    snapshot_format TEXT NOT NULL DEFAULT 'raw-jsonl',
+    snapshot_size_bytes INTEGER NOT NULL DEFAULT 0,
+    snapshot_content_sha256 TEXT NOT NULL DEFAULT '',
     line_count INTEGER NOT NULL,
     snapshot_manifest_path TEXT NOT NULL,
     source_state TEXT NOT NULL,
@@ -642,11 +645,18 @@ def initialize(connection: sqlite3.Connection) -> None:
     _ensure_column(connection, "threads", "parent_thread_id TEXT")
     _ensure_column(connection, "threads", "source_id TEXT")
     _ensure_column(connection, "knowledge_versions", "build_id TEXT")
+    _ensure_column(connection, "source_files", "snapshot_format TEXT NOT NULL DEFAULT 'raw-jsonl'")
+    _ensure_column(connection, "source_files", "snapshot_size_bytes INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(connection, "source_files", "snapshot_content_sha256 TEXT NOT NULL DEFAULT ''")
     _create_fts(connection)
     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     connection.execute(
         "INSERT OR IGNORE INTO schema_migrations(version,applied_at,description) VALUES(?,?,?)",
-        (SCHEMA_VERSION, utc_now(), "Add portable library path mappings"),
+        (
+            SCHEMA_VERSION,
+            utc_now(),
+            "Add normalized transcript snapshot metadata for incremental portability",
+        ),
     )
     values = {
         "schema_name": SCHEMA_NAME,

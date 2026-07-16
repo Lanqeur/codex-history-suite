@@ -121,14 +121,18 @@ def insert_source_snapshot(connection: sqlite3.Connection, snapshot: SnapshotFil
         """
         INSERT INTO source_files(
             source_id,adapter,source_root,source_path,relative_path,thread_id,size_bytes,
-            mtime_ns,content_sha256,prefix_sha256,line_count,snapshot_manifest_path,
-            source_state,first_seen_at,last_seen_at
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            mtime_ns,content_sha256,prefix_sha256,snapshot_format,snapshot_size_bytes,
+            snapshot_content_sha256,line_count,snapshot_manifest_path,source_state,
+            first_seen_at,last_seen_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(source_id) DO UPDATE SET
             adapter=excluded.adapter,source_root=excluded.source_root,
             source_path=excluded.source_path,relative_path=excluded.relative_path,
             thread_id=excluded.thread_id,size_bytes=excluded.size_bytes,mtime_ns=excluded.mtime_ns,
             content_sha256=excluded.content_sha256,prefix_sha256=excluded.prefix_sha256,
+            snapshot_format=excluded.snapshot_format,
+            snapshot_size_bytes=excluded.snapshot_size_bytes,
+            snapshot_content_sha256=excluded.snapshot_content_sha256,
             line_count=excluded.line_count,snapshot_manifest_path=excluded.snapshot_manifest_path,
             source_state=excluded.source_state,last_seen_at=excluded.last_seen_at
         """,
@@ -143,6 +147,9 @@ def insert_source_snapshot(connection: sqlite3.Connection, snapshot: SnapshotFil
             source.mtime_ns,
             snapshot.content_sha256,
             snapshot.prefix_sha256,
+            "normalized-jsonl-v1",
+            snapshot.snapshot_size_bytes,
+            snapshot.snapshot_content_sha256,
             snapshot.line_count,
             str(snapshot.manifest_path),
             "active",
@@ -233,6 +240,18 @@ def _insert_thread_structure(
             tool_call_count,tool_output_count,goal_event_count,compacted_count,indexed_at,
             source_kind,parent_thread_id,source_id
         ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(thread_id) DO UPDATE SET
+            title=excluded.title,transcript_relative_path=excluded.transcript_relative_path,
+            source_relative_path=excluded.source_relative_path,
+            source_size_bytes=excluded.source_size_bytes,line_count=excluded.line_count,
+            first_activity_at=excluded.first_activity_at,last_activity_at=excluded.last_activity_at,
+            event_count=excluded.event_count,turn_count=excluded.turn_count,
+            message_count=excluded.message_count,user_message_count=excluded.user_message_count,
+            assistant_message_count=excluded.assistant_message_count,
+            tool_call_count=excluded.tool_call_count,tool_output_count=excluded.tool_output_count,
+            goal_event_count=excluded.goal_event_count,compacted_count=excluded.compacted_count,
+            indexed_at=excluded.indexed_at,source_kind=excluded.source_kind,
+            parent_thread_id=excluded.parent_thread_id,source_id=excluded.source_id
         """,
         (
             parsed.thread_id,
@@ -310,15 +329,72 @@ def _insert_thread_structure(
                 event.event_type,
                 event.payload_type,
                 event.role,
-                event.text,
+                truncate(event.text, 16000),
                 event.tool_name,
                 event.call_id,
-                event.raw_json,
+                "",
                 canonical_json(event.metadata),
             )
             for event in parsed.events
         ),
     )
+
+
+def hydrate_parsed_thread(
+    connection: sqlite3.Connection,
+    snapshot: SnapshotFile,
+    parsed: ParsedThread,
+    config: ProfileConfig,
+    *,
+    index_new_knowledge: bool = False,
+) -> dict[str, int]:
+    existing = connection.execute(
+        "SELECT 1 FROM threads WHERE thread_id=?", (parsed.thread_id,)
+    ).fetchone()
+    if not existing:
+        inserted = insert_parsed_thread(connection, snapshot, parsed, config)
+        inserted["preserved_curated_scope"] = 0
+        return inserted
+    previous_events = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT event_id FROM canonical_events WHERE thread_id=?", (parsed.thread_id,)
+        )
+    }
+    previous_turns = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT turn_id FROM turns WHERE thread_id=?", (parsed.thread_id,)
+        )
+    }
+    connection.execute("DELETE FROM canonical_events WHERE thread_id=?", (parsed.thread_id,))
+    connection.execute("DELETE FROM turns WHERE thread_id=?", (parsed.thread_id,))
+    _insert_thread_structure(connection, snapshot, parsed)
+    _insert_artifacts(connection, snapshot, parsed, config)
+    if index_new_knowledge and not connection.execute(
+        "SELECT 1 FROM scopes WHERE scope_id=?", (parsed.thread_id,)
+    ).fetchone():
+        _insert_scope(connection, parsed, _thread_overview(parsed))
+    indexed = (
+        _insert_incremental_knowledge(
+            connection,
+            snapshot,
+            parsed,
+            event_ids={event.event_id for event in parsed.events} - previous_events,
+            turn_ids={turn.turn_id for turn in parsed.turns} - previous_turns,
+        )
+        if index_new_knowledge
+        else {"evidence": 0, "fact_blocks": 0}
+    )
+    return {
+        "events": len(parsed.events),
+        "turns": len(parsed.turns),
+        "evidence": indexed["evidence"],
+        "fact_blocks": indexed["fact_blocks"],
+        "parse_errors": len(parsed.parse_errors),
+        "artifacts": len(parsed.image_artifacts),
+        "preserved_curated_scope": 1,
+    }
 
 
 def _insert_scope(connection: sqlite3.Connection, parsed: ParsedThread, overview: str) -> None:
@@ -765,6 +841,134 @@ def _insert_artifacts(
                     raw_path,
                 ),
             )
+
+
+def _insert_incremental_knowledge(
+    connection: sqlite3.Connection,
+    snapshot: SnapshotFile,
+    parsed: ParsedThread,
+    *,
+    event_ids: set[str],
+    turn_ids: set[str],
+) -> dict[str, int]:
+    evidence_by_event: dict[str, tuple[str, str]] = {}
+    for event in parsed.events:
+        if (
+            event.event_id in event_ids
+            and event.role in {"user", "assistant", "tool_call", "tool_output", "goal"}
+            and event.text
+        ):
+            evidence_by_event[event.event_id] = _upsert_evidence(
+                connection, parsed, event
+            )
+    for event in parsed.events:
+        linked = evidence_by_event.get(event.event_id)
+        if not linked:
+            continue
+        evidence_id, _occurrence_id = linked
+        status, status_group, confidence = _status_for_event(event)
+        _insert_record(
+            connection,
+            record_id=stable_id("record", "event", parsed.thread_id, event.event_id),
+            tier="core",
+            asset_type="",
+            scope_id=parsed.thread_id,
+            scope_type="thread",
+            scope_title=parsed.title,
+            category=_event_category(event),
+            text=event.text,
+            status=status,
+            status_group=status_group,
+            evidence_refs=[evidence_id],
+            source_path=_source_uri(snapshot.source.source_id, event.line_no),
+            source_locator=f"line[{event.line_no}]",
+            confidence=confidence,
+            occurred_start_at=event.timestamp,
+            occurred_end_at=event.timestamp,
+            metadata={
+                "event_id": event.event_id,
+                "line_no": event.line_no,
+                "payload_type": event.payload_type,
+                "tool_name": event.tool_name,
+                "call_id": event.call_id,
+                "incremental_append": True,
+            },
+        )
+        for asset_type in _asset_types(event):
+            _insert_record(
+                connection,
+                record_id=stable_id(
+                    "record", "asset", asset_type, parsed.thread_id, event.event_id
+                ),
+                tier="asset",
+                asset_type=asset_type,
+                scope_id=parsed.thread_id,
+                scope_type="thread",
+                scope_title=parsed.title,
+                category=asset_type,
+                text=event.text,
+                status=status,
+                status_group=status_group,
+                evidence_refs=[evidence_id],
+                source_path=_source_uri(snapshot.source.source_id, event.line_no),
+                source_locator=f"line[{event.line_no}]",
+                confidence=confidence,
+                occurred_start_at=event.timestamp,
+                occurred_end_at=event.timestamp,
+                metadata={
+                    "derived_by": "deterministic-asset-classifier-v1",
+                    "event_id": event.event_id,
+                    "incremental_append": True,
+                },
+            )
+
+    events_by_turn: dict[str, list[ParsedEvent]] = defaultdict(list)
+    for event in parsed.events:
+        if event.turn_id:
+            events_by_turn[event.turn_id].append(event)
+    fact_blocks = 0
+    for turn in parsed.turns:
+        if turn.turn_id not in turn_ids:
+            continue
+        events = events_by_turn.get(turn.turn_id, [])
+        evidence_refs = list(
+            dict.fromkeys(
+                evidence_by_event[event.event_id][0]
+                for event in events
+                if event.event_id in evidence_by_event
+            )
+        )
+        _insert_record(
+            connection,
+            record_id=stable_id("record", "turn", parsed.thread_id, turn.turn_id),
+            tier="fact_block",
+            asset_type="",
+            scope_id=parsed.thread_id,
+            scope_type="thread",
+            scope_title=parsed.title,
+            category="turn_summary",
+            text=_turn_text(turn, events),
+            status="executed" if turn.status == "complete" else turn.status,
+            status_group="executed" if turn.status == "complete" else "uncertain",
+            evidence_refs=evidence_refs,
+            source_path=_source_uri(snapshot.source.source_id),
+            source_locator=f"turn[{turn.turn_seq}]",
+            confidence="deterministic_extract",
+            occurred_start_at=turn.started_at,
+            occurred_end_at=turn.completed_at,
+            metadata={
+                "turn_id": turn.turn_id,
+                "turn_seq": turn.turn_seq,
+                "source_status": turn.status,
+                "incremental_append": True,
+            },
+        )
+        fact_blocks += 1
+    connection.execute(
+        "UPDATE scopes SET evidence_rows=evidence_rows+? WHERE scope_id=?",
+        (len(evidence_by_event), parsed.thread_id),
+    )
+    return {"evidence": len(evidence_by_event), "fact_blocks": fact_blocks}
 
 
 def insert_parsed_thread(

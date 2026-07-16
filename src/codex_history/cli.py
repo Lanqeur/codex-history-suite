@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .audit import audit_database
 from .config import (
     default_codex_homes,
     default_data_home,
@@ -21,11 +20,14 @@ from .config import (
     resolve_summarization,
     write_initial_config,
 )
+from .coverage import knowledge_coverage
 from .pipeline import (
     active_database,
     active_info,
     build_full,
+    compact_canonical_storage,
     equivalence_audit,
+    hydrate_canonical_baseline,
     plan,
     update_incremental,
 )
@@ -91,6 +93,21 @@ def _management_parser() -> argparse.ArgumentParser:
     build.add_argument("--no-promote", action="store_true")
     build.add_argument("--json", action="store_true")
 
+    hydrate = subparsers.add_parser(
+        "hydrate-baseline",
+        help="attach canonical transcript snapshots to a migrated curated knowledge base",
+    )
+    hydrate.add_argument("--max-cost-cny", type=float, default=None)
+    hydrate.add_argument("--no-promote", action="store_true")
+    hydrate.add_argument("--json", action="store_true")
+
+    compact = subparsers.add_parser(
+        "compact-storage",
+        help="remove duplicate canonical payloads after snapshot-offset trace verification",
+    )
+    compact.add_argument("--no-promote", action="store_true")
+    compact.add_argument("--json", action="store_true")
+
     update = subparsers.add_parser("update", help="plan or apply an incremental update")
     update.add_argument("--dry-run", action="store_true")
     update.add_argument("--max-cost-cny", type=float, default=None)
@@ -100,9 +117,15 @@ def _management_parser() -> argparse.ArgumentParser:
     status = subparsers.add_parser("status", help="show active build and incomplete runs")
     status.add_argument("--json", action="store_true")
 
+    coverage = subparsers.add_parser(
+        "coverage", help="show represented history time range and source observation watermark"
+    )
+    coverage.add_argument("--json", action="store_true")
+
     audit = subparsers.add_parser("audit", help="audit integrity or full/incremental equivalence")
     audit.add_argument("--equivalence", action="store_true")
     audit.add_argument("--keep-reference", action="store_true")
+    audit.add_argument("--verify-artifact-hashes", action="store_true")
     audit.add_argument("--json", action="store_true")
 
     repair = subparsers.add_parser("repair", help="inspect failed runs and remove stale locks")
@@ -113,6 +136,12 @@ def _management_parser() -> argparse.ArgumentParser:
     migrate.add_argument("--from-db", type=Path, required=True)
     migrate.add_argument("--skip-source-adoption", action="store_true")
     migrate.add_argument("--from-chroma", type=Path, default=None)
+    migrate.add_argument("--from-artifacts", type=Path, default=None)
+    migrate.add_argument(
+        "--artifact-mode",
+        choices=("reference", "copy", "hardlink", "auto"),
+        default="reference",
+    )
     migrate.add_argument("--no-promote", action="store_true")
     migrate.add_argument("--json", action="store_true")
 
@@ -136,9 +165,26 @@ def _management_parser() -> argparse.ArgumentParser:
         "export", help="export a verified, portable library bundle"
     )
     library_export.add_argument("destination", type=Path)
+    library_export.add_argument(
+        "--artifacts",
+        choices=("none", "referenced", "all"),
+        default="referenced",
+        help="omit artifacts, include database-referenced artifacts, or include the complete CAS",
+    )
     library_export.add_argument("--without-semantic", action="store_true")
     library_export.add_argument("--without-model-cache", action="store_true")
     library_export.add_argument("--json", action="store_true")
+
+    delta_export = library_commands.add_parser(
+        "export-delta", help="export only changes since a canonical baseline or prior delta"
+    )
+    delta_export.add_argument("destination", type=Path)
+    delta_export.add_argument("--base", type=Path, required=True)
+    delta_export.add_argument(
+        "--artifacts", choices=("none", "referenced", "all"), default="referenced"
+    )
+    delta_export.add_argument("--without-model-cache", action="store_true")
+    delta_export.add_argument("--json", action="store_true")
 
     library_import = library_commands.add_parser(
         "import", help="verify and import a device library with automatic naming"
@@ -151,9 +197,33 @@ def _management_parser() -> argparse.ArgumentParser:
     )
     library_import.add_argument("--json", action="store_true")
 
+    delta_apply = library_commands.add_parser(
+        "apply-delta", help="apply a verified source delta and run an incremental rebuild"
+    )
+    delta_apply.add_argument("delta", type=Path)
+    delta_apply.add_argument("--max-cost-cny", type=float, default=None)
+    delta_apply.add_argument("--json", action="store_true")
+
     library_verify = library_commands.add_parser("verify", help="verify every bundled file hash")
     library_verify.add_argument("bundle", type=Path)
     library_verify.add_argument("--json", action="store_true")
+
+    artifact_audit = library_commands.add_parser(
+        "artifact-audit", help="check database-to-CAS artifact closure"
+    )
+    artifact_audit.add_argument("--verify-hashes", action="store_true")
+    artifact_audit.add_argument("--json", action="store_true")
+
+    adopt_artifacts = library_commands.add_parser(
+        "adopt-artifacts", help="verify and attach or materialize an existing artifact CAS"
+    )
+    adopt_artifacts.add_argument("source", type=Path)
+    adopt_artifacts.add_argument(
+        "--mode",
+        choices=("reference", "copy", "hardlink", "auto"),
+        default="reference",
+    )
+    adopt_artifacts.add_argument("--json", action="store_true")
 
     library_search = library_commands.add_parser(
         "search", help="search multiple libraries and collapse duplicate knowledge"
@@ -351,6 +421,11 @@ def _status(config) -> dict[str, Any]:
         "active": active_info(config),
         "database": str(database) if database else None,
         "counts": counts,
+        "history_coverage": (
+            knowledge_coverage(config, database, active=active_info(config))
+            if database
+            else None
+        ),
         "runs": runs[:20],
         "lock_exists": config.lock_path.exists(),
     }
@@ -388,6 +463,7 @@ def _query_main(
         raise SystemExit("No active Codex History build. Run `codex-history build` first.")
     os.environ["CODEX_HISTORY_DB"] = str(database)
     os.environ["CODEX_HISTORY_CHROMA"] = str(config.root / "semantic/chroma")
+    os.environ["CODEX_HISTORY_SNAPSHOTS"] = str(config.snapshots_dir)
     os.environ["CODEX_HISTORY_RETRIEVAL"] = "hybrid" if config.embedding_enabled else "lexical"
     os.environ["CODEX_HISTORY_EMBEDDING_ENDPOINT"] = config.embedding_endpoint
     os.environ["CODEX_HISTORY_EMBEDDING_API_KEY_ENV"] = config.embedding_api_key_env
@@ -404,12 +480,20 @@ def _query_main(
         ],
         ensure_ascii=False,
     )
+    from .artifacts import external_artifact_roots
+
+    os.environ["CODEX_HISTORY_ARTIFACT_ROOTS"] = json.dumps(
+        [str(config.cas_dir), *(str(path) for path in external_artifact_roots(config))],
+        ensure_ascii=False,
+    )
     from . import query
 
     query.PATH_MAPPINGS = [
         {"original_prefix": old, "local_prefix": new}
         for old, new in config.path_mappings
     ]
+    query.ARTIFACT_ROOTS = [config.cas_dir, *external_artifact_roots(config)]
+    query.SNAPSHOT_ROOT = config.snapshots_dir
 
     return query.main(["--db", str(database), *argv])
 
@@ -497,7 +581,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "library":
         from .library import (
+            apply_delta,
             configure_device,
+            export_delta,
             export_library,
             federated_search,
             import_library,
@@ -505,7 +591,9 @@ def main(argv: list[str] | None = None) -> int:
             merge_libraries,
             sync_libraries,
             verify_bundle,
+            verify_delta,
         )
+        from .artifacts import adopt_artifacts, inspect_artifact_closure
 
         if args.library_command == "device":
             _print(configure_device(home, args.name), as_json=args.json)
@@ -514,9 +602,33 @@ def main(argv: list[str] | None = None) -> int:
             _print(list_libraries(home), as_json=args.json)
             return 0
         if args.library_command == "verify":
-            value = verify_bundle(args.bundle)
+            import zipfile
+
+            with zipfile.ZipFile(args.bundle, "r") as archive:
+                is_delta = "delta.json" in archive.namelist()
+            value = verify_delta(args.bundle) if is_delta else verify_bundle(args.bundle)
             _print(value, as_json=args.json)
             return 0 if value["passed"] else 2
+        if args.library_command == "artifact-audit":
+            config = load_config(home, args.profile)
+            database = active_database(config)
+            if not database:
+                raise RuntimeError("No active database")
+            value, _ = inspect_artifact_closure(
+                config, database, verify_hashes=args.verify_hashes
+            )
+            _print(value, as_json=args.json)
+            return 0 if value["complete"] else 2
+        if args.library_command == "adopt-artifacts":
+            config = load_config(home, args.profile)
+            database = active_database(config)
+            if not database:
+                raise RuntimeError("No active database")
+            _print(
+                adopt_artifacts(config, database, args.source, mode=args.mode),
+                as_json=args.json,
+            )
+            return 0
         if args.library_command == "import":
             mappings: list[tuple[str, str]] = []
             for value in args.path_map:
@@ -531,6 +643,17 @@ def main(argv: list[str] | None = None) -> int:
                 as_json=args.json,
             )
             return 0
+        if args.library_command == "apply-delta":
+            _print(
+                apply_delta(
+                    home,
+                    args.delta,
+                    profile_name=args.profile or "",
+                    max_cost_cny=args.max_cost_cny,
+                ),
+                as_json=args.json,
+            )
+            return 0
         if args.library_command == "export":
             config = load_config(home, args.profile)
             _print(
@@ -538,6 +661,20 @@ def main(argv: list[str] | None = None) -> int:
                     config,
                     args.destination,
                     include_semantic=not args.without_semantic,
+                    include_model_cache=not args.without_model_cache,
+                    artifact_mode=args.artifacts,
+                ),
+                as_json=args.json,
+            )
+            return 0
+        if args.library_command == "export-delta":
+            config = load_config(home, args.profile)
+            _print(
+                export_delta(
+                    config,
+                    args.destination,
+                    base=args.base,
+                    artifact_mode=args.artifacts,
                     include_model_cache=not args.without_model_cache,
                 ),
                 as_json=args.json,
@@ -635,6 +772,25 @@ def main(argv: list[str] | None = None) -> int:
             as_json=args.json,
         )
         return 0
+    if args.command == "hydrate-baseline":
+        _print(
+            hydrate_canonical_baseline(
+                config,
+                promote=not args.no_promote,
+                max_cost_cny=args.max_cost_cny,
+            ),
+            as_json=args.json,
+        )
+        return 0
+    if args.command == "compact-storage":
+        _print(
+            compact_canonical_storage(
+                config,
+                promote=not args.no_promote,
+            ),
+            as_json=args.json,
+        )
+        return 0
     if args.command == "update":
         value = (
             plan(config, mode="incremental")
@@ -650,6 +806,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "status":
         _print(_status(config), as_json=args.json)
         return 0
+    if args.command == "coverage":
+        database = active_database(config)
+        if not database:
+            raise RuntimeError("No active database")
+        _print(
+            knowledge_coverage(config, database, active=active_info(config)),
+            as_json=args.json,
+        )
+        return 0
     if args.command == "audit":
         if args.equivalence:
             value = equivalence_audit(config, keep_reference=args.keep_reference)
@@ -657,7 +822,13 @@ def main(argv: list[str] | None = None) -> int:
             database = active_database(config)
             if not database:
                 raise RuntimeError("No active database")
-            value = audit_database(database)
+            from .audit import audit_profile
+
+            value = audit_profile(
+                config,
+                database,
+                verify_artifact_hashes=args.verify_artifact_hashes,
+            )
         _print(value, as_json=args.json)
         return 0 if value["passed"] else 2
     if args.command == "repair":
@@ -678,6 +849,8 @@ def main(argv: list[str] | None = None) -> int:
             promote=not args.no_promote,
             adopt_sources=not args.skip_source_adoption,
             source_chroma=args.from_chroma,
+            source_artifacts=args.from_artifacts,
+            artifact_mode=args.artifact_mode,
         )
         _print(value, as_json=args.json)
         return 0

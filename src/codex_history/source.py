@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import base64
+import binascii
 import json
+import mimetypes
 import os
+import re
 import sqlite3
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -10,6 +14,12 @@ from typing import Any, Iterable, Iterator
 
 from .config import ProfileConfig
 from .util import atomic_write_bytes, atomic_write_json, sha256_file, stable_id, utc_now
+
+
+SOURCE_IDENTITY_FILE = "source_identity.jsonl"
+DATA_URI_BYTES_RE = re.compile(
+    rb"data:(image/[A-Za-z0-9.+-]+);base64,([A-Za-z0-9+/=\r\n]+)"
+)
 
 
 @dataclass(frozen=True)
@@ -25,6 +35,10 @@ class SourceCandidate:
     mtime_ns: int
     archived: bool
     session_meta: dict[str, Any]
+    declared_size_bytes: int | None = None
+    declared_content_sha256: str = ""
+    snapshot_format: str = "raw-jsonl"
+    declared_artifacts: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -40,9 +54,12 @@ class SnapshotFile:
     source: SourceCandidate
     content_sha256: str
     prefix_sha256: str
+    snapshot_content_sha256: str
+    snapshot_size_bytes: int
     line_count: int
     manifest_path: Path
     chunks: tuple[dict[str, Any], ...]
+    artifacts: tuple[dict[str, Any], ...] = ()
 
 
 def _first_json(path: Path) -> dict[str, Any]:
@@ -95,6 +112,38 @@ def _state_titles(root: Path) -> dict[str, str]:
     return result
 
 
+def _portable_identities(root: Path) -> dict[str, dict[str, Any]]:
+    path = root / SOURCE_IDENTITY_FILE
+    result: dict[str, dict[str, Any]] = {}
+    if not path.is_file():
+        return result
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(row, dict):
+                continue
+            relative = str(row.get("relative_path") or "")
+            source_id = str(row.get("source_id") or "")
+            if relative and source_id:
+                result[relative] = {
+                    "source_id": source_id,
+                    "thread_id": str(row.get("thread_id") or ""),
+                    "title": str(row.get("title") or ""),
+                    "source_size_bytes": str(row.get("source_size_bytes") or ""),
+                    "source_content_sha256": str(row.get("source_content_sha256") or ""),
+                    "snapshot_format": str(row.get("snapshot_format") or ""),
+                    "artifacts": [
+                        dict(item)
+                        for item in row.get("artifacts", [])
+                        if isinstance(item, dict)
+                    ],
+                }
+    return result
+
+
 def _thread_id(path: Path, first: dict[str, Any]) -> str:
     payload = first.get("payload") if isinstance(first.get("payload"), dict) else {}
     identifier = payload.get("id") or first.get("thread_id")
@@ -118,6 +167,7 @@ def discover_sources(config: ProfileConfig) -> list[SourceCandidate]:
             continue
         titles = _session_index(root)
         titles.update(_state_titles(root))
+        portable_identities = _portable_identities(root)
         paths: list[Path] = []
         sessions = root / "sessions"
         if sessions.is_dir():
@@ -145,8 +195,15 @@ def discover_sources(config: ProfileConfig) -> list[SourceCandidate]:
                 relative = path.relative_to(root).as_posix()
             except ValueError:
                 relative = path.name
+            portable = portable_identities.get(relative, {})
+            thread_id = portable.get("thread_id") or thread_id
+            title = portable.get("title") or titles.get(thread_id) or str(
+                payload.get("title") or thread_id
+            )
             is_archived = "archived_sessions" in path.parts
-            source_id = stable_id("source", "codex-jsonl", resolved)
+            source_id = portable.get("source_id") or stable_id(
+                "source", "codex-jsonl", resolved
+            )
             discovered.append(
                 SourceCandidate(
                     source_id=source_id,
@@ -160,6 +217,14 @@ def discover_sources(config: ProfileConfig) -> list[SourceCandidate]:
                     mtime_ns=stat.st_mtime_ns,
                     archived=is_archived,
                     session_meta=payload,
+                    declared_size_bytes=(
+                        int(portable["source_size_bytes"])
+                        if portable.get("source_size_bytes")
+                        else None
+                    ),
+                    declared_content_sha256=portable.get("source_content_sha256", ""),
+                    snapshot_format=portable.get("snapshot_format") or "raw-jsonl",
+                    declared_artifacts=tuple(portable.get("artifacts") or ()),
                 )
             )
     return sorted(discovered, key=lambda item: (item.thread_id, item.relative_path))
@@ -184,9 +249,31 @@ def classify_changes(
         if old is None:
             changes.append(SourceChange("added", source, None, "new source path"))
             continue
-        if source.size_bytes == int(old["size_bytes"]) and source.mtime_ns == int(old["mtime_ns"]):
-            changes.append(SourceChange("unchanged", source, old, "size and mtime match"))
+        logical_size = source.declared_size_bytes or source.size_bytes
+        logical_sha = source.declared_content_sha256
+        if logical_sha:
+            if logical_sha == str(old["content_sha256"]):
+                changes.append(
+                    SourceChange("unchanged", source, old, "portable source generation matches")
+                )
+            elif logical_size > int(old["size_bytes"]):
+                changes.append(
+                    SourceChange("appended", source, old, "portable source generation advanced")
+                )
+            else:
+                changes.append(
+                    SourceChange("rewritten", source, old, "portable source generation changed")
+                )
             continue
+        if source.size_bytes == int(old["size_bytes"]):
+            if source.mtime_ns == int(old["mtime_ns"]):
+                changes.append(SourceChange("unchanged", source, old, "size and mtime match"))
+                continue
+            if sha256_file(source.path) == old["content_sha256"]:
+                changes.append(
+                    SourceChange("unchanged", source, old, "content hash matches; mtime changed")
+                )
+                continue
         old_size = int(old["size_bytes"])
         if source.size_bytes > old_size:
             prefix = sha256_file(source.path, old_size)
@@ -201,44 +288,118 @@ def classify_changes(
     return sorted(changes, key=lambda item: (order[item.kind], (item.source or item.previous or {}).get("source_path", "") if isinstance(item.source, dict) else str(item.source.path) if item.source else str(item.previous.get("source_path", ""))))
 
 
+def _snapshot_artifact(
+    blob: bytes,
+    mime: str,
+    config: ProfileConfig,
+    artifacts: dict[str, dict[str, Any]],
+) -> str:
+    digest = hashlib.sha256(blob).hexdigest()
+    extension = mimetypes.guess_extension(mime) or ".bin"
+    extension = ".jpg" if extension == ".jpe" else extension
+    relative = Path("blobs") / digest[:2] / f"{digest}{extension}"
+    target = config.cas_dir / relative
+    if not target.exists():
+        atomic_write_bytes(target, blob)
+    uri = f"codex-history-artifact://sha256/{digest}"
+    artifacts[digest] = {
+        "sha256": digest,
+        "size_bytes": len(blob),
+        "mime_type": mime,
+        "extension": extension,
+        "cas_relative_path": relative.as_posix(),
+        "artifact_uri": uri,
+    }
+    return uri
+
+
+def _normalize_snapshot_line(
+    raw: bytes,
+    config: ProfileConfig,
+    artifacts: dict[str, dict[str, Any]],
+) -> bytes:
+    if b"data:image/" not in raw:
+        return raw
+    output = bytearray()
+    cursor = 0
+    for match in DATA_URI_BYTES_RE.finditer(raw):
+        try:
+            blob = base64.b64decode(match.group(2), validate=False)
+        except (ValueError, binascii.Error):
+            continue
+        uri = _snapshot_artifact(
+            blob, match.group(1).decode("ascii"), config, artifacts
+        )
+        output.extend(raw[cursor : match.start()])
+        output.extend(uri.encode("ascii"))
+        cursor = match.end()
+    if cursor == 0:
+        return raw
+    output.extend(raw[cursor:])
+    return bytes(output)
+
+
 def snapshot_source(config: ProfileConfig, source: SourceCandidate) -> SnapshotFile:
-    chunk_root = config.snapshots_dir / "chunks"
     chunks: list[dict[str, Any]] = []
-    full_digest = hashlib.sha256()
+    source_digest = hashlib.sha256()
+    snapshot_digest = hashlib.sha256()
+    artifacts: dict[str, dict[str, Any]] = {
+        str(item["sha256"]): dict(item)
+        for item in source.declared_artifacts
+        if item.get("sha256")
+    }
     line_count = 0
     last_byte = b""
-    bytes_read = 0
+    source_bytes_read = 0
+    snapshot_bytes = 0
     remaining = source.size_bytes
+    pending = bytearray()
+
+    def emit(block: bytes) -> None:
+        digest = hashlib.sha256(block).hexdigest()
+        relative = Path("chunks") / digest[:2] / f"{digest}.bin"
+        target = config.snapshots_dir / relative
+        if not target.exists():
+            atomic_write_bytes(target, block)
+        chunks.append(
+            {
+                "index": len(chunks),
+                "sha256": digest,
+                "size_bytes": len(block),
+                "cas_relative_path": relative.as_posix(),
+            }
+        )
+
     with source.path.open("rb") as handle:
-        index = 0
         while remaining > 0:
-            block = handle.read(min(config.snapshot_chunk_bytes, remaining))
-            if not block:
+            raw = handle.readline(remaining)
+            if not raw:
                 break
-            bytes_read += len(block)
-            remaining -= len(block)
-            full_digest.update(block)
-            line_count += block.count(b"\n")
-            last_byte = block[-1:]
-            digest = hashlib.sha256(block).hexdigest()
-            relative = Path("chunks") / digest[:2] / f"{digest}.bin"
-            target = config.snapshots_dir / relative
-            if not target.exists():
-                atomic_write_bytes(target, block)
-            chunks.append(
-                {
-                    "index": index,
-                    "sha256": digest,
-                    "size_bytes": len(block),
-                    "cas_relative_path": relative.as_posix(),
-                }
+            source_bytes_read += len(raw)
+            remaining -= len(raw)
+            source_digest.update(raw)
+            line_count += raw.count(b"\n")
+            last_byte = raw[-1:]
+            normalized = (
+                raw
+                if source.snapshot_format == "normalized-jsonl-v1"
+                else _normalize_snapshot_line(raw, config, artifacts)
             )
-            index += 1
-    if bytes_read and last_byte != b"\n":
+            snapshot_digest.update(normalized)
+            snapshot_bytes += len(normalized)
+            pending.extend(normalized)
+            while len(pending) >= config.snapshot_chunk_bytes:
+                emit(bytes(pending[: config.snapshot_chunk_bytes]))
+                del pending[: config.snapshot_chunk_bytes]
+    if pending:
+        emit(bytes(pending))
+    if source_bytes_read and last_byte != b"\n":
         line_count += 1
-    sampled_source = replace(source, size_bytes=bytes_read)
-    content_sha256 = full_digest.hexdigest()
+    logical_size = source.declared_size_bytes or source_bytes_read
+    sampled_source = replace(source, size_bytes=logical_size)
+    content_sha256 = source.declared_content_sha256 or source_digest.hexdigest()
     prefix_sha256 = content_sha256
+    snapshot_content_sha256 = snapshot_digest.hexdigest()
     manifest = {
         "schema_version": "chunked-transcript-snapshot-v1",
         "created_at": utc_now(),
@@ -247,13 +408,21 @@ def snapshot_source(config: ProfileConfig, source: SourceCandidate) -> SnapshotF
         "source_path": str(source.path),
         "relative_path": source.relative_path,
         "thread_id": source.thread_id,
-        "size_bytes": bytes_read,
+        "size_bytes": logical_size,
         "mtime_ns": source.mtime_ns,
         "content_sha256": content_sha256,
+        "snapshot_format": "normalized-jsonl-v1",
+        "snapshot_size_bytes": snapshot_bytes,
+        "snapshot_content_sha256": snapshot_content_sha256,
         "line_count": line_count,
         "chunks": chunks,
+        "artifacts": list(artifacts.values()),
     }
-    manifest_relative = Path("manifests") / source.source_id / f"{content_sha256}.json"
+    manifest_relative = (
+        Path("manifests")
+        / source.source_id
+        / f"{content_sha256}-{snapshot_content_sha256}.json"
+    )
     manifest_path = config.snapshots_dir / manifest_relative
     if not manifest_path.exists():
         atomic_write_json(manifest_path, manifest)
@@ -261,9 +430,12 @@ def snapshot_source(config: ProfileConfig, source: SourceCandidate) -> SnapshotF
         source=sampled_source,
         content_sha256=content_sha256,
         prefix_sha256=prefix_sha256,
+        snapshot_content_sha256=snapshot_content_sha256,
+        snapshot_size_bytes=snapshot_bytes,
         line_count=line_count,
         manifest_path=manifest_path,
         chunks=tuple(chunks),
+        artifacts=tuple(artifacts.values()),
     )
 
 

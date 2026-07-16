@@ -7,6 +7,7 @@ import platform
 import re
 import shutil
 import socket
+import sqlite3
 import tempfile
 import uuid
 import zipfile
@@ -15,6 +16,12 @@ from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Iterable, Mapping
 
 from .audit import audit_database
+from .artifacts import (
+    artifact_export_entries,
+    artifact_records,
+    external_artifact_roots,
+    normalize_cas_relative_path,
+)
 from .config import (
     ProfileConfig,
     catalog_path,
@@ -22,6 +29,7 @@ from .config import (
     load_config,
     profile_names,
 )
+from .coverage import knowledge_coverage, source_inventory
 from .pipeline import active_database, active_info, build_full, plan, update_incremental
 from .schema import connect, initialize
 from .util import (
@@ -37,6 +45,7 @@ from .util import (
 
 CATALOG_SCHEMA = "codex-history-library-catalog-v1"
 BUNDLE_SCHEMA = "codex-history-library-bundle-v1"
+DELTA_SCHEMA = "codex-history-library-delta-v1"
 PROFILE_SCHEMA = "codex-history-library-profile-v1"
 MERGE_SCHEMA = "codex-history-library-merge-v1"
 
@@ -63,7 +72,9 @@ def load_catalog(home: Path, *, create: bool = False) -> dict[str, Any]:
     path = catalog_path(home)
     value = read_json(path, {}) or {}
     if value and value.get("schema_version") != CATALOG_SCHEMA:
-        raise ValueError(f"Unsupported library catalog schema: {value.get('schema_version')}")
+        raise ValueError(
+            f"Unsupported library catalog schema: {value.get('schema_version')}"
+        )
     if not value:
         value = {
             "schema_version": CATALOG_SCHEMA,
@@ -174,7 +185,9 @@ def list_libraries(home: Path) -> dict[str, Any]:
             {
                 "profile": name,
                 "display_name": catalog_item.get("display_name", name),
-                "origin": catalog_item.get("origin", identity.get("lineage_kind", "local")),
+                "origin": catalog_item.get(
+                    "origin", identity.get("lineage_kind", "local")
+                ),
                 "library_id": identity["library_id"],
                 "origin_device_id": identity.get("origin_device_id", ""),
                 "origin_device_name": identity.get("origin_device_name", ""),
@@ -187,6 +200,11 @@ def list_libraries(home: Path) -> dict[str, Any]:
                     {"original_prefix": old, "local_prefix": new}
                     for old, new in config.path_mappings
                 ],
+                "history_coverage": (
+                    knowledge_coverage(config, database, active=active_info(config))
+                    if database
+                    else None
+                ),
             }
         )
     return {
@@ -230,7 +248,9 @@ def _active_files(config: ProfileConfig, database: Path) -> list[tuple[Path, str
         if connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='source_chunks'"
         ).fetchone():
-            for row in connection.execute("SELECT DISTINCT cas_relative_path FROM source_chunks"):
+            for row in connection.execute(
+                "SELECT DISTINCT cas_relative_path FROM source_chunks"
+            ):
                 relative = str(row[0])
                 path = config.snapshots_dir / relative
                 if path.is_file():
@@ -239,7 +259,9 @@ def _active_files(config: ProfileConfig, database: Path) -> list[tuple[Path, str
         if connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='source_files'"
         ).fetchone():
-            for row in connection.execute("SELECT snapshot_manifest_path FROM source_files"):
+            for row in connection.execute(
+                "SELECT snapshot_manifest_path FROM source_files"
+            ):
                 path = Path(str(row[0]))
                 if not path.is_file():
                     continue
@@ -252,13 +274,6 @@ def _active_files(config: ProfileConfig, database: Path) -> list[tuple[Path, str
     finally:
         connection.close()
 
-    # Keep the complete artifact CAS. Unreferenced files can be inherited from a
-    # prior device merge and remain valuable even before the next rebuild.
-    for path in sorted(config.cas_dir.rglob("*")):
-        if path.is_file():
-            relative = path.relative_to(config.cas_dir).as_posix()
-            archive = f"data/cas/{relative}"
-            entries[archive] = (path, archive, "artifact_cas")
     for root, prefix, role in (
         (config.root / "semantic", "data/semantic", "semantic_index"),
         (config.cache_dir / "model", "data/cache/model", "model_cache"),
@@ -272,12 +287,55 @@ def _active_files(config: ProfileConfig, database: Path) -> list[tuple[Path, str
     return list(entries.values())
 
 
+def _artifact_inventory(database: Path) -> dict[str, Any]:
+    records = [
+        {
+            "sha256": str(row["sha256"]),
+            "size_bytes": int(row["size_bytes"]),
+            "cas_relative_path": normalize_cas_relative_path(
+                str(row["cas_relative_path"])
+            ),
+        }
+        for row in artifact_records(database)
+    ]
+    records.sort(key=lambda item: (item["sha256"], item["cas_relative_path"]))
+    digest = hashlib.sha256(canonical_json(records).encode("utf-8")).hexdigest()
+    return {
+        "digest": digest,
+        "file_count": len(records),
+        "total_bytes": sum(item["size_bytes"] for item in records),
+        "files": records,
+    }
+
+
+def _tree_inventory(root: Path, archive_prefix: str) -> dict[str, Any]:
+    files = []
+    if root.is_dir():
+        for path in sorted(root.rglob("*")):
+            if not path.is_file():
+                continue
+            files.append(
+                {
+                    "path": f"{archive_prefix}/{path.relative_to(root).as_posix()}",
+                    "sha256": sha256_file(path),
+                    "size_bytes": path.stat().st_size,
+                }
+            )
+    return {
+        "digest": hashlib.sha256(canonical_json(files).encode("utf-8")).hexdigest(),
+        "file_count": len(files),
+        "total_bytes": sum(item["size_bytes"] for item in files),
+        "files": files,
+    }
+
+
 def export_library(
     config: ProfileConfig,
     destination: Path,
     *,
     include_semantic: bool = True,
     include_model_cache: bool = True,
+    artifact_mode: str = "referenced",
 ) -> dict[str, Any]:
     database = active_database(config)
     if not database:
@@ -291,6 +349,20 @@ def export_library(
     catalog = load_catalog(config.home, create=True)
     active = active_info(config) or {}
     audit = audit_database(database)
+    history_coverage = knowledge_coverage(config, database, active=active)
+    connection = connect(database, readonly=True)
+    try:
+        inventory = source_inventory(connection)
+    finally:
+        connection.close()
+    artifact_closure, artifact_entries = artifact_export_entries(
+        config,
+        database,
+        mode=artifact_mode,
+        verify_hashes=artifact_mode != "none",
+    )
+    artifact_inventory = _artifact_inventory(database)
+    cache_inventory = _tree_inventory(config.cache_dir / "model", "data/cache/model")
     with tempfile.TemporaryDirectory(prefix="codex-history-export-") as temporary:
         temporary_root = Path(temporary)
         database_copy = temporary_root / "database.sqlite3"
@@ -302,12 +374,16 @@ def export_library(
             if role == "model_cache" and not include_model_cache:
                 continue
             entries.append((path, archive, role))
+        entries.extend(artifact_entries)
         records = [_file_record(path, archive, role) for path, archive, role in entries]
         bundle_id = stable_id(
             "bundle",
             identity["library_id"],
             active.get("build_id"),
             audit["logical_digest"]["sha256"],
+            artifact_mode,
+            include_semantic,
+            include_model_cache,
             length=32,
         )
         manifest = {
@@ -320,16 +396,24 @@ def export_library(
             "source_profile": config.name,
             "source_build": active,
             "logical_digest": audit["logical_digest"]["sha256"],
+            "source_generation_id": inventory["generation_id"],
+            "source_inventory": inventory,
+            "artifact_inventory": artifact_inventory,
+            "cache_inventory": cache_inventory,
+            "history_coverage": history_coverage,
             "profile_config": _settings_from_config(config),
             "source_roots": [str(path) for path in config.source_roots],
             "path_mappings": [
                 {"original_prefix": old, "local_prefix": new}
                 for old, new in config.path_mappings
             ],
+            "artifact_closure": artifact_closure,
             "capabilities": {
                 "query": True,
-                "incremental_sources": any(role == "transcript_chunk" for *_rest, role in entries),
-                "artifacts": any(role == "artifact_cas" for *_rest, role in entries),
+                "incremental_sources": inventory["snapshot_complete"],
+                "artifacts": artifact_closure["package_complete"]
+                and artifact_closure["indexed_files"] > 0,
+                "artifact_metadata": artifact_closure["indexed_files"] > 0,
                 "semantic": any(role == "semantic_index" for *_rest, role in entries),
                 "model_cache": any(role == "model_cache" for *_rest, role in entries),
             },
@@ -339,7 +423,9 @@ def export_library(
                 "uncompressed_bytes": sum(record["size_bytes"] for record in records),
             },
         }
-        temporary_zip = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+        temporary_zip = destination.with_name(
+            f".{destination.name}.{uuid.uuid4().hex}.tmp"
+        )
         try:
             with zipfile.ZipFile(
                 temporary_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6
@@ -362,6 +448,8 @@ def export_library(
         "file_count": manifest["totals"]["file_count"],
         "verified": verified["passed"],
         "capabilities": manifest["capabilities"],
+        "artifact_closure": manifest["artifact_closure"],
+        "history_coverage": manifest["history_coverage"],
     }
 
 
@@ -385,7 +473,9 @@ def _bundle_manifest(archive: zipfile.ZipFile) -> dict[str, Any]:
     records = manifest.get("files")
     if not isinstance(records, list) or not records:
         raise ValueError("Bundle manifest contains no files")
-    record_paths = [str(record.get("path") or "") for record in records if isinstance(record, dict)]
+    record_paths = [
+        str(record.get("path") or "") for record in records if isinstance(record, dict)
+    ]
     if len(record_paths) != len(records) or len(record_paths) != len(set(record_paths)):
         raise ValueError("Bundle manifest contains invalid or duplicate file records")
     return manifest
@@ -403,9 +493,164 @@ def _hash_stream(handle: BinaryIO) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
+def _verify_bundle_artifact_closure(
+    archive: zipfile.ZipFile, manifest: Mapping[str, Any]
+) -> tuple[dict[str, Any], list[str], list[str]]:
+    errors: list[str] = []
+    warnings: list[str] = []
+    records = [dict(record) for record in manifest.get("files", [])]
+    database_record = next(
+        (record for record in records if record.get("role") == "database"), None
+    )
+    if database_record is None:
+        return {}, ["bundle contains no database record"], warnings
+    with tempfile.TemporaryDirectory(prefix="codex-history-bundle-db-") as temporary:
+        database = Path(temporary) / "database.sqlite3"
+        with (
+            archive.open(str(database_record["path"])) as source,
+            database.open("wb") as target,
+        ):
+            shutil.copyfileobj(source, target, length=1024 * 1024)
+        indexed = artifact_records(database)
+
+    declared = dict(manifest.get("artifact_closure") or {})
+    mode = str(declared.get("mode") or "legacy")
+    if mode not in {"legacy", "none", "referenced", "all"}:
+        errors.append(f"unsupported artifact export mode: {mode}")
+    packaged = {
+        str(record["path"]): record
+        for record in records
+        if record.get("role") == "artifact_cas"
+    }
+    indexed_bytes = sum(int(record["size_bytes"]) for record in indexed)
+    indexed_digest = hashlib.sha256()
+    expected_paths: set[str] = set()
+    for record in indexed:
+        indexed_digest.update(
+            f"{record['sha256']}:{int(record['size_bytes'])}\n".encode("ascii")
+        )
+        expected_path = (
+            f"data/cas/{normalize_cas_relative_path(str(record['cas_relative_path']))}"
+        )
+        expected_paths.add(expected_path)
+        packaged_record = packaged.get(expected_path)
+        if mode == "none":
+            if packaged_record is not None:
+                errors.append(
+                    f"artifact mode none unexpectedly packages: {expected_path}"
+                )
+            continue
+        if packaged_record is None:
+            errors.append(f"indexed artifact missing from bundle: {expected_path}")
+            continue
+        if str(packaged_record.get("sha256")) != str(record["sha256"]):
+            errors.append(
+                f"indexed artifact sha256 disagrees with database: {expected_path}"
+            )
+        if int(packaged_record.get("size_bytes", -1)) != int(record["size_bytes"]):
+            errors.append(
+                f"indexed artifact size disagrees with database: {expected_path}"
+            )
+
+    if mode == "referenced" and set(packaged) != expected_paths:
+        errors.append(
+            "referenced artifact bundle contains files outside the active database"
+        )
+    if mode == "none" and packaged:
+        errors.append("artifact mode none contains artifact CAS files")
+    if mode == "legacy" and indexed:
+        warnings.append("legacy bundle has no explicit artifact export policy")
+
+    computed = {
+        "mode": mode,
+        "indexed_files": len(indexed),
+        "indexed_bytes": indexed_bytes,
+        "indexed_digest": indexed_digest.hexdigest(),
+        "packaged_cas_files": len(packaged),
+        "packaged_indexed_files": 0
+        if mode == "none"
+        else len(expected_paths & set(packaged)),
+        "package_complete": mode != "none" and expected_paths.issubset(packaged),
+        "intentional_omission": mode == "none" and bool(indexed),
+    }
+    for key in (
+        "indexed_files",
+        "indexed_bytes",
+        "indexed_digest",
+        "packaged_indexed_files",
+        "packaged_cas_files",
+        "package_complete",
+    ):
+        if key in declared and declared[key] != computed[key]:
+            errors.append(
+                f"artifact closure manifest mismatch for {key}: "
+                f"declared {declared[key]!r}, computed {computed[key]!r}"
+            )
+    return computed, errors, warnings
+
+
+def _verify_source_inventory(
+    manifest: Mapping[str, Any],
+    *,
+    records: Iterable[Mapping[str, Any]],
+) -> tuple[dict[str, Any], list[str]]:
+    inventory = dict(manifest.get("source_inventory") or {})
+    errors: list[str] = []
+    sources = inventory.get("sources")
+    if (
+        not inventory.get("snapshot_complete")
+        or not isinstance(sources, list)
+        or not sources
+    ):
+        return inventory, ["bundle has no complete canonical source inventory"]
+
+    transcript_records = {
+        str(record.get("path") or ""): record
+        for record in records
+        if record.get("role") == "transcript_chunk"
+    }
+    required_paths: set[str] = set()
+    for source in sources:
+        chunks = source.get("chunks") or []
+        snapshot_size = int(source.get("snapshot_size_bytes") or 0)
+        chunk_size = sum(int(chunk.get("size_bytes") or 0) for chunk in chunks)
+        if snapshot_size != chunk_size:
+            errors.append(
+                f"source snapshot size mismatch: {source.get('source_id') or 'unknown'}"
+            )
+        for chunk in chunks:
+            relative = normalize_cas_relative_path(
+                str(chunk.get("cas_relative_path") or "")
+            )
+            archive_path = f"data/snapshots/{relative}"
+            required_paths.add(archive_path)
+            record = transcript_records.get(archive_path)
+            if record is None:
+                errors.append(
+                    f"source inventory chunk missing from bundle: {archive_path}"
+                )
+                continue
+            if str(record.get("sha256") or "") != str(chunk.get("sha256") or ""):
+                errors.append(f"source inventory chunk sha256 mismatch: {archive_path}")
+            if int(record.get("size_bytes") or -1) != int(chunk.get("size_bytes") or 0):
+                errors.append(f"source inventory chunk size mismatch: {archive_path}")
+
+    unexpected = set(transcript_records) - required_paths
+    if unexpected:
+        errors.append(
+            f"bundle contains {len(unexpected)} unreferenced transcript chunks"
+        )
+    declared_generation = str(manifest.get("source_generation_id") or "")
+    inventory_generation = _inventory_generation(inventory)
+    if declared_generation and declared_generation != inventory_generation:
+        errors.append("bundle source generation disagrees with source inventory")
+    return inventory, errors
+
+
 def verify_bundle(path: Path) -> dict[str, Any]:
     path = path.expanduser().resolve()
     errors: list[str] = []
+    warnings: list[str] = []
     checked = 0
     with zipfile.ZipFile(path, "r") as archive:
         manifest = _bundle_manifest(archive)
@@ -425,11 +670,430 @@ def verify_bundle(path: Path) -> dict[str, Any]:
                 errors.append(f"sha256 mismatch: {name}")
                 continue
             checked += 1
+        source_inventory_value, source_errors = _verify_source_inventory(
+            manifest,
+            records=manifest.get("files", []),
+        )
+        errors.extend(source_errors)
+        try:
+            artifact_closure, closure_errors, closure_warnings = (
+                _verify_bundle_artifact_closure(archive, manifest)
+            )
+            errors.extend(closure_errors)
+            warnings.extend(closure_warnings)
+        except (OSError, ValueError, sqlite3.DatabaseError) as error:
+            artifact_closure = {}
+            errors.append(f"artifact closure verification failed: {error}")
     return {
         "schema_version": BUNDLE_SCHEMA,
         "bundle": str(path),
         "bundle_id": manifest["bundle_id"],
         "library_id": manifest["library_id"],
+        "passed": not errors,
+        "checked_files": checked,
+        "source_inventory": {
+            key: source_inventory_value.get(key)
+            for key in (
+                "generation_id",
+                "source_count",
+                "thread_count",
+                "snapshot_complete",
+                "unique_chunk_count",
+                "total_bytes",
+            )
+        },
+        "artifact_closure": artifact_closure,
+        "history_coverage": manifest.get("history_coverage"),
+        "warnings": warnings,
+        "errors": errors,
+    }
+
+
+def _transfer_manifest(path: Path) -> tuple[str, dict[str, Any]]:
+    with zipfile.ZipFile(path.expanduser().resolve(), "r") as archive:
+        names = set(archive.namelist())
+        if "delta.json" in names:
+            return DELTA_SCHEMA, json.loads(archive.read("delta.json"))
+        if "bundle.json" in names:
+            return BUNDLE_SCHEMA, _bundle_manifest(archive)
+    raise ValueError("Archive contains neither bundle.json nor delta.json")
+
+
+def _inventory_generation(inventory: Mapping[str, Any]) -> str:
+    return str(inventory.get("generation_id") or "")
+
+
+def _base_transfer(path: Path) -> dict[str, Any]:
+    schema, manifest = _transfer_manifest(path)
+    verification = verify_delta(path) if schema == DELTA_SCHEMA else verify_bundle(path)
+    if not verification["passed"]:
+        raise ValueError(
+            "Base transfer failed verification: " + "; ".join(verification["errors"])
+        )
+    inventory = dict(manifest.get("source_inventory") or {})
+    if not inventory.get("snapshot_complete") or not inventory.get("sources"):
+        raise ValueError("Base transfer has no complete canonical source inventory")
+    return manifest
+
+
+def _source_change_kind(
+    config: ProfileConfig,
+    current: Mapping[str, Any],
+    previous: Mapping[str, Any] | None,
+) -> str:
+    if previous is None:
+        return "added"
+    if current.get("content_sha256") == previous.get("content_sha256"):
+        return "unchanged"
+    old_size = int(previous.get("size_bytes") or 0)
+    current_size = int(current.get("size_bytes") or 0)
+    path = Path(str(current.get("source_path") or ""))
+    if current_size > old_size and path.is_file():
+        if sha256_file(path, old_size) == str(previous.get("content_sha256") or ""):
+            return "appended"
+    return "rewritten"
+
+
+def export_delta(
+    config: ProfileConfig,
+    destination: Path,
+    *,
+    base: Path,
+    artifact_mode: str = "referenced",
+    include_model_cache: bool = True,
+) -> dict[str, Any]:
+    database = active_database(config)
+    if not database:
+        raise RuntimeError(f"Profile {config.name!r} has no active build")
+    identity = _profile_identity(config)
+    base_manifest = _base_transfer(base)
+    if str(base_manifest.get("library_id")) != str(identity["library_id"]):
+        raise ValueError("Base transfer belongs to a different library lineage")
+    connection = connect(database, readonly=True)
+    try:
+        current_inventory = source_inventory(connection)
+    finally:
+        connection.close()
+    if not current_inventory["snapshot_complete"]:
+        raise RuntimeError(
+            "The active profile has no complete canonical transcript snapshots; "
+            "create or hydrate a canonical baseline first"
+        )
+    base_inventory = dict(base_manifest["source_inventory"])
+    base_by_id = {
+        str(item["source_id"]): item for item in base_inventory.get("sources", [])
+    }
+    current_by_id = {
+        str(item["source_id"]): item for item in current_inventory.get("sources", [])
+    }
+    changes: list[dict[str, Any]] = []
+    for source_id in sorted(set(base_by_id) | set(current_by_id)):
+        current = current_by_id.get(source_id)
+        previous = base_by_id.get(source_id)
+        kind = (
+            "deleted"
+            if current is None
+            else _source_change_kind(config, current, previous)
+        )
+        if kind == "unchanged":
+            continue
+        changes.append(
+            {
+                "kind": kind,
+                "source_id": source_id,
+                "thread_id": str((current or previous or {}).get("thread_id") or ""),
+                "previous_content_sha256": (previous or {}).get("content_sha256"),
+                "content_sha256": (current or {}).get("content_sha256"),
+                "previous_size_bytes": int((previous or {}).get("size_bytes") or 0),
+                "size_bytes": int((current or {}).get("size_bytes") or 0),
+            }
+        )
+
+    base_chunks = {
+        str(chunk["sha256"])
+        for item in base_inventory.get("sources", [])
+        for chunk in item.get("chunks", [])
+    }
+    entries: dict[str, tuple[Path, str, str]] = {}
+    changed_ids = {item["source_id"] for item in changes if item["kind"] != "deleted"}
+    for source_id in changed_ids:
+        source = current_by_id[source_id]
+        for chunk in source.get("chunks", []):
+            if str(chunk["sha256"]) in base_chunks:
+                continue
+            relative = str(chunk["cas_relative_path"])
+            path = config.snapshots_dir / relative
+            if not path.is_file():
+                raise FileNotFoundError(f"Missing transcript snapshot chunk: {path}")
+            archive_path = f"data/snapshots/{Path(relative).as_posix()}"
+            entries[archive_path] = (path, archive_path, "transcript_chunk")
+
+    artifact_closure, artifact_entries = artifact_export_entries(
+        config,
+        database,
+        mode=artifact_mode,
+        verify_hashes=False,
+    )
+    current_artifacts = _artifact_inventory(database)
+    base_artifact_inventory = dict(base_manifest.get("artifact_inventory") or {})
+    base_artifacts = {
+        str(item["sha256"]) for item in base_artifact_inventory.get("files", [])
+    }
+    artifact_sha_by_path = {
+        f"data/cas/{item['cas_relative_path']}": str(item["sha256"])
+        for item in current_artifacts.get("files", [])
+    }
+    for path, archive_path, role in artifact_entries:
+        digest = artifact_sha_by_path.get(archive_path)
+        if not digest:
+            raise ValueError(
+                f"Artifact export entry is absent from the database: {archive_path}"
+            )
+        if digest not in base_artifacts:
+            if sha256_file(path) != digest:
+                raise ValueError(f"Artifact content hash mismatch: {path}")
+            entries[archive_path] = (path, archive_path, role)
+
+    current_cache = _tree_inventory(config.cache_dir / "model", "data/cache/model")
+    base_cache = {
+        (str(item["path"]), str(item["sha256"]))
+        for item in (base_manifest.get("cache_inventory") or {}).get("files", [])
+    }
+    if include_model_cache:
+        for item in current_cache["files"]:
+            key = (str(item["path"]), str(item["sha256"]))
+            if key in base_cache:
+                continue
+            relative = str(item["path"]).removeprefix("data/cache/model/")
+            path = config.cache_dir / "model" / relative
+            entries[str(item["path"])] = (path, str(item["path"]), "model_cache")
+
+    active = active_info(config) or {}
+    audit = audit_database(database)
+    history_coverage = knowledge_coverage(config, database, active=active)
+    records = [_file_record(*entry) for entry in entries.values()]
+    base_generation = _inventory_generation(base_inventory)
+    target_generation = _inventory_generation(current_inventory)
+    delta_id = stable_id(
+        "delta",
+        identity["library_id"],
+        base_generation,
+        target_generation,
+        artifact_mode,
+        length=32,
+    )
+    manifest = {
+        "schema_version": DELTA_SCHEMA,
+        "delta_id": delta_id,
+        "created_at": utc_now(),
+        "library_id": identity["library_id"],
+        "source_device": load_catalog(config.home, create=True)["device"],
+        "source_profile": config.name,
+        "base_bundle_id": base_manifest.get("bundle_id"),
+        "base_delta_id": base_manifest.get("delta_id"),
+        "base_source_generation_id": base_generation,
+        "target_source_generation_id": target_generation,
+        "base_source_inventory": base_inventory,
+        "source_build": active,
+        "logical_digest": audit["logical_digest"]["sha256"],
+        "history_coverage": history_coverage,
+        "source_inventory": current_inventory,
+        "base_artifact_inventory": base_artifact_inventory,
+        "artifact_inventory": current_artifacts,
+        "cache_inventory": current_cache,
+        "target_artifact_closure": {
+            key: artifact_closure.get(key)
+            for key in (
+                "complete",
+                "hashes_verified",
+                "indexed_files",
+                "indexed_bytes",
+                "indexed_digest",
+                "available_files",
+                "available_bytes",
+                "missing_files",
+                "registered_external_roots",
+            )
+        },
+        "artifact_delta": {
+            "mode": artifact_mode,
+            "new_files": sum(record["role"] == "artifact_cas" for record in records),
+            "new_bytes": sum(
+                int(record["size_bytes"])
+                for record in records
+                if record["role"] == "artifact_cas"
+            ),
+        },
+        "changes": changes,
+        "capabilities": {
+            "incremental_sources": True,
+            "semantic_rebuild_required": config.embedding_enabled,
+            "model_cache_delta": include_model_cache,
+            "artifact_delta": artifact_mode != "none",
+        },
+        "files": records,
+        "totals": {
+            "file_count": len(records),
+            "uncompressed_bytes": sum(item["size_bytes"] for item in records),
+        },
+    }
+    destination = destination.expanduser().resolve()
+    if destination.suffix.lower() != ".zip":
+        destination = destination.with_suffix(".zip")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with zipfile.ZipFile(
+            temporary, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6
+        ) as archive:
+            archive.writestr("delta.json", canonical_json(manifest) + "\n")
+            for path, archive_path, _role in entries.values():
+                archive.write(path, _zip_safe_name(archive_path))
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    verified = verify_delta(destination)
+    return {
+        "status": "exported",
+        "delta": str(destination),
+        "delta_id": delta_id,
+        "library_id": identity["library_id"],
+        "base_source_generation_id": base_generation,
+        "target_source_generation_id": target_generation,
+        "change_count": len(changes),
+        "change_counts": dict(
+            (kind, sum(item["kind"] == kind for item in changes))
+            for kind in ("added", "appended", "rewritten", "deleted")
+        ),
+        "delta_bytes": destination.stat().st_size,
+        "uncompressed_bytes": manifest["totals"]["uncompressed_bytes"],
+        "file_count": len(records),
+        "verified": verified["passed"],
+        "history_coverage": history_coverage,
+    }
+
+
+def verify_delta(path: Path) -> dict[str, Any]:
+    path = path.expanduser().resolve()
+    errors: list[str] = []
+    checked = 0
+    manifest: dict[str, Any] = {}
+    with zipfile.ZipFile(path, "r") as archive:
+        names = archive.namelist()
+        if len(names) != len(set(names)):
+            errors.append("delta contains duplicate archive paths")
+        for name in names:
+            try:
+                _zip_safe_name(name)
+            except ValueError as error:
+                errors.append(str(error))
+        if "delta.json" not in names:
+            errors.append("delta is missing delta.json")
+        else:
+            manifest = json.loads(archive.read("delta.json"))
+        if manifest.get("schema_version") != DELTA_SCHEMA:
+            errors.append(f"unsupported delta schema: {manifest.get('schema_version')}")
+        records = manifest.get("files") or []
+        record_paths = [str(item.get("path") or "") for item in records]
+        if len(record_paths) != len(set(record_paths)):
+            errors.append("delta manifest contains duplicate file records")
+        available = set(names)
+        for record in records:
+            name = str(record.get("path") or "")
+            if name not in available:
+                errors.append(f"missing: {name}")
+                continue
+            info = archive.getinfo(name)
+            with archive.open(name) as handle:
+                digest, size = _hash_stream(handle)
+            if digest != record.get("sha256") or size != int(
+                record.get("size_bytes", -1)
+            ):
+                errors.append(f"sha256 mismatch: {name}")
+                continue
+            if size != info.file_size:
+                errors.append(f"size mismatch: {name}")
+                continue
+            checked += 1
+        inventory = manifest.get("source_inventory") or {}
+        if not inventory.get("snapshot_complete"):
+            errors.append("delta target source inventory is incomplete")
+        if not manifest.get("base_source_generation_id"):
+            errors.append("delta has no base source generation")
+        if _inventory_generation(inventory) != manifest.get(
+            "target_source_generation_id"
+        ):
+            errors.append("delta target generation disagrees with source inventory")
+        packaged_chunks = {
+            str(record["sha256"])
+            for record in records
+            if record.get("role") == "transcript_chunk"
+        }
+        changed_ids = {
+            str(item["source_id"])
+            for item in manifest.get("changes", [])
+            if item.get("kind") != "deleted"
+        }
+        base_chunks = {
+            str(chunk["sha256"])
+            for source in (manifest.get("base_source_inventory") or {}).get(
+                "sources", []
+            )
+            for chunk in source.get("chunks", [])
+        }
+        required_chunks: set[str] = set()
+        for source in inventory.get("sources", []):
+            if str(source.get("source_id")) not in changed_ids:
+                continue
+            for chunk in source.get("chunks", []):
+                digest = str(chunk["sha256"])
+                if digest not in base_chunks:
+                    required_chunks.add(digest)
+        missing_chunks = required_chunks - packaged_chunks
+        if missing_chunks:
+            errors.append(
+                f"delta is missing {len(missing_chunks)} required transcript chunks"
+            )
+
+        artifact_delta = dict(manifest.get("artifact_delta") or {})
+        artifact_mode = str(artifact_delta.get("mode") or "")
+        if artifact_mode not in {"none", "referenced", "all"}:
+            errors.append(
+                f"unsupported delta artifact mode: {artifact_mode or 'missing'}"
+            )
+        packaged_artifacts = {
+            str(record.get("sha256") or "")
+            for record in records
+            if record.get("role") == "artifact_cas"
+        }
+        base_artifacts = {
+            str(item.get("sha256") or "")
+            for item in (manifest.get("base_artifact_inventory") or {}).get("files", [])
+        }
+        target_artifacts = {
+            str(item.get("sha256") or "")
+            for item in (manifest.get("artifact_inventory") or {}).get("files", [])
+        }
+        required_artifacts = target_artifacts - base_artifacts
+        if artifact_mode == "none":
+            if packaged_artifacts:
+                errors.append("artifact mode none contains artifact CAS files")
+        elif packaged_artifacts != required_artifacts:
+            missing = required_artifacts - packaged_artifacts
+            unexpected = packaged_artifacts - required_artifacts
+            errors.append(
+                "delta artifact closure mismatch: "
+                f"{len(missing)} missing and {len(unexpected)} unexpected"
+            )
+        if int(artifact_delta.get("new_files") or 0) != len(packaged_artifacts):
+            errors.append("delta artifact file count disagrees with manifest")
+    return {
+        "schema_version": DELTA_SCHEMA,
+        "delta": str(path),
+        "delta_id": manifest.get("delta_id"),
+        "library_id": manifest.get("library_id"),
+        "base_source_generation_id": manifest.get("base_source_generation_id"),
+        "target_source_generation_id": manifest.get("target_source_generation_id"),
         "passed": not errors,
         "checked_files": checked,
         "errors": errors,
@@ -531,6 +1195,7 @@ def _database_sources(root: Path, database: Path) -> dict[str, list[dict[str, An
         for source in connection.execute(
             "SELECT * FROM source_files WHERE source_state='active' ORDER BY thread_id,source_id"
         ):
+            source_columns = set(source.keys())
             chunks = connection.execute(
                 "SELECT * FROM source_chunks WHERE source_id=? ORDER BY chunk_index",
                 (source["source_id"],),
@@ -546,10 +1211,33 @@ def _database_sources(root: Path, database: Path) -> dict[str, list[dict[str, An
             if not data:
                 continue
             digest = hashlib.sha256(data).hexdigest()
-            expected = str(source["content_sha256"])
+            expected = str(
+                source["snapshot_content_sha256"] or source["content_sha256"]
+                if "snapshot_content_sha256" in source_columns
+                else source["content_sha256"]
+            )
             if expected and digest != expected:
-                raise ValueError(f"Transcript snapshot digest mismatch for {source['source_id']}")
+                raise ValueError(
+                    f"Transcript snapshot digest mismatch for {source['source_id']}"
+                )
             thread_id = str(source["thread_id"])
+            source_artifacts = [
+                {
+                    "sha256": str(item["sha256"]),
+                    "size_bytes": int(item["size_bytes"]),
+                    "mime_type": str(item["mime_type"]),
+                    "extension": str(item["extension"]),
+                    "cas_relative_path": str(item["cas_relative_path"]),
+                    "artifact_uri": str(item["artifact_uri"]),
+                }
+                for item in connection.execute(
+                    "SELECT DISTINCT f.sha256,f.size_bytes,f.mime_type,f.extension,"
+                    "f.cas_relative_path,f.artifact_uri FROM artifact_paths ap "
+                    "JOIN artifact_files f ON f.sha256=ap.sha256 WHERE ap.path LIKE ? "
+                    "ORDER BY f.sha256",
+                    (f"inline-image:{source['source_id']}:%",),
+                )
+            ]
             result[thread_id].append(
                 {
                     "thread_id": thread_id,
@@ -557,6 +1245,17 @@ def _database_sources(root: Path, database: Path) -> dict[str, list[dict[str, An
                     "source_id": str(source["source_id"]),
                     "source_path": str(source["source_path"]),
                     "relative_path": str(source["relative_path"]),
+                    "adapter": str(source["adapter"]),
+                    "mtime_ns": int(source["mtime_ns"]),
+                    "line_count": int(source["line_count"]),
+                    "source_size_bytes": int(source["size_bytes"]),
+                    "source_content_sha256": str(source["content_sha256"]),
+                    "snapshot_format": str(
+                        source["snapshot_format"] or "normalized-jsonl-v1"
+                        if "snapshot_format" in source_columns
+                        else "raw-jsonl"
+                    ),
+                    "artifacts": source_artifacts,
                     "data": data,
                     "sha256": digest,
                 }
@@ -576,13 +1275,16 @@ def _line_timestamp(row: Mapping[str, Any]) -> str:
     return ""
 
 
-def merge_transcript_variants(variants: Iterable[Mapping[str, Any]]) -> tuple[bytes, dict[str, Any]]:
+def merge_transcript_variants(
+    variants: Iterable[Mapping[str, Any]],
+) -> tuple[bytes, dict[str, Any]]:
     values = list(variants)
     if not values:
         return b"", {"method": "empty", "variants": 0, "unique_lines": 0}
     unique_by_digest = {str(value["sha256"]): value for value in values}
     unique = sorted(
-        unique_by_digest.values(), key=lambda value: (-len(value["data"]), str(value["sha256"]))
+        unique_by_digest.values(),
+        key=lambda value: (-len(value["data"]), str(value["sha256"])),
     )
     primary = bytes(unique[0]["data"])
     if len(unique) == 1:
@@ -666,15 +1368,44 @@ def _materialize_sources(
     session_root.mkdir(parents=True, exist_ok=True)
     reports: list[dict[str, Any]] = []
     mappings: list[dict[str, str]] = []
-    index_rows: list[dict[str, str]] = []
+    index_by_thread: dict[str, dict[str, str]] = {}
+    identity_rows: list[dict[str, Any]] = []
     for thread_id, thread_variants in sorted(variants.items()):
-        data, report = merge_transcript_variants(thread_variants)
-        digest = hashlib.sha256(data).hexdigest()
-        target = session_root / f"rollout-{_slug(thread_id, 'thread')}-{digest[:12]}.jsonl"
-        atomic_write_bytes(target, data)
-        title = str(thread_variants[0]["title"])
-        index_rows.append({"id": thread_id, "thread_name": title, "updated_at": utc_now()})
         for variant in thread_variants:
+            data = bytes(variant["data"])
+            digest = hashlib.sha256(data).hexdigest()
+            source_id = str(variant["source_id"])
+            target = session_root / f"{_slug(source_id, 'source')}.jsonl"
+            atomic_write_bytes(target, data)
+            try:
+                os.utime(
+                    target, ns=(int(variant["mtime_ns"]), int(variant["mtime_ns"]))
+                )
+            except OSError:
+                pass
+            relative = target.relative_to(source_root).as_posix()
+            title = str(variant["title"])
+            index_by_thread[thread_id] = {
+                "id": thread_id,
+                "thread_name": title,
+                "updated_at": utc_now(),
+            }
+            identity_rows.append(
+                {
+                    "source_id": source_id,
+                    "thread_id": thread_id,
+                    "title": title,
+                    "relative_path": relative,
+                    "adapter": str(variant["adapter"]),
+                    "content_sha256": digest,
+                    "size_bytes": len(data),
+                    "mtime_ns": int(variant["mtime_ns"]),
+                    "source_size_bytes": int(variant["source_size_bytes"]),
+                    "source_content_sha256": str(variant["source_content_sha256"]),
+                    "snapshot_format": "normalized-jsonl-v1",
+                    "artifacts": list(variant.get("artifacts") or []),
+                }
+            )
             mappings.append(
                 {
                     "original_prefix": str(variant["source_path"]),
@@ -682,19 +1413,32 @@ def _materialize_sources(
                     "mapping_kind": "exact-source",
                 }
             )
-        reports.append(
-            {
-                "thread_id": thread_id,
-                "title": title,
-                "target": str(target),
-                "sha256": digest,
-                **report,
-            }
-        )
+            reports.append(
+                {
+                    "thread_id": thread_id,
+                    "source_id": source_id,
+                    "title": title,
+                    "target": str(target),
+                    "sha256": digest,
+                    "method": "exact-source-snapshot",
+                    "unique_lines": data.count(b"\n"),
+                }
+            )
     index_path = source_root / "session_index.jsonl"
     index_path.parent.mkdir(parents=True, exist_ok=True)
     index_path.write_text(
-        "".join(canonical_json(row) + "\n" for row in index_rows), encoding="utf-8"
+        "".join(
+            canonical_json(row) + "\n"
+            for row in sorted(index_by_thread.values(), key=lambda item: item["id"])
+        ),
+        encoding="utf-8",
+    )
+    (source_root / "source_identity.jsonl").write_text(
+        "".join(
+            canonical_json(row) + "\n"
+            for row in sorted(identity_rows, key=lambda item: item["source_id"])
+        ),
+        encoding="utf-8",
     )
     return reports, mappings
 
@@ -756,7 +1500,9 @@ def import_library(
     catalog = load_catalog(home, create=True)
     verification = verify_bundle(bundle)
     if not verification["passed"]:
-        raise ValueError("Bundle failed verification: " + "; ".join(verification["errors"]))
+        raise ValueError(
+            "Bundle failed verification: " + "; ".join(verification["errors"])
+        )
     backup_root: Path | None = None
     with zipfile.ZipFile(bundle, "r") as archive:
         manifest = _bundle_manifest(archive)
@@ -771,7 +1517,8 @@ def import_library(
         )
         same_bundle = bool(
             existing_name
-            and catalog["profiles"][existing_name].get("bundle_id") == manifest["bundle_id"]
+            and catalog["profiles"][existing_name].get("bundle_id")
+            == manifest["bundle_id"]
         )
         if same_bundle:
             return {
@@ -782,7 +1529,10 @@ def import_library(
                 "verified": True,
             }
         source_device = manifest.get("source_device", {})
-        preferred = as_name or f"{source_device.get('slug') or _slug(str(source_device.get('display_name') or 'device'))}-{manifest.get('source_profile', 'history')}"
+        preferred = (
+            as_name
+            or f"{source_device.get('slug') or _slug(str(source_device.get('display_name') or 'device'))}-{manifest.get('source_profile', 'history')}"
+        )
         updating = existing_name is not None
         profile_name = existing_name or _available_profile_name(home, preferred)
         final_root = home / "profiles" / profile_name
@@ -815,6 +1565,14 @@ def import_library(
                 "promoted_at": utc_now(),
                 "incremental_ready": False,
                 "imported_bundle_id": manifest["bundle_id"],
+                "artifact_mode": str(
+                    (manifest.get("artifact_closure") or {}).get("mode") or "legacy"
+                ),
+                "artifact_package_complete": bool(
+                    verification.get("artifact_closure", {}).get("package_complete")
+                ),
+                "history_coverage": manifest.get("history_coverage"),
+                "source_generation_id": manifest.get("source_generation_id"),
             }
             source_slug = _slug(str(source_device.get("slug") or "device"))
             staging_source_root = staging_root / "imported_sources" / source_slug
@@ -822,7 +1580,14 @@ def import_library(
             source_reports, automatic_mappings = _materialize_sources(
                 staging_root, database, staging_source_root
             )
-            active_payload["incremental_ready"] = bool(source_reports)
+            expected_sources = int(
+                (manifest.get("source_inventory") or {}).get("source_count") or 0
+            )
+            active_payload["incremental_ready"] = bool(
+                (manifest.get("capabilities") or {}).get("incremental_sources")
+                and expected_sources
+                and len(source_reports) == expected_sources
+            )
             atomic_write_json(staging_root / "active.json", active_payload)
             mappings = [*manifest.get("path_mappings", []), *automatic_mappings]
             for old_root in manifest.get("source_roots", []):
@@ -845,7 +1610,9 @@ def import_library(
             for mapping in mappings:
                 local = str(mapping.get("local_prefix") or "")
                 if local.startswith(str(staging_root)):
-                    mapping["local_prefix"] = str(final_root) + local[len(str(staging_root)) :]
+                    mapping["local_prefix"] = (
+                        str(final_root) + local[len(str(staging_root)) :]
+                    )
             deduplicated_mappings = list(
                 {
                     (str(item["original_prefix"]), str(item["local_prefix"])): item
@@ -854,7 +1621,9 @@ def import_library(
                 }.values()
             )
             _write_path_mappings(
-                database, deduplicated_mappings, str(source_device.get("device_id") or "")
+                database,
+                deduplicated_mappings,
+                str(source_device.get("device_id") or ""),
             )
             identity = dict(manifest.get("profile_identity") or {})
             identity.update(
@@ -875,7 +1644,9 @@ def import_library(
                     home
                     / "backups/imports"
                     / profile_name
-                    / str(catalog["profiles"][profile_name].get("bundle_id") or utc_now()).replace(":", "-")
+                    / str(
+                        catalog["profiles"][profile_name].get("bundle_id") or utc_now()
+                    ).replace(":", "-")
                 )
                 backup_root.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(final_root, backup_root)
@@ -884,7 +1655,11 @@ def import_library(
             try:
                 os.replace(staging_root, final_root)
             except BaseException:
-                if backup_root is not None and backup_root.exists() and not final_root.exists():
+                if (
+                    backup_root is not None
+                    and backup_root.exists()
+                    and not final_root.exists()
+                ):
                     os.replace(backup_root, final_root)
                 raise
         except BaseException:
@@ -915,11 +1690,320 @@ def import_library(
         "bundle_id": manifest["bundle_id"],
         "verified": verification["passed"],
         "audit_passed": True,
-        "materialized_threads": len(source_reports),
+        "materialized_threads": len({item["thread_id"] for item in source_reports}),
+        "materialized_sources": len(source_reports),
         "path_mapping_count": len(deduplicated_mappings),
         "content_install": dict(stats),
+        "artifact_closure": verification.get("artifact_closure", {}),
+        "history_coverage": manifest.get("history_coverage", {}),
         "shared_blob_root": str(home / "shared/blobs"),
         "previous_version_preserved": updating,
+    }
+
+
+def _read_source_identities(root: Path) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    path = root / "source_identity.jsonl"
+    if not path.is_file():
+        return result
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict) and row.get("source_id") and row.get("relative_path"):
+            result[str(row["source_id"])] = row
+    return result
+
+
+def _write_inventory_sources(
+    config: ProfileConfig,
+    inventory: Mapping[str, Any],
+    changes: Iterable[Mapping[str, Any]],
+) -> list[Path]:
+    if not config.source_roots:
+        raise RuntimeError("Imported profile has no materialized source root")
+    root = config.source_roots[0].expanduser().resolve()
+    profile_root = config.root.resolve()
+    if root != profile_root and profile_root not in root.parents:
+        raise RuntimeError(
+            "Delta application is restricted to imported, profile-managed source roots"
+        )
+    root.mkdir(parents=True, exist_ok=True)
+    existing = _read_source_identities(root)
+    target_sources = {
+        str(item["source_id"]): dict(item) for item in inventory.get("sources", [])
+    }
+    changed = {str(item["source_id"]): str(item["kind"]) for item in changes}
+    touched: list[Path] = []
+    for source_id, kind in changed.items():
+        old = existing.get(source_id)
+        if kind == "deleted":
+            if old:
+                path = root / str(old["relative_path"])
+                path.unlink(missing_ok=True)
+                touched.append(path)
+            continue
+        source = target_sources[source_id]
+        relative = (
+            str(old["relative_path"])
+            if old
+            else f"sessions/imported/{_slug(source_id, 'source')}.jsonl"
+        )
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            with temporary.open("wb") as output:
+                for chunk in source.get("chunks", []):
+                    chunk_path = config.snapshots_dir / str(chunk["cas_relative_path"])
+                    if not chunk_path.is_file():
+                        raise FileNotFoundError(
+                            f"Missing base or delta transcript chunk: {chunk_path}"
+                        )
+                    with chunk_path.open("rb") as handle:
+                        while True:
+                            block = handle.read(1024 * 1024)
+                            if not block:
+                                break
+                            output.write(block)
+                            digest.update(block)
+                            size += len(block)
+                output.flush()
+                os.fsync(output.fileno())
+            if size != int(source["snapshot_size_bytes"]) or digest.hexdigest() != str(
+                source["snapshot_content_sha256"]
+            ):
+                raise ValueError(f"Reconstructed transcript mismatch for {source_id}")
+            os.replace(temporary, target)
+            try:
+                mtime = int(source["mtime_ns"])
+                os.utime(target, ns=(mtime, mtime))
+            except OSError:
+                pass
+        finally:
+            temporary.unlink(missing_ok=True)
+        touched.append(target)
+
+    identity_rows: list[dict[str, Any]] = []
+    index_by_thread: dict[str, dict[str, str]] = {}
+    for source_id, source in sorted(target_sources.items()):
+        old = existing.get(source_id)
+        relative = (
+            str(old["relative_path"])
+            if old
+            else f"sessions/imported/{_slug(source_id, 'source')}.jsonl"
+        )
+        identity_rows.append(
+            {
+                "source_id": source_id,
+                "thread_id": str(source["thread_id"]),
+                "title": str(source.get("title") or source["thread_id"]),
+                "relative_path": relative,
+                "adapter": str(source.get("adapter") or "codex-jsonl-v1"),
+                "content_sha256": str(source["content_sha256"]),
+                "size_bytes": int(source["snapshot_size_bytes"]),
+                "mtime_ns": int(source["mtime_ns"]),
+                "source_size_bytes": int(source["size_bytes"]),
+                "source_content_sha256": str(source["content_sha256"]),
+                "snapshot_format": "normalized-jsonl-v1",
+                "artifacts": list(source.get("artifacts") or []),
+            }
+        )
+        index_by_thread[str(source["thread_id"])] = {
+            "id": str(source["thread_id"]),
+            "thread_name": str(source.get("title") or source["thread_id"]),
+            "updated_at": utc_now(),
+        }
+    atomic_write_bytes(
+        root / "source_identity.jsonl",
+        "".join(canonical_json(row) + "\n" for row in identity_rows).encode("utf-8"),
+    )
+    atomic_write_bytes(
+        root / "session_index.jsonl",
+        "".join(
+            canonical_json(row) + "\n"
+            for row in sorted(index_by_thread.values(), key=lambda item: item["id"])
+        ).encode("utf-8"),
+    )
+    return touched
+
+
+def _delta_target(config: ProfileConfig, archive_path: str) -> Path:
+    if archive_path.startswith("data/snapshots/"):
+        return config.snapshots_dir / archive_path.removeprefix("data/snapshots/")
+    if archive_path.startswith("data/cas/"):
+        return config.cas_dir / archive_path.removeprefix("data/cas/")
+    if archive_path.startswith("data/cache/model/"):
+        return (
+            config.cache_dir / "model" / archive_path.removeprefix("data/cache/model/")
+        )
+    raise ValueError(f"Unsupported delta data path: {archive_path}")
+
+
+def apply_delta(
+    home: Path,
+    delta: Path,
+    *,
+    profile_name: str = "",
+    max_cost_cny: float | None = None,
+) -> dict[str, Any]:
+    home = home.expanduser().resolve()
+    delta = delta.expanduser().resolve()
+    verification = verify_delta(delta)
+    if not verification["passed"]:
+        raise ValueError(
+            "Delta failed verification: " + "; ".join(verification["errors"])
+        )
+    with zipfile.ZipFile(delta, "r") as archive:
+        manifest = json.loads(archive.read("delta.json"))
+        library_id = str(manifest["library_id"])
+        catalog = load_catalog(home, create=True)
+        candidates = [
+            name
+            for name, item in catalog.get("profiles", {}).items()
+            if item.get("library_id") == library_id and item.get("enabled", True)
+        ]
+        if profile_name:
+            if profile_name not in candidates:
+                raise ValueError(
+                    "Selected profile does not match the delta library lineage"
+                )
+            selected = profile_name
+        elif len(candidates) == 1:
+            selected = candidates[0]
+        elif not candidates:
+            raise ValueError(
+                "Import the canonical baseline bundle before applying this delta"
+            )
+        else:
+            raise ValueError(
+                "Multiple matching profiles exist; select one with --profile"
+            )
+        config = load_config(home, selected)
+        active = active_info(config) or {}
+        if not active.get("incremental_ready"):
+            raise RuntimeError("Target profile is not a canonical incremental baseline")
+        database = active_database(config)
+        if not database:
+            raise RuntimeError("Target profile has no active database")
+        connection = connect(database, readonly=True)
+        try:
+            current_inventory = source_inventory(connection)
+        finally:
+            connection.close()
+        current_generation = _inventory_generation(current_inventory)
+        required_generation = str(manifest["base_source_generation_id"])
+        if current_generation == str(manifest["target_source_generation_id"]):
+            return {
+                "status": "already_applied",
+                "profile": selected,
+                "library_id": library_id,
+                "delta_id": manifest["delta_id"],
+                "target_source_generation_id": current_generation,
+                "changes": 0,
+            }
+        if current_generation != required_generation:
+            raise RuntimeError(
+                "Delta base generation mismatch: target is "
+                f"{current_generation}, delta requires {required_generation}"
+            )
+
+        install_stats = defaultdict(int)
+        for record in manifest.get("files", []):
+            archive_path = str(record["path"])
+            target = _delta_target(config, archive_path)
+            if target.is_file() and sha256_file(target) == str(record["sha256"]):
+                install_stats["reused"] += 1
+                continue
+            method = _copy_from_zip(home, archive, record, target, shared=True)
+            install_stats[method] += 1
+
+    source_root = config.source_roots[0].resolve()
+    backup_root = config.root / "backups/deltas" / str(manifest["delta_id"])
+    backup_root.mkdir(parents=True, exist_ok=True)
+    identities = _read_source_identities(source_root)
+    restore: list[tuple[Path, Path | None]] = []
+    for change in manifest.get("changes", []):
+        old = identities.get(str(change["source_id"]))
+        target = (
+            source_root / str(old["relative_path"])
+            if old
+            else source_root
+            / f"sessions/imported/{_slug(str(change['source_id']), 'source')}.jsonl"
+        )
+        if target.is_file():
+            backup = backup_root / target.relative_to(source_root)
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.link(target, backup)
+            except OSError:
+                shutil.copy2(target, backup)
+            restore.append((target, backup))
+        else:
+            restore.append((target, None))
+    for name in ("source_identity.jsonl", "session_index.jsonl"):
+        target = source_root / name
+        if target.is_file():
+            backup = backup_root / name
+            shutil.copy2(target, backup)
+            restore.append((target, backup))
+    try:
+        _write_inventory_sources(
+            config, manifest["source_inventory"], manifest["changes"]
+        )
+        build = update_incremental(config, max_cost_cny=max_cost_cny)
+        updated_database = active_database(config)
+        if not updated_database:
+            raise RuntimeError("Incremental update did not promote a database")
+        connection = connect(updated_database, readonly=True)
+        try:
+            updated_inventory = source_inventory(connection)
+        finally:
+            connection.close()
+        target_generation = str(manifest["target_source_generation_id"])
+        if _inventory_generation(updated_inventory) != target_generation:
+            raise RuntimeError(
+                "Applied delta did not converge to its target source generation"
+            )
+        active_payload = active_info(config) or {}
+        active_payload.update(
+            {
+                "incremental_ready": True,
+                "source_generation_id": target_generation,
+                "last_delta_id": manifest["delta_id"],
+                "history_coverage": knowledge_coverage(
+                    config, updated_database, active=active_payload
+                ),
+            }
+        )
+        atomic_write_json(config.active_path, active_payload)
+    except BaseException:
+        for target, backup in reversed(restore):
+            if backup is None:
+                target.unlink(missing_ok=True)
+            elif backup.is_file():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(backup, target)
+        raise
+    else:
+        shutil.rmtree(backup_root, ignore_errors=True)
+    catalog["profiles"][selected]["source_generation_id"] = target_generation
+    catalog["profiles"][selected]["last_delta_id"] = manifest["delta_id"]
+    save_catalog(home, catalog)
+    return {
+        "status": "applied",
+        "profile": selected,
+        "library_id": library_id,
+        "delta_id": manifest["delta_id"],
+        "base_source_generation_id": required_generation,
+        "target_source_generation_id": target_generation,
+        "changes": len(manifest.get("changes", [])),
+        "content_install": dict(install_stats),
+        "build": build,
+        "history_coverage": active_payload["history_coverage"],
     }
 
 
@@ -976,7 +2060,9 @@ def federated_search(
             "CODEX_HISTORY_EMBEDDING_INPUT_PRICE_CNY",
             "CODEX_HISTORY_EMBEDDING_ENV_FILE",
         )
-        previous_environment = {key: os.environ.get(key) for key in embedding_environment}
+        previous_environment = {
+            key: os.environ.get(key) for key in embedding_environment
+        }
         try:
             query_module.DEFAULT_CHROMA = config.root / "semantic/chroma"
             query_module.SEMANTIC_MODEL = config.embedding_model
@@ -986,9 +2072,13 @@ def federated_search(
                 for old, new in config.path_mappings
             ]
             os.environ["CODEX_HISTORY_EMBEDDING_ENDPOINT"] = config.embedding_endpoint
-            os.environ["CODEX_HISTORY_EMBEDDING_API_KEY_ENV"] = config.embedding_api_key_env
+            os.environ["CODEX_HISTORY_EMBEDDING_API_KEY_ENV"] = (
+                config.embedding_api_key_env
+            )
             os.environ["CODEX_HISTORY_EMBEDDING_MODEL"] = config.embedding_model
-            os.environ["CODEX_HISTORY_EMBEDDING_DIMENSIONS"] = str(config.embedding_dimensions)
+            os.environ["CODEX_HISTORY_EMBEDDING_DIMENSIONS"] = str(
+                config.embedding_dimensions
+            )
             os.environ["CODEX_HISTORY_EMBEDDING_INPUT_PRICE_CNY"] = str(
                 config.embedding_input_price_cny
             )
@@ -1125,14 +2215,17 @@ def merge_libraries(
         (
             name
             for name, item in catalog.get("profiles", {}).items()
-            if item.get("library_id") == identity["library_id"] and item.get("enabled", True)
+            if item.get("library_id") == identity["library_id"]
+            and item.get("enabled", True)
         ),
         None,
     )
     profile_name = existing_name or _available_profile_name(home, as_name)
     profile_root = home / "profiles" / profile_name
     profile_root.mkdir(parents=True, exist_ok=True)
-    run_id = f"merge-{utc_now().replace(':', '').replace('+', '-')}-{uuid.uuid4().hex[:8]}"
+    run_id = (
+        f"merge-{utc_now().replace(':', '').replace('+', '-')}-{uuid.uuid4().hex[:8]}"
+    )
     staging_sources = profile_root / "merged_sources" / f".{run_id}"
     current_sources = profile_root / "merged_sources/current"
     history_sources = profile_root / "merged_sources/history" / run_id
@@ -1170,7 +2263,9 @@ def merge_libraries(
         target = session_root / f"rollout-{_slug(thread_id, 'thread')}.jsonl"
         atomic_write_bytes(target, data)
         title = str(variants[0]["title"])
-        index_rows.append({"id": thread_id, "thread_name": title, "updated_at": utc_now()})
+        index_rows.append(
+            {"id": thread_id, "thread_name": title, "updated_at": utc_now()}
+        )
         merge_reports.append(
             {
                 "thread_id": thread_id,
@@ -1184,9 +2279,9 @@ def merge_libraries(
         "".join(canonical_json(row) + "\n" for row in index_rows), encoding="utf-8"
     )
     source_digest = hashlib.sha256(
-        canonical_json([(item["thread_id"], item["sha256"]) for item in merge_reports]).encode(
-            "utf-8"
-        )
+        canonical_json(
+            [(item["thread_id"], item["sha256"]) for item in merge_reports]
+        ).encode("utf-8")
     ).hexdigest()
     previous_manifest = read_json(profile_root / "merge.json", {}) or {}
     changed = previous_manifest.get("source_digest") != source_digest
@@ -1201,10 +2296,14 @@ def merge_libraries(
     # CAS and model response caches are immutable and therefore safe to deduplicate physically.
     shared_stats = defaultdict(int)
     for config in configs:
-        for source_root, target_root in (
-            (config.cas_dir, profile_root / "cas"),
+        content_roots = [
+            *(
+                (root, profile_root / "cas")
+                for root in (config.cas_dir, *external_artifact_roots(config))
+            ),
             (config.cache_dir / "model", profile_root / "cache/model"),
-        ):
+        ]
+        for source_root, target_root in content_roots:
             if not source_root.is_dir():
                 continue
             for path in source_root.rglob("*"):
@@ -1267,9 +2366,7 @@ def merge_libraries(
     build_result: dict[str, Any] | None = None
     if build:
         build_result = (
-            update_incremental(
-                merged_config, max_cost_cny=max_cost_cny
-            )
+            update_incremental(merged_config, max_cost_cny=max_cost_cny)
             if active_database(merged_config)
             else build_full(merged_config, max_cost_cny=max_cost_cny)
         )

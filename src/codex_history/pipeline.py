@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import sqlite3
 import uuid
@@ -9,10 +10,12 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .audit import audit_connection, compare_databases
+from .artifacts import inspect_artifact_closure
 from .config import ProfileConfig, config_path, ensure_profile_dirs, resolve_summarization
 from .estimate import actual_managed_storage, estimate_build
 from .knowledge import (
     delete_thread,
+    hydrate_parsed_thread,
     insert_parsed_thread,
     insert_source_snapshot,
     rebuild_conservative_relations,
@@ -71,6 +74,28 @@ def active_database(config: ProfileConfig) -> Path | None:
 def _config_sha256(config: ProfileConfig) -> str:
     path = config_path(config.home)
     return sha256_file(path) if path.exists() else ""
+
+
+def _prune_unreferenced_profile_artifacts(
+    config: ProfileConfig, connection: sqlite3.Connection
+) -> dict[str, int]:
+    referenced = {
+        str(row[0]).replace("\\", "/").removeprefix("cas/")
+        for row in connection.execute("SELECT DISTINCT cas_relative_path FROM artifact_files")
+    }
+    removed_files = 0
+    removed_bytes = 0
+    if config.cas_dir.is_dir():
+        for path in config.cas_dir.rglob("*"):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(config.cas_dir).as_posix()
+            if relative in referenced:
+                continue
+            removed_bytes += path.stat().st_size
+            path.unlink()
+            removed_files += 1
+    return {"removed_files": removed_files, "removed_bytes": removed_bytes}
 
 
 def _source_public(source: SourceCandidate) -> dict[str, Any]:
@@ -284,7 +309,7 @@ def _new_database(
     build_dir = config.builds_dir / build_id
     build_dir.mkdir(parents=True, exist_ok=False)
     database = build_dir / "codex_history.sqlite3"
-    if kind == "incremental":
+    if kind in {"incremental", "hydrate", "compact"}:
         parent = active_database(config)
         if not parent:
             raise RuntimeError("Incremental update requires an active build")
@@ -314,7 +339,26 @@ def _new_database(
     return database, connection
 
 
-def _promote(config: ProfileConfig, build_id: str, database: Path) -> dict[str, Any]:
+def _prepare_semantic_candidate(config: ProfileConfig, build_dir: Path) -> Path:
+    source = config.root / "semantic/chroma"
+    candidate = build_dir / "semantic-candidate/chroma"
+    if candidate.exists():
+        shutil.rmtree(candidate)
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    if source.is_dir():
+        shutil.copytree(source, candidate)
+    else:
+        candidate.mkdir(parents=True)
+    return candidate
+
+
+def _promote(
+    config: ProfileConfig,
+    build_id: str,
+    database: Path,
+    *,
+    semantic_candidate: Path | None = None,
+) -> dict[str, Any]:
     relative = database.relative_to(config.root).as_posix()
     payload = {
         "schema_version": "codex-history-active-v1",
@@ -324,7 +368,26 @@ def _promote(config: ProfileConfig, build_id: str, database: Path) -> dict[str, 
         "promoted_at": utc_now(),
         "incremental_ready": True,
     }
-    atomic_write_json(config.active_path, payload)
+    semantic_target = config.root / "semantic/chroma"
+    semantic_previous = config.root / f"semantic/.previous-{build_id}"
+    semantic_swapped = False
+    try:
+        if semantic_candidate is not None:
+            shutil.rmtree(semantic_previous, ignore_errors=True)
+            if semantic_target.exists():
+                os.replace(semantic_target, semantic_previous)
+            semantic_target.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(semantic_candidate, semantic_target)
+            semantic_swapped = True
+        atomic_write_json(config.active_path, payload)
+    except BaseException:
+        if semantic_swapped:
+            shutil.rmtree(semantic_target, ignore_errors=True)
+            if semantic_previous.exists():
+                os.replace(semantic_previous, semantic_target)
+        raise
+    else:
+        shutil.rmtree(semantic_previous, ignore_errors=True)
     return payload
 
 
@@ -362,6 +425,13 @@ def _build_locked(
     run = RunState(config, build_id, kind, build_dir)
     sources = discover_sources(config)
     snapshots: dict[str, Any] = {}
+    semantic_candidate: Path | None = None
+    hydrated_incremental = bool(
+        kind == "incremental"
+        and connection.execute(
+            "SELECT 1 FROM metadata WHERE key='canonical_snapshot_complete' AND value='true'"
+        ).fetchone()
+    )
     changes: list[SourceChange]
     try:
         with run.stage(connection, "discover") as report:
@@ -400,6 +470,8 @@ def _build_locked(
                 {
                     "source_id": source_id,
                     "content_sha256": snapshot.content_sha256,
+                    "snapshot_content_sha256": snapshot.snapshot_content_sha256,
+                    "snapshot_size_bytes": snapshot.snapshot_size_bytes,
                     "line_count": snapshot.line_count,
                     "manifest_path": str(snapshot.manifest_path),
                     "chunks": len(snapshot.chunks),
@@ -429,11 +501,38 @@ def _build_locked(
                 "fact_blocks": 0,
                 "parse_errors": 0,
                 "artifacts": 0,
+                "preserved_curated_scopes": 0,
             }
             for change in changes:
                 if change.kind == "unchanged":
                     continue
                 old = change.previous
+                if hydrated_incremental:
+                    if change.kind == "deleted" or not change.source:
+                        if old:
+                            connection.execute(
+                                "UPDATE source_files SET source_state='deleted',last_seen_at=? "
+                                "WHERE source_id=?",
+                                (utc_now(), old["source_id"]),
+                            )
+                        continue
+                    snapshot = snapshots[change.source.source_id]
+                    insert_source_snapshot(connection, snapshot)
+                    parsed = parse_snapshot(snapshot, config)
+                    inserted = hydrate_parsed_thread(
+                        connection,
+                        snapshot,
+                        parsed,
+                        config,
+                        index_new_knowledge=True,
+                    )
+                    totals["threads"] += 1
+                    totals["preserved_curated_scopes"] += int(
+                        inserted.pop("preserved_curated_scope", 0)
+                    )
+                    for key, value in inserted.items():
+                        totals[key] += value
+                    continue
                 if old:
                     old_thread = str(old["thread_id"])
                     if connection.execute(
@@ -457,8 +556,16 @@ def _build_locked(
             report.update(totals)
 
         with run.stage(connection, "lineage") as report:
-            report["family_scopes"] = rebuild_family_scopes(connection, build_id)
-            report["relations"] = rebuild_conservative_relations(connection)
+            if hydrated_incremental:
+                report.update(
+                    {
+                        "preserved": True,
+                        "note": "Curated family scopes and relations retained during append",
+                    }
+                )
+            else:
+                report["family_scopes"] = rebuild_family_scopes(connection, build_id)
+                report["relations"] = rebuild_conservative_relations(connection)
 
         with run.stage(connection, "summarize") as report:
             from .summarize import summarize_scopes
@@ -522,6 +629,8 @@ def _build_locked(
                         scope_id,
                     ),
                 )
+            if hydrated_incremental:
+                scope_ids = []
             report.update(
                 summarize_scopes(
                     config,
@@ -540,9 +649,10 @@ def _build_locked(
             )
             rebuild_fts(connection)
             semantic_report: dict[str, Any] = {"enabled": False}
-            if config.embedding_enabled:
+            if config.embedding_enabled and not hydrated_incremental:
                 from .semantic import refresh_embeddings
 
+                semantic_candidate = _prepare_semantic_candidate(config, build_dir)
                 summary_cost = float(
                     run.data["stages"]["summarize"].get("report", {}).get("cost_cny", 0.0)
                 )
@@ -553,7 +663,17 @@ def _build_locked(
                     config,
                     connection,
                     max_cost_cny=remaining_cost,
+                    chroma_path=semantic_candidate,
                 )
+            elif config.embedding_enabled and hydrated_incremental:
+                semantic_report = {
+                    "enabled": True,
+                    "mode": "preserve-existing",
+                    "embedded": 0,
+                    "input_tokens": 0,
+                    "actual_cost_cny": 0.0,
+                    "status": "partial-until-explicit-semantic-refresh",
+                }
             report.update(
                 {
                     "knowledge": connection.execute("SELECT COUNT(*) FROM knowledge").fetchone()[0],
@@ -566,6 +686,20 @@ def _build_locked(
 
         with run.stage(connection, "audit") as report:
             audit = audit_connection(connection)
+            artifact_closure, _ = inspect_artifact_closure(
+                config,
+                database,
+                verify_hashes=not hydrated_incremental,
+            )
+            audit["artifact_closure"] = artifact_closure
+            audit["checks"].append(
+                {
+                    "name": "artifact_closure",
+                    "passed": artifact_closure["complete"],
+                    "detail": artifact_closure,
+                }
+            )
+            audit["passed"] = audit["passed"] and artifact_closure["complete"]
             report.update(audit)
             atomic_write_json(build_dir / "audit.json", audit)
             if not audit["passed"]:
@@ -577,7 +711,14 @@ def _build_locked(
 
         with run.stage(connection, "promote") as report:
             if promote:
-                report.update(_promote(config, build_id, database))
+                report.update(
+                    _promote(
+                        config,
+                        build_id,
+                        database,
+                        semantic_candidate=semantic_candidate,
+                    )
+                )
                 promoted_at = report["promoted_at"]
             else:
                 report.update({"promoted": False})
@@ -643,6 +784,336 @@ def build_full(
                 config, kind="full", promote=promote, max_cost_cny=max_cost_cny
             )
     return _build_locked(config, kind="full", promote=promote, max_cost_cny=max_cost_cny)
+
+
+def hydrate_canonical_baseline(
+    config: ProfileConfig,
+    *,
+    promote: bool = True,
+    max_cost_cny: float | None = None,
+) -> dict[str, Any]:
+    ensure_profile_dirs(config)
+    current_database = active_database(config)
+    if not current_database:
+        raise RuntimeError("Canonical hydration requires an active migrated knowledge base")
+    current_active = active_info(config) or {}
+    with file_lock(config.lock_path):
+        build_id = _build_id("hydrate")
+        build_dir = config.builds_dir / build_id
+        manifest_path = build_dir / "source-manifest.json"
+        database, connection = _new_database(
+            config,
+            build_id,
+            "hydrate",
+            str(current_active.get("build_id") or "") or None,
+            manifest_path,
+        )
+        run = RunState(config, build_id, "hydrate", build_dir)
+        sources = discover_sources(config)
+        snapshots: dict[str, Any] = {}
+        try:
+            with run.stage(connection, "discover") as report:
+                atomic_write_json(
+                    manifest_path,
+                    {
+                        "schema_version": "codex-history-source-manifest-v1",
+                        "build_id": build_id,
+                        "created_at": utc_now(),
+                        "mode": "canonical-hydration-preserve-curated-knowledge",
+                        "sources": [_source_public(source) for source in sources],
+                        "changes": [
+                            _change_public(SourceChange("added", source, None, "hydrate"))
+                            for source in sources
+                        ],
+                        "snapshots": [],
+                    },
+                )
+                report.update({"sources": len(sources), "preserve_curated_knowledge": True})
+
+            with run.stage(connection, "snapshot") as report:
+                for source in sources:
+                    snapshots[source.source_id] = snapshot_source(config, source)
+                manifest = read_json(manifest_path)
+                manifest["snapshots"] = [
+                    {
+                        "source_id": source_id,
+                        "content_sha256": snapshot.content_sha256,
+                        "snapshot_content_sha256": snapshot.snapshot_content_sha256,
+                        "snapshot_size_bytes": snapshot.snapshot_size_bytes,
+                        "line_count": snapshot.line_count,
+                        "manifest_path": str(snapshot.manifest_path),
+                        "chunks": len(snapshot.chunks),
+                    }
+                    for source_id, snapshot in sorted(snapshots.items())
+                ]
+                atomic_write_json(manifest_path, manifest)
+                report.update(
+                    {
+                        "snapshotted_sources": len(snapshots),
+                        "snapshot_bytes": sum(
+                            item.snapshot_size_bytes for item in snapshots.values()
+                        ),
+                        "source_bytes": sum(
+                            item.source.size_bytes for item in snapshots.values()
+                        ),
+                        "unique_chunks": len(
+                            {
+                                chunk["sha256"]
+                                for item in snapshots.values()
+                                for chunk in item.chunks
+                            }
+                        ),
+                    }
+                )
+
+            with run.stage(connection, "ingest") as report:
+                current_ids = {source.source_id for source in sources}
+                if current_ids:
+                    placeholders = ",".join("?" for _ in current_ids)
+                    connection.execute(
+                        f"UPDATE source_files SET source_state='deleted' "
+                        f"WHERE source_id NOT IN ({placeholders})",
+                        sorted(current_ids),
+                    )
+                totals = {
+                    "threads": 0,
+                    "events": 0,
+                    "turns": 0,
+                    "evidence": 0,
+                    "fact_blocks": 0,
+                    "parse_errors": 0,
+                    "artifacts": 0,
+                    "preserved_curated_scopes": 0,
+                }
+                for source in sources:
+                    snapshot = snapshots[source.source_id]
+                    insert_source_snapshot(connection, snapshot)
+                    parsed = parse_snapshot(snapshot, config)
+                    inserted = hydrate_parsed_thread(
+                        connection, snapshot, parsed, config
+                    )
+                    totals["threads"] += 1
+                    totals["preserved_curated_scopes"] += int(
+                        inserted.pop("preserved_curated_scope", 0)
+                    )
+                    for key, value in inserted.items():
+                        totals[key] += value
+                connection.execute(
+                    "INSERT INTO metadata(key,value) VALUES('canonical_snapshot_complete','true') "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+                )
+                connection.execute(
+                    "INSERT INTO metadata(key,value) VALUES('canonical_hydrated_at',?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (utc_now(),),
+                )
+                connection.execute(
+                    "INSERT INTO metadata(key,value) VALUES('canonical_hydration_build_id',?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (build_id,),
+                )
+                totals["pruned_profile_artifacts"] = _prune_unreferenced_profile_artifacts(
+                    config, connection
+                )
+                report.update(totals)
+
+            with run.stage(connection, "lineage") as report:
+                report.update(
+                    {
+                        "preserved": True,
+                        "note": "Existing curated scopes and fact relations were retained",
+                    }
+                )
+            with run.stage(connection, "summarize") as report:
+                report.update(
+                    {
+                        "mode": "preserve-existing",
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cost_cny": 0.0,
+                    }
+                )
+            with run.stage(connection, "index") as report:
+                rebuild_fts(connection)
+                semantic_report: dict[str, Any] = {
+                    "enabled": config.embedding_enabled,
+                    "mode": "preserve-existing",
+                    "embedded": 0,
+                    "input_tokens": 0,
+                    "actual_cost_cny": 0.0,
+                    "status": "partial-until-next-incremental-refresh",
+                }
+                report.update(
+                    {
+                        "knowledge": connection.execute(
+                            "SELECT COUNT(*) FROM knowledge"
+                        ).fetchone()[0],
+                        "semantic": semantic_report,
+                    }
+                )
+            with run.stage(connection, "audit") as report:
+                audit = audit_connection(connection)
+                artifact_closure, _ = inspect_artifact_closure(
+                    config, database, verify_hashes=True
+                )
+                audit["artifact_closure"] = artifact_closure
+                audit["checks"].append(
+                    {
+                        "name": "artifact_closure",
+                        "passed": artifact_closure["complete"],
+                        "detail": artifact_closure,
+                    }
+                )
+                audit["passed"] = audit["passed"] and artifact_closure["complete"]
+                report.update(audit)
+                atomic_write_json(build_dir / "audit.json", audit)
+                if not audit["passed"]:
+                    raise RuntimeError("Canonical hydration audit failed")
+                connection.execute(
+                    "UPDATE builds SET logical_digest=? WHERE build_id=?",
+                    (audit["logical_digest"]["sha256"], build_id),
+                )
+            with run.stage(connection, "promote") as report:
+                if promote:
+                    report.update(_promote(config, build_id, database))
+                    promoted_at = report["promoted_at"]
+                else:
+                    report["promoted"] = False
+                    promoted_at = None
+                connection.execute(
+                    "UPDATE builds SET status='complete',completed_at=?,promoted_at=? "
+                    "WHERE build_id=?",
+                    (utc_now(), promoted_at, build_id),
+                )
+            run.complete()
+            return {
+                "status": "complete",
+                "build_id": build_id,
+                "kind": "hydrate",
+                "database": str(database),
+                "build_dir": str(build_dir),
+                "promoted": promote,
+                "audit": read_json(build_dir / "audit.json"),
+                "run": read_json(run.path),
+            }
+        finally:
+            connection.close()
+
+
+def compact_canonical_storage(
+    config: ProfileConfig,
+    *,
+    promote: bool = True,
+) -> dict[str, Any]:
+    ensure_profile_dirs(config)
+    current_database = active_database(config)
+    if not current_database:
+        raise RuntimeError("Canonical compaction requires an active database")
+    with file_lock(config.lock_path):
+        build_id = _build_id("compact")
+        build_dir = config.builds_dir / build_id
+        manifest_path = build_dir / "source-manifest.json"
+        database, connection = _new_database(
+            config,
+            build_id,
+            "compact",
+            str((active_info(config) or {}).get("build_id") or "") or None,
+            manifest_path,
+        )
+        run = RunState(config, build_id, "compact", build_dir)
+        try:
+            with run.stage(connection, "discover") as report:
+                report.update({"mode": "reuse-active-canonical-sources"})
+                atomic_write_json(
+                    manifest_path,
+                    {
+                        "schema_version": "codex-history-source-manifest-v1",
+                        "build_id": build_id,
+                        "created_at": utc_now(),
+                        "mode": "canonical-payload-compaction",
+                        "sources": [],
+                        "changes": [],
+                        "snapshots": [],
+                    },
+                )
+            with run.stage(connection, "snapshot") as report:
+                report.update({"reused": True, "snapshot_directory": str(config.snapshots_dir)})
+            with run.stage(connection, "ingest") as report:
+                before_bytes = database.stat().st_size
+                rows = connection.execute(
+                    "SELECT COUNT(*) FROM canonical_events WHERE raw_json<>'' OR length(text)>16000"
+                ).fetchone()[0]
+                connection.execute(
+                    "UPDATE canonical_events SET raw_json='',text=substr(text,1,16000) "
+                    "WHERE raw_json<>'' OR length(text)>16000"
+                )
+                connection.execute(
+                    "INSERT INTO metadata(key,value) VALUES('canonical_payload_storage','snapshot-offset-v1') "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+                )
+                connection.commit()
+                connection.execute("VACUUM")
+                report.update(
+                    {
+                        "compacted_events": int(rows),
+                        "before_bytes": before_bytes,
+                        "after_bytes": database.stat().st_size,
+                        "reclaimed_bytes": before_bytes - database.stat().st_size,
+                    }
+                )
+            with run.stage(connection, "lineage") as report:
+                report["preserved"] = True
+            with run.stage(connection, "summarize") as report:
+                report.update({"mode": "preserve-existing", "cost_cny": 0.0})
+            with run.stage(connection, "index") as report:
+                report.update({"fts_preserved": True, "semantic_preserved": True})
+            with run.stage(connection, "audit") as report:
+                audit = audit_connection(connection)
+                artifact_closure, _ = inspect_artifact_closure(
+                    config, database, verify_hashes=False
+                )
+                audit["artifact_closure"] = artifact_closure
+                audit["checks"].append(
+                    {
+                        "name": "artifact_closure",
+                        "passed": artifact_closure["complete"],
+                        "detail": artifact_closure,
+                    }
+                )
+                audit["passed"] = audit["passed"] and artifact_closure["complete"]
+                report.update(audit)
+                atomic_write_json(build_dir / "audit.json", audit)
+                if not audit["passed"]:
+                    raise RuntimeError("Canonical storage compaction audit failed")
+                connection.execute(
+                    "UPDATE builds SET logical_digest=? WHERE build_id=?",
+                    (audit["logical_digest"]["sha256"], build_id),
+                )
+            with run.stage(connection, "promote") as report:
+                if promote:
+                    report.update(_promote(config, build_id, database))
+                    promoted_at = report["promoted_at"]
+                else:
+                    report["promoted"] = False
+                    promoted_at = None
+                connection.execute(
+                    "UPDATE builds SET status='complete',completed_at=?,promoted_at=? "
+                    "WHERE build_id=?",
+                    (utc_now(), promoted_at, build_id),
+                )
+            run.complete()
+            return {
+                "status": "complete",
+                "build_id": build_id,
+                "kind": "compact",
+                "database": str(database),
+                "build_dir": str(build_dir),
+                "promoted": promote,
+                "compaction": run.data["stages"]["ingest"]["report"],
+                "audit": read_json(build_dir / "audit.json"),
+            }
+        finally:
+            connection.close()
 
 
 def update_incremental(

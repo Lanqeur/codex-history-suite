@@ -8,6 +8,7 @@ import pytest
 
 from codex_history.cli import main as cli_main
 from codex_history.audit import audit_database
+from codex_history.coverage import knowledge_coverage
 from codex_history.pipeline import (
     active_database,
     build_full,
@@ -38,6 +39,50 @@ def test_model_first_build_requires_an_explicit_cost_limit(portable_profile, mon
         build_full(config)
 
 
+def test_artifact_closure_failure_blocks_promotion(portable_profile, monkeypatch):
+    config, codex_home = portable_profile
+    add_transcript(
+        codex_home,
+        "thread-artifact-gate",
+        "Artifact gate",
+        timestamp="2026-07-14T00:30:00Z",
+        label="artifact-gate",
+    )
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "codex_history.pipeline.inspect_artifact_closure",
+        lambda *_args, **_kwargs: ({"complete": False, "missing_files": 1}, []),
+    )
+    with pytest.raises(RuntimeError, match="Build audit failed"):
+        build_full(config)
+    assert active_database(config) is None
+
+
+def test_coverage_separates_activity_and_snapshot_watermarks(portable_profile):
+    config, codex_home = portable_profile
+    timestamp = "2026-07-14T00:30:00Z"
+    add_transcript(
+        codex_home,
+        "thread-coverage",
+        "Coverage",
+        timestamp=timestamp,
+        label="coverage",
+    )
+    built = build_full(config)
+    coverage = knowledge_coverage(
+        config,
+        Path(built["database"]),
+        active={"build_id": built["build_id"], "incremental_ready": True},
+    )
+    assert coverage["coverage_basis"] == "canonical-events"
+    assert coverage["latest_activity_at"] == "2026-07-14T00:30:00.000Z"
+    assert coverage["source_scan_started_at"] is not None
+    assert coverage["source_snapshot_completed_at"] is not None
+    assert coverage["authority_completed_at"] is not None
+    assert coverage["logical_digest"]
+    assert coverage["knowledge_version_id"].startswith("coverage-")
+
+
 def test_full_build_incremental_update_and_equivalence(portable_profile):
     config, codex_home = portable_profile
     add_transcript(
@@ -65,20 +110,46 @@ def test_full_build_incremental_update_and_equivalence(portable_profile):
     try:
         assert connection.execute("SELECT COUNT(*) FROM threads").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM artifact_files").fetchone()[0] == 1
+        source_row = connection.execute(
+            "SELECT size_bytes,snapshot_size_bytes,snapshot_format FROM source_files"
+        ).fetchone()
+        assert source_row["snapshot_format"] == "normalized-jsonl-v1"
+        assert source_row["snapshot_size_bytes"] > 0
+        snapshot_payload = b"".join(
+            (config.snapshots_dir / row[0]).read_bytes()
+            for row in connection.execute(
+                "SELECT cas_relative_path FROM source_chunks ORDER BY chunk_index"
+            )
+        )
+        assert b"data:image/" not in snapshot_payload
+        assert b"codex-history-artifact://" in snapshot_payload
         assert connection.execute(
             "SELECT COUNT(*) FROM canonical_events WHERE raw_json LIKE '%data:image/%'"
         ).fetchone()[0] == 0
         assert connection.execute(
-            "SELECT COUNT(*) FROM canonical_events WHERE raw_json LIKE '%codex-history-artifact://%'"
-        ).fetchone()[0] >= 1
+            "SELECT COUNT(*) FROM canonical_events WHERE raw_json<>''"
+        ).fetchone()[0] == 0
         assert connection.execute(
             "SELECT COUNT(*) FROM canonical_events WHERE role='tool_call' "
-            "AND raw_json LIKE '%test alpha%'"
+            "AND text LIKE '%test alpha%'"
         ).fetchone()[0] == 1
         assert connection.execute(
             "SELECT COUNT(*) FROM canonical_events WHERE role='tool_output' "
-            "AND raw_json LIKE '%3 passed%'"
+            "AND text LIKE '%3 passed%'"
         ).fetchone()[0] == 1
+        from codex_history import query as query_module
+
+        query_module.SNAPSHOT_ROOT = config.snapshots_dir
+        evidence = dict(
+            connection.execute(
+                "SELECT * FROM evidence WHERE assignment LIKE '%test alpha%' LIMIT 1"
+            ).fetchone()
+        )
+        raw_sources = query_module.portable_evidence_sources(connection, evidence)
+        assert raw_sources
+        assert "test alpha" in json.dumps(
+            raw_sources[0]["content"]["raw"], ensure_ascii=False
+        )
         relation = connection.execute(
             "SELECT kr.relation_type,source.category AS source_category,"
             "target.category AS target_category,kr.metadata_json "

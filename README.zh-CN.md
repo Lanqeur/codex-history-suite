@@ -60,17 +60,35 @@ python3 scripts/codex_history.py plan --mode full --json
 
 ## 多设备知识库
 
-v0.3 增加了带完整校验的 library bundle 和非破坏式多设备工作流。先给每台电脑设置稳定身份，再导出 active profile；这些 bundle 可以导入任一电脑，也可以统一导入一台中转设备：
+v0.4 增加了“规范基线 + 严格代际 delta”。每台电脑先设置稳定身份，只传输一次完整基线；以后只移动新增的内容寻址 transcript chunk、artifact 和模型缓存：
 
 ```bash
 python3 scripts/codex_history.py library device --name '工作笔记本' --json
-python3 scripts/codex_history.py --profile default library export ~/work-laptop.zip --json
+python3 scripts/codex_history.py --profile default coverage --json
+python3 scripts/codex_history.py --profile default library artifact-audit --verify-hashes --json
+python3 scripts/codex_history.py --profile default library export ~/work-laptop.zip \
+  --artifacts referenced --json
 python3 scripts/codex_history.py library import ~/work-laptop.zip --json
+
+# 本机后续产生新会话并完成一次增量建库后：
+python3 scripts/codex_history.py --profile default update --max-cost-cny 5 --json
+python3 scripts/codex_history.py --profile default library export-delta ~/work-laptop-001.zip \
+  --base ~/work-laptop.zip --artifacts referenced --json
+
+# 接收设备只应用 delta，不再搬运完整基线：
+python3 scripts/codex_history.py library apply-delta ~/work-laptop-001.zip \
+  --max-cost-cny 5 --json
 python3 scripts/codex_history.py library list --json
 python3 scripts/codex_history.py library search '发布 决策' --deep --json
 ```
 
+下一份 delta 可以把上一份 delta 作为 `--base`。delta 保留完整的目标来源清单，但 ZIP 只携带基代中不存在的 blob。`apply-delta` 会严格检查 `library_id` 与基代 source generation，只重建发生变化的规范化 transcript，再走普通的审计式增量状态机；重复应用保持幂等。缺代、乱序、跨库或篡改的 delta 都会在晋升前拒绝。完整 SQLite、已有 Chroma、历史 snapshot 与 artifact CAS 因此只需传输一次。
+
 导入 profile 默认按“来源设备名 + 原 profile 名”自动命名，重名时自动追加数字。稳定的 `library_id` 会识别同一个设备库的后续版本：新 bundle 会更新对应 profile，同时把旧代保存在 `backups/imports`。bundle 内每个文件都执行 SHA-256 校验，并拒绝危险压缩路径；不可变 transcript chunk、artifact、语义索引和模型缓存会进入全局内容寻址 blob 仓库，在文件系统允许时通过硬链接实现物理去重。
+
+附件导出策略是显式的。`--artifacts none` 会生成体积较小的仅检索 bundle，SQLite 仍保留附件元数据，但有意不携带文件内容；默认的 `referenced` 会带上 active 数据库索引到的全部附件；`all` 还会带上本地或已登记外部 CAS 中暂未被数据库引用的文件。`referenced` 和 `all` 会在数据库到 CAS 不闭合、文件大小不符或 SHA-256 不符时拒绝导出，bundle manifest 也会记录所选策略和闭合统计。
+
+每个新 bundle 还会记录 `history_coverage`：实际覆盖的最早/最晚会话活动时间、来源扫描与 snapshot 水位、构建完成时间、thread/source/event 数量、逻辑摘要和稳定的知识版本 ID。`latest_activity_at` 表示“库内真实出现的最晚时间”，`source_scan_started_at` 表示“何时观察了本地来源”；任何一个字段都不能单独证明时间区间内绝无漏会话。可随时通过 `coverage --json`、`status --json` 或 `library list --json` 检查同一水位。
 
 联合检索会同时查询多个独立的 SQLite/Chroma 权威库，按知识内容折叠完全重复项，并保留所有命中的 profile 和 Record ID。它不重建知识库，可以导入后立刻使用。合并则是另一件事：系统按稳定 thread ID 重建 transcript，依次采用完全相同、最长前缀或确定性事件并集策略，将结果写入新的生成 profile，两个来源库都不会被修改：
 
@@ -84,7 +102,7 @@ python3 scripts/codex_history.py library merge \
   --as personal-history --build --max-cost-cny 30 --json
 ```
 
-`library sync` 会完成合并、构建并导出一份收敛 bundle；将同一个 bundle 导入两台设备即可完成离线双向收敛。重复导入和重复合并会按 library lineage 与内容摘要保持幂等。历史绝对路径仍作为证据保留，自动生成的文件/根路径映射和可选 `--path-map 'OLD=NEW'` 会在查询显示层提供本机可访问路径，不会篡改原始 provenance。
+`library sync` 会完成合并、构建并导出一份收敛基线；将同一个基线导入两台设备即可完成离线双向收敛，同一合并 lineage 的后续版本也能继续使用 delta。重复导入、delta 应用和合并会按 library lineage、source generation 与内容摘要保持幂等。历史绝对路径仍作为证据保留，自动生成的文件/根路径映射和可选 `--path-map 'OLD=NEW'` 会在查询显示层提供本机可访问路径，不会篡改原始 provenance。
 
 完整 bundle 格式、冲突规则、离线双向同步和恢复流程见[多设备参考](skills/build-codex-history/references/multi-device.md)。
 
@@ -110,7 +128,7 @@ discover -> snapshot -> ingest -> lineage -> summarize -> index -> audit -> prom
 
 ## 旧版迁移
 
-`migrate --from-db` 会保留并审计已有 v2.1/v2.1.1 SQLite 权威库；`--from-chroma` 可以复制其语义索引。迁移后的数据库可以立即查询，但会被视为只读的旧版基线。第一次增量更新前应先执行一次完整构建。提升是原子的，因此迁移版本仍保留用于回滚和比较。
+`migrate --from-db` 会保留并审计已有 v2.1/v2.1.1 SQLite 权威库；`--from-chroma` 可以复制其语义索引。使用 `--from-artifacts ARTIFACT_PACK --artifact-mode reference` 可以先完整校验并登记大型外部 CAS，避免重复占用空间；也可以选择 `copy`、`hardlink` 或 `auto` 把文件实体写入 profile。迁移后的数据库可以立即查询，但还不是规范增量基线。执行 `hydrate-baseline` 可在保留已有 Overview、ledger、Evidence、关系和语义索引的同时补齐规范化来源快照；随后可用 `compact-storage` 在验证 trace 偏移回溯后清除重复 raw payload。这两步都不调用模型。提升是原子的，因此迁移版本仍保留用于回滚和比较。
 
 ## 跨平台存储
 

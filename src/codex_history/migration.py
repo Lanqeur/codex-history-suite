@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import shutil
 import sqlite3
 import uuid
@@ -43,6 +42,8 @@ def migrate_legacy_database(
     promote: bool = True,
     adopt_sources: bool = True,
     source_chroma: Path | None = None,
+    source_artifacts: Path | None = None,
+    artifact_mode: str = "reference",
 ) -> dict[str, Any]:
     ensure_profile_dirs(config)
     source = source.expanduser().resolve()
@@ -241,6 +242,18 @@ def migrate_legacy_database(
                 "destination": str(destination_chroma),
             }
         manifest["chroma_migration"] = chroma_migration
+        artifact_migration: dict[str, Any] = {"status": "not_requested"}
+        if source_artifacts is not None:
+            from .artifacts import adopt_artifacts
+
+            artifact_migration = adopt_artifacts(
+                config,
+                database,
+                source_artifacts,
+                mode=artifact_mode,
+                acquire_lock=False,
+            )
+        manifest["artifact_migration"] = artifact_migration
         atomic_write_json(build_dir / "migration-manifest.json", manifest)
         if promote:
             active = {
@@ -262,5 +275,6 @@ def migrate_legacy_database(
             "audit": audit,
             "source_adoption": adoption,
             "chroma_migration": chroma_migration,
+            "artifact_migration": artifact_migration,
             "manifest": str(build_dir / "migration-manifest.json"),
         }

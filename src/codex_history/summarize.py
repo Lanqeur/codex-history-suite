@@ -300,6 +300,16 @@ def summarize_scopes(
     max_cost_cny: float | None,
     client: ChatClient | None = None,
 ) -> dict[str, Any]:
+    if not scope_ids:
+        return {
+            "enabled": False,
+            "mode": config.summary_mode,
+            "effective_mode": "preserve-existing",
+            "fallback": False,
+            "fallback_reason": "",
+            "scopes": 0,
+            "cost_cny": 0.0,
+        }
     resolution = resolve_summarization(config)
     if resolution["effective_mode"] == "extractive":
         return {

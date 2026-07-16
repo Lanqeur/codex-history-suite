@@ -9,17 +9,58 @@
 
 ## Bundle Contract
 
-`library export` creates a ZIP with `bundle.json`, an SQLite backup, active transcript snapshot chunks and manifests, the complete artifact CAS, and optional semantic/model-cache files. The manifest records SHA-256, size, role, source device, profile lineage, active build, logical digest, capabilities, non-secret provider settings, and historical source roots.
+`library export` creates a ZIP with `bundle.json`, an SQLite backup, active transcript snapshot chunks and manifests, selected artifact files, and optional semantic/model-cache files. Choose one artifact policy:
 
-`library verify` rejects a missing file, size mismatch, SHA-256 mismatch, unsupported schema, absolute archive path, or path containing `..`. Import performs the same verification before installing data.
+- `none`: retain artifact metadata in SQLite but intentionally omit file payloads.
+- `referenced`: include every CAS object indexed by the active database; this is the default.
+- `all`: include referenced objects plus unreferenced files retained in local and registered external CAS roots.
+
+For `referenced` and `all`, export verifies database-to-CAS size and SHA-256 closure before writing the ZIP. The manifest records the policy, indexed and packaged counts, closure digest, SHA-256, size, role, source device, profile lineage, active build, logical digest, capabilities, non-secret provider settings, and historical source roots.
+
+The manifest's `history_coverage` separates content time from processing time. `earliest_activity_at` and `latest_activity_at` bound timestamps actually represented by the authority. `source_scan_started_at` and `source_snapshot_completed_at` describe source observation, while `authority_completed_at` describes processing. `knowledge_version_id` and `logical_digest` identify the exact authority generation. These are watermarks, not a proof that no transcript is missing between the bounds; legacy migrations are marked `legacy-migrated` and may rely on thread metadata rather than canonical events.
+
+`library verify` rejects a missing file, size mismatch, SHA-256 mismatch, database-to-bundle artifact mismatch, unsupported schema, absolute archive path, or path containing `..`. A `none` bundle passes only because the omission is explicit in its manifest. Import performs the same verification before installing data.
+
+Use `library adopt-artifacts PACK --mode reference` to register and verify a large existing CAS without duplicating its bytes. `copy` materializes an independent profile copy, `hardlink` requires one filesystem, and `auto` tries a hard link before copying. A reference remains an external runtime dependency, but a later `referenced` or `all` export dereferences and embeds the real files.
 
 Immutable files enter `<home>/shared/blobs/<sha-prefix>/<sha256>`. The imported profile receives a hard link when supported and a verified copy otherwise. SQLite is copied independently because it receives local schema/path metadata.
+
+## Canonical Baseline And Delta Contract
+
+A library can receive deltas only when its baseline has a complete `source_inventory`. Each source entry records the stable source/thread identity, logical raw hash and size, normalized snapshot hash and size, ordered content-addressed chunks, inline artifacts, and observation watermarks. Normalization replaces inline image base64 with `codex-history-artifact://` references without changing the logical raw-source generation. Exact normalized event payloads remain recoverable from snapshot byte offsets, and image bytes remain in the artifact CAS.
+
+Create and import the baseline once:
+
+```bash
+python3 scripts/codex_history.py --profile default library export DEVICE-baseline.zip \
+  --artifacts referenced --json
+python3 scripts/codex_history.py library import DEVICE-baseline.zip --json
+```
+
+After a local audited `update`, export only the difference from the immediately preceding transfer:
+
+```bash
+python3 scripts/codex_history.py --profile default library export-delta DEVICE-001.zip \
+  --base DEVICE-baseline.zip --artifacts referenced --json
+python3 scripts/codex_history.py library apply-delta DEVICE-001.zip \
+  --max-cost-cny 5 --json
+
+# The next generation uses the prior delta, not the original baseline.
+python3 scripts/codex_history.py --profile default library export-delta DEVICE-002.zip \
+  --base DEVICE-001.zip --artifacts referenced --json
+```
+
+`delta.json` contains the full base and target source inventories but packages only new transcript chunks, new artifact CAS objects, and optionally new exact model-cache entries. It records stable library lineage plus exact base/target source generations. Verification hashes every packaged file and proves that every changed source can be reconstructed from base plus delta chunks. For artifact mode `referenced` or `all`, every artifact present in the target inventory but absent from the base inventory must be packaged.
+
+`apply-delta` is restricted to profile-managed imported sources. It requires the receiver's active generation to equal the declared base generation, stages immutable blobs, atomically reconstructs only changed transcript files, and runs the normal incremental audit/promotion pipeline. On failure it restores source files and leaves the prior active authority in place. Applying the same target generation again returns `already_applied`. A skipped delta, unrelated library, divergent local generation, unsafe archive path, or content mismatch is a hard error.
+
+Model-cache deltas are enabled by default so the receiver can reuse source-side summarization work. Omitting them may cause paid model work during `apply-delta`; always review the target plan and pass an explicit `--max-cost-cny` when its configuration can call a model. Existing Chroma is preserved, while newly appended lexical knowledge may remain marked `partial-until-explicit-semantic-refresh` until a separately budgeted embedding refresh.
 
 ## Naming And Lineage
 
 Run `library device --name NAME` once per installation. Without an explicit import name, the profile becomes `<device-slug>-<source-profile>` and receives `-2`, `-3`, and so on only for unrelated name collisions.
 
-`library_id` identifies a logical library across exports. `bundle_id` identifies one audited build generation. Reimporting the same bundle is a no-op. Importing a different bundle with the same library ID updates the existing imported profile and preserves its prior directory under `backups/imports`.
+`library_id` identifies a logical library across exports. `bundle_id` identifies one audited full baseline, `delta_id` identifies one base-to-target transition, and `source_generation_id` is the strict synchronization watermark. Reimporting the same bundle or reapplying the same delta is a no-op. Importing a different full bundle with the same library ID updates the existing imported profile and preserves its prior directory under `backups/imports`.
 
 ## Path Remapping
 
@@ -60,7 +101,7 @@ python3 scripts/codex_history.py library sync shared-history.zip \
   --as shared-history --max-cost-cny 30 --json
 ```
 
-Import `shared-history.zip` on both devices. Both now contain the same merged lineage alongside their untouched local profile. Continue collecting new transcripts in each local profile. At the next sync, export both updated local profiles, import them on the hub, rerun `library sync`, and import the new convergence bundle on both ends.
+Import `shared-history.zip` on both devices. Both now contain the same merged lineage alongside their untouched local profile. Continue collecting new transcripts in each local profile. Move each local library's ordinary updates to the hub with its delta chain. When a new merge generation is produced, transfer one convergence baseline if the generated lineage is new; after that lineage exists on both devices, its later append-only generations can also travel as deltas.
 
 This is symmetric offline convergence, not live file replication. Do not write directly into another machine's active SQLite or synchronize profile directories with a generic cloud drive while a build is running.
 
@@ -68,5 +109,7 @@ This is symmetric offline convergence, not live file replication. Do not write d
 
 - A failed verification installs nothing.
 - A failed staged import leaves the source bundle unchanged; inspect `.import-*` only if a process was killed outside normal exception handling.
+- A failed delta restores materialized source files and cannot replace the last passing `active.json`.
+- Keep the baseline and ordered delta chain until a newer verified baseline is intentionally chosen as a checkpoint.
 - A lineage update preserves the previous imported profile under `backups/imports`.
 - Source profiles and their `active.json` files are never rollback targets for a merge failure.

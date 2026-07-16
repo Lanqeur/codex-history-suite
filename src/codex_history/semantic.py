@@ -158,7 +158,17 @@ def chroma_collection(
         "authority": "semantic-candidates-only",
     }
     if create:
-        collection = client.get_or_create_collection(collection_name, metadata=metadata)
+        names = {item.name for item in client.list_collections()}
+        selected = collection_name
+        if collection_name not in names and collection_name == COLLECTION_NAME:
+            legacy = "codex_history_v21"
+            if legacy in names:
+                selected = legacy
+        collection = (
+            client.get_collection(selected)
+            if selected in names
+            else client.create_collection(selected, metadata=metadata)
+        )
     else:
         collection = client.get_collection(collection_name)
     return client, collection
@@ -175,11 +185,12 @@ def refresh_embeddings(
     *,
     max_cost_cny: float | None,
     batch_size: int = 10,
+    chroma_path: Path | None = None,
 ) -> dict[str, Any]:
     settings = EmbeddingSettings.from_config(config)
     client = EmbeddingClient(settings)
     _chroma_client, collection = chroma_collection(
-        config.root / "semantic/chroma", settings, create=True
+        chroma_path or config.root / "semantic/chroma", settings, create=True
     )
     documents = [
         dict(row)
@@ -190,9 +201,6 @@ def refresh_embeddings(
     existing = set(collection.get(include=[]).get("ids") or []) if collection.count() else set()
     requested_ids = {str(row["document_id"]) for row in documents}
     stale = sorted(existing - requested_ids)
-    if stale:
-        for chunk in _batches(stale, 500):
-            collection.delete(ids=chunk)
     pending = [row for row in documents if row["document_id"] not in existing]
     estimated_tokens = sum(max(1, len(str(row["document_text"])) // 2) for row in pending)
     estimated_cost = estimated_tokens / 1_000_000 * settings.input_price_cny
@@ -200,6 +208,9 @@ def refresh_embeddings(
         raise RuntimeError(
             f"Embedding estimate {estimated_cost:.6f} CNY exceeds remaining limit {max_cost_cny:.6f} CNY"
         )
+    if stale:
+        for chunk in _batches(stale, 500):
+            collection.delete(ids=chunk)
     run_id = f"embedding-{uuid.uuid4().hex[:16]}"
     connection.execute(
         "INSERT INTO embedding_runs(run_id,model,dimensions,status,started_at,requested_documents,estimated_cost_cny,max_cost_cny,metadata_json) VALUES(?,?,?,?,?,?,?,?,?)",
@@ -212,7 +223,7 @@ def refresh_embeddings(
             len(pending),
             estimated_cost,
             max_cost_cny,
-            canonical_json({"collection": COLLECTION_NAME}),
+            canonical_json({"collection": collection.name}),
         ),
     )
     total_tokens = 0
@@ -246,6 +257,7 @@ def refresh_embeddings(
         "run_id": run_id,
         "model": settings.model,
         "dimensions": settings.dimensions,
+        "collection": collection.name,
         "documents": len(documents),
         "embedded": embedded,
         "reused": len(documents) - embedded,

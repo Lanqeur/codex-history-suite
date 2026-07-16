@@ -141,12 +141,18 @@ py -3 -m pip install ".[semantic]"
 
 ## 9. 多设备迁移与合并
 
-先给每台设备设置名称并导出完整 bundle：
+先给每台设备设置名称、检查附件闭合，再创建只需传输一次的规范基线：
 
 ```bash
 python3 scripts/codex_history.py library device --name '工作笔记本' --json
-python3 scripts/codex_history.py --profile default library export D:\CodexHistory\work-laptop.zip --json
+python3 scripts/codex_history.py --profile default coverage --json
+python3 scripts/codex_history.py --profile default library artifact-audit --verify-hashes --json
+python3 scripts/codex_history.py --profile default library export D:\CodexHistory\work-laptop.zip --artifacts referenced --json
 ```
+
+`--artifacts none` 适合只需要文本检索的轻量迁移；默认 `referenced` 会携带数据库引用的全部历史文件；`all` 还会归档 CAS 中未被当前数据库引用的对象。只有后两种属于附件闭合的便携包，并会在缺失或哈希不符时拒绝导出。
+
+导出结果中的 `history_coverage.latest_activity_at` 是实际知识内容截止水位，`source_scan_started_at` 是扫描本地来源的时点，`knowledge_version_id` 与 `logical_digest` 用来识别具体版本。迁移后先检查这些字段，不要仅根据 ZIP 文件创建时间判断内容新旧。
 
 在另一台设备导入后，系统会自动命名并做完整 SHA-256 校验：
 
@@ -156,9 +162,27 @@ python3 scripts/codex_history.py library list --json
 python3 scripts/codex_history.py library search '项目 决策' --deep --json
 ```
 
+以后有新会话时，不要再导出和搬运完整基线。源设备先正常执行 `update`，再以上一份基线或 delta 为基代导出下一代：
+
+```bash
+python3 scripts/codex_history.py --profile default update --dry-run --json
+python3 scripts/codex_history.py --profile default update --max-cost-cny 5 --json
+python3 scripts/codex_history.py --profile default library export-delta D:\CodexHistory\work-laptop-001.zip \
+  --base D:\CodexHistory\work-laptop.zip --artifacts referenced --json
+```
+
+接收设备只应用这份小 delta：
+
+```bash
+python3 scripts/codex_history.py library apply-delta D:\CodexHistory\work-laptop-001.zip \
+  --max-cost-cny 5 --json
+```
+
+delta 严格绑定稳定 `library_id` 和上一代 `source_generation_id`。缺代、乱序、误用其他设备库的 delta 或文件哈希不符都会被拒绝；重复应用同一份 delta 是安全的。默认携带新增模型缓存，使接收端尽量复用源端已经完成的模型结果；显式使用 `--without-model-cache` 时，接收端可能需要重新调用模型。
+
 联合检索不会重建数据，适合先直接使用。确实需要一个统一知识库时，再运行 `library merge`；第一次不要加 `--build`，先审阅返回的冲突分类、Token、费用和磁盘计划。确认后再用 `--build --max-cost-cny N`。两个来源 profile 始终保持不变。
 
-需要让两台设备得到同一份合并库时，使用 `library sync` 导出收敛 bundle，并把同一个 bundle 分别导入两端。后续重复同步会按稳定 library ID 更新导入版本，旧版保存在 `backups/imports`。完整说明见[多设备参考](skills/build-codex-history/references/multi-device.md)。
+需要让两台设备得到同一份合并库时，使用 `library sync` 导出收敛基线，并把同一个基线分别导入两端。后续同一 lineage 可以改用 delta 传输；旧版仍保存在 `backups/imports`。完整说明见[多设备参考](skills/build-codex-history/references/multi-device.md)。
 
 ## 10. 更新插件
 

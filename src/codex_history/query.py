@@ -11,7 +11,7 @@ import os
 import re
 import sqlite3
 import sys
-from collections import Counter, defaultdict
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -32,6 +32,7 @@ DEFAULT_CHROMA = Path(
         "chroma",
     )
 )
+SNAPSHOT_ROOT = Path(os.environ.get("CODEX_HISTORY_SNAPSHOTS", "snapshots"))
 ASSET_TYPES = ("decisions", "unresolved", "failures", "capabilities", "preferences")
 HIGH_TIERS = ("asset", "overview", "ledger")
 ALL_TIERS = (*HIGH_TIERS, "fact_block", "core")
@@ -69,6 +70,17 @@ def _environment_path_mappings() -> list[dict[str, str]]:
 
 
 PATH_MAPPINGS = _environment_path_mappings()
+
+
+def _environment_artifact_roots() -> list[Path]:
+    try:
+        value = json.loads(os.environ.get("CODEX_HISTORY_ARTIFACT_ROOTS", "[]"))
+    except json.JSONDecodeError:
+        return []
+    return [Path(str(item)).expanduser() for item in value if str(item)]
+
+
+ARTIFACT_ROOTS = _environment_artifact_roots()
 
 
 def compact_json(value: Any) -> str:
@@ -133,6 +145,19 @@ def remap_path_fields(value: Any) -> Any:
         elif isinstance(item, (dict, list)):
             result[key] = remap_path_fields(item)
     return result
+
+
+def resolve_artifact_path(cas_relative_path: str) -> str | None:
+    path = Path(cas_relative_path.replace("\\", "/"))
+    parts = path.parts[1:] if path.parts and path.parts[0] == "cas" else path.parts
+    if not parts or path.is_absolute() or ".." in parts:
+        return None
+    relative = Path(*parts)
+    for root in ARTIFACT_ROOTS:
+        candidate = root / relative
+        if candidate.is_file():
+            return str(candidate)
+    return None
 
 
 def connect(path: Path) -> sqlite3.Connection:
@@ -990,10 +1015,37 @@ def portable_evidence_sources(
         ).fetchone()
         if row is None:
             continue
+        raw_text = str(row["raw_json"] or "")
+        if not raw_text:
+            start = int(row["byte_start"])
+            end = int(row["byte_end"])
+            cursor = 0
+            pieces: list[bytes] = []
+            for chunk in connection.execute(
+                "SELECT size_bytes,cas_relative_path FROM source_chunks "
+                "WHERE source_id=? ORDER BY chunk_index",
+                (row["source_id"],),
+            ):
+                chunk_size = int(chunk["size_bytes"])
+                chunk_end = cursor + chunk_size
+                if end <= cursor:
+                    break
+                if start < chunk_end and end > cursor:
+                    path = SNAPSHOT_ROOT / str(chunk["cas_relative_path"])
+                    if path.is_file():
+                        with path.open("rb") as handle:
+                            local_start = max(0, start - cursor)
+                            local_end = min(chunk_size, end - cursor)
+                            handle.seek(local_start)
+                            pieces.append(handle.read(local_end - local_start))
+                cursor = chunk_end
+            raw_text = b"".join(pieces).rstrip(b"\r\n").decode(
+                "utf-8", errors="replace"
+            )
         try:
-            raw = json.loads(row["raw_json"])
+            raw = json.loads(raw_text)
         except json.JSONDecodeError:
-            raw = {"raw_json": row["raw_json"]}
+            raw = {"raw_json": raw_text}
         result.append(
             {
                 "queue_path": row["source_path"],
@@ -1295,6 +1347,9 @@ def command_artifacts(args: argparse.Namespace, connection: sqlite3.Connection) 
     artifacts = [remap_path_fields(dict(row)) for row in rows]
     for row in artifacts:
         row.pop("rank", None)
+        local_path = resolve_artifact_path(str(row.get("cas_relative_path") or ""))
+        row["artifact_available"] = local_path is not None
+        row["local_cas_path"] = local_path
 
     ledger_filters = ["(ref LIKE ? OR role LIKE ?)"]
     ledger_params: list[Any] = [f"%{args.query}%", f"%{args.query}%"]
@@ -1323,6 +1378,7 @@ def command_artifacts(args: argparse.Namespace, connection: sqlite3.Connection) 
         print(f"{index}. {row['path']} ({row['size_human']}, {row['mime_type']})")
         print(f"   {row['artifact_uri']}")
         print(f"   CAS: {row['cas_relative_path']} | sha256={row['sha256']}")
+        print(f"   Local: {row['local_cas_path'] or 'unavailable'}")
     print("\n# Ledger artifact references")
     if not ledger_rows:
         print("No matching ledger artifact references.")

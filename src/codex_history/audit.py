@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
+from .artifacts import inspect_artifact_closure
+from .config import ProfileConfig
 from .schema import connect, schema_version
 from .util import canonical_json, utc_now
 
@@ -207,6 +208,30 @@ def audit_database(path: Path) -> dict[str, Any]:
         return audit_connection(connection)
     finally:
         connection.close()
+
+
+def audit_profile(
+    config: ProfileConfig,
+    path: Path,
+    *,
+    verify_artifact_hashes: bool = False,
+) -> dict[str, Any]:
+    result = audit_database(path)
+    closure, _ = inspect_artifact_closure(
+        config,
+        path,
+        verify_hashes=verify_artifact_hashes,
+    )
+    result["artifact_closure"] = closure
+    result["checks"].append(
+        {
+            "name": "artifact_closure",
+            "passed": closure["complete"],
+            "detail": closure,
+        }
+    )
+    result["passed"] = result["passed"] and closure["complete"]
+    return result
 
 
 def compare_databases(left: Path, right: Path) -> dict[str, Any]:

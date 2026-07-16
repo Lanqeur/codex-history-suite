@@ -34,13 +34,14 @@ python3 ../../scripts/codex_history.py update --dry-run --json
 python3 ../../scripts/codex_history.py update --max-cost-cny 5 --json
 python3 ../../scripts/codex_history.py audit --equivalence --json
 python3 ../../scripts/codex_history.py status --json
+python3 ../../scripts/codex_history.py coverage --json
 ```
 
 Use `--home` and `--profile` before the command for non-default installations.
 
 ## Migration And Recovery
 
-Use `migrate --from-db PATH` for an existing v2.1/v2.1.1 SQLite authority. Migration uses SQLite backup, adds portable metadata and lifecycle tables, rebuilds FTS, audits, and only then promotes it. It does not silently discard legacy evidence or knowledge. The imported authority is query-compatible, not a canonical incremental baseline; run one full build before the first `update`, keeping the migrated build for comparison and rollback.
+Use `migrate --from-db PATH` for an existing v2.1/v2.1.1 SQLite authority. Add `--from-artifacts PATH --artifact-mode reference|copy|hardlink|auto` when the legacy database indexes an external artifact pack. Migration uses SQLite backup, adds portable metadata and lifecycle tables, rebuilds FTS, verifies artifact closure when requested, audits, and only then promotes it. It does not silently discard legacy evidence or knowledge. The imported authority is query-compatible, not yet a canonical incremental baseline. Run `hydrate-baseline` to attach normalized source snapshots while preserving curated knowledge and the existing semantic index, then optionally run `compact-storage` to remove duplicate canonical payloads. Both operations cost zero model tokens. Keep the migrated build for comparison and rollback until the hydrated baseline passes audit.
 
 Use `status` to inspect failed stages. Use `repair` only after reading [references/recovery.md](references/recovery.md). Never delete the last passing build or clear a lock while a process is alive.
 
@@ -48,13 +49,15 @@ Read [references/configuration.md](references/configuration.md) when configuring
 
 ## Device Libraries
 
-Use `library device`, `library export`, `library import`, and `library verify` for portable device libraries. Never treat the old `backup` command as a complete portable export; it contains only SQLite and the active manifest.
+Use `library device`, `library export`, `library import`, and `library verify` for the one-time canonical device baseline. Run `coverage --json` and explain both the represented `latest_activity_at` and source observation watermark before migration; do not call bundle creation time a content cutoff. Run `library artifact-audit --verify-hashes` before an archival export. Select `library export --artifacts none` for an explicitly query-only bundle, `referenced` for the default database-closed portable bundle, or `all` to retain unreferenced CAS objects too. Never describe `none` or the old `backup` command as a complete artifact backup.
+
+After the baseline is imported, use `library export-delta DEST --base PREVIOUS_TRANSFER` on the source and `library apply-delta DELTA` on the receiver. The previous transfer may be the baseline or the immediately preceding delta. Keep model cache deltas enabled unless the user explicitly accepts possible repeated model calls. Report base and target source generations, changed-source counts, payload size, and coverage watermarks. Never advise retransferring a full multi-gigabyte bundle for an ordinary append. Do not bypass a generation mismatch: missing, out-of-order, cross-lineage, and tampered deltas must fail before promotion.
 
 Use `library search` when the user wants immediate cross-device retrieval without rebuilding. It preserves independent authorities and collapses exact duplicate knowledge while returning every source profile and Record ID.
 
 Use `library merge` only after explaining that it creates or updates a separate generated profile. Run it without `--build` first and report the transcript merge methods plus the returned full/incremental cost plan. Add `--build --max-cost-cny N` only after explicit approval. Never modify either source profile.
 
-Use `library sync DESTINATION --from A --from B` when the user wants offline two-way convergence. It produces one merged, audited bundle; the same bundle must be imported on both devices. A later bundle with the same stable `library_id` updates the imported generation and preserves the previous one under `backups/imports`.
+Use `library sync DESTINATION --from A --from B` when the user wants offline two-way convergence. It produces one merged, audited baseline; the same baseline must be imported on both devices. Later generations of that merged lineage should use deltas. A newer full baseline with the same stable `library_id` can still replace an imported generation while preserving the previous one under `backups/imports`.
 
 Read [references/multi-device.md](references/multi-device.md) before handling divergent transcript copies, path mappings, repeated synchronization, or import recovery.
 

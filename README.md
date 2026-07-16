@@ -60,17 +60,35 @@ Completed builds return an actual `usage` summary for model input, provider-cach
 
 ## Multiple Devices
 
-Version 0.3 adds a verified library bundle and non-destructive multi-device workflow. Give each machine a stable identity, export its active profile, and import both bundles on either machine or on a separate hub:
+Version 0.4 adds canonical baselines plus generation-checked deltas. Give each machine a stable identity, create and transfer one complete baseline, then move only new content-addressed transcript chunks, artifacts, and model-cache entries:
 
 ```bash
 python3 scripts/codex_history.py library device --name 'Work laptop' --json
-python3 scripts/codex_history.py --profile default library export ~/work-laptop.zip --json
+python3 scripts/codex_history.py --profile default coverage --json
+python3 scripts/codex_history.py --profile default library artifact-audit --verify-hashes --json
+python3 scripts/codex_history.py --profile default library export ~/work-laptop.zip \
+  --artifacts referenced --json
 python3 scripts/codex_history.py library import ~/work-laptop.zip --json
+
+# After later local conversations and a successful incremental update:
+python3 scripts/codex_history.py --profile default update --max-cost-cny 5 --json
+python3 scripts/codex_history.py --profile default library export-delta ~/work-laptop-001.zip \
+  --base ~/work-laptop.zip --artifacts referenced --json
+
+# On the receiving machine; the baseline is not transferred again:
+python3 scripts/codex_history.py library apply-delta ~/work-laptop-001.zip \
+  --max-cost-cny 5 --json
 python3 scripts/codex_history.py library list --json
 python3 scripts/codex_history.py library search 'release decision' --deep --json
 ```
 
+The next delta can use the previous delta as `--base`. Each delta contains the complete target source inventory but packages only blobs absent from its base generation. `apply-delta` requires the exact `library_id` and base source generation, reconstructs only changed normalized transcripts, runs the ordinary audited incremental pipeline, and is idempotent. Missing, out-of-order, cross-library, or tampered deltas are rejected before promotion. This makes the full SQLite, existing Chroma index, historical snapshots, and artifact CAS a one-time transfer rather than a recurring multi-gigabyte copy.
+
 Imported profiles are named from the source device and profile, with collision suffixes added automatically. A stable `library_id` recognizes later generations of the same library; a newer import updates that profile while preserving the prior generation under `backups/imports`. Every bundle entry is verified with SHA-256, unsafe archive paths are rejected, and immutable transcript chunks, artifacts, semantic files, and model-cache entries share a global content-addressed blob store through hard links when the filesystem permits it.
+
+Artifact export is explicit. `--artifacts none` creates a smaller query-only bundle whose SQLite keeps artifact metadata but intentionally omits file payloads. `referenced` is the default portable mode and includes every artifact indexed by the active database. `all` also includes unreferenced files retained in local or registered external CAS roots. Referenced and all exports fail when database-to-CAS closure is missing, the size disagrees, or SHA-256 verification fails. The bundle manifest records both the selected policy and computed closure.
+
+Every new bundle also records `history_coverage`: the earliest and latest represented conversation activity, source scan and snapshot watermarks, build completion, thread/source/event counts, logical digest, and a stable knowledge-version ID. `latest_activity_at` means “the latest timestamp actually represented,” while `source_scan_started_at` means “when local sources were observed”; neither field alone proves that every possible transcript in the interval exists. Inspect the same watermark at any time with `coverage --json` or in `status --json` and `library list --json`.
 
 Federated search queries independent SQLite/Chroma authorities and collapses exact knowledge duplicates while retaining every matching profile and Record ID. It is immediately useful and does not rebuild anything. A merge is different: it reconstructs transcript snapshots by stable thread ID, chooses exact or longest-prefix variants, performs a deterministic event union for divergent copies, and writes a new generated profile without changing either source:
 
@@ -84,7 +102,7 @@ python3 scripts/codex_history.py library merge \
   --as personal-history --build --max-cost-cny 30 --json
 ```
 
-`library sync` performs the merge/build and exports one convergence bundle. Import that same bundle on both devices. Repeated imports and merges are idempotent by library lineage and content digest. Absolute paths remain in provenance; automatic exact-file/root mappings and optional `--path-map 'OLD=NEW'` mappings expose usable local paths at query time without rewriting historical evidence.
+`library sync` performs the merge/build and exports one convergence baseline. Import that same baseline on both devices; subsequent generations of that merged lineage can also travel as deltas. Repeated imports, delta application, and merges are idempotent by library lineage, source generation, and content digest. Absolute paths remain in provenance; automatic exact-file/root mappings and optional `--path-map 'OLD=NEW'` mappings expose usable local paths at query time without rewriting historical evidence.
 
 See [the multi-device reference](skills/build-codex-history/references/multi-device.md) for the bundle format, conflict rules, offline two-way synchronization, and recovery procedure.
 
@@ -113,7 +131,7 @@ Fresh builds generate only conservative, evidence-exact fact relations. Verified
 
 ## Legacy Migration
 
-`migrate --from-db` preserves and audits an existing v2.1/v2.1.1 SQLite authority; `--from-chroma` can copy its semantic index. The migrated build is immediately queryable but intentionally read-only as a legacy baseline. Run one full build before the first incremental update. Promotion is atomic, so the imported build remains available for rollback and comparison.
+`migrate --from-db` preserves and audits an existing v2.1/v2.1.1 SQLite authority; `--from-chroma` can copy its semantic index. Use `--from-artifacts ARTIFACT_PACK --artifact-mode reference` to verify and register a large external CAS without duplicating it, or select `copy`, `hardlink`, or `auto` to materialize files under the profile. The migrated build is immediately queryable but is not yet a canonical incremental baseline. Run `hydrate-baseline` to attach normalized source snapshots while preserving curated Overview, ledger, Evidence, relations, and the existing semantic index; then use `compact-storage` to remove duplicate raw payloads after trace-offset verification. Neither step calls a model. Promotion is atomic, so the imported build remains available for rollback and comparison.
 
 ## Cross-Platform Storage
 
