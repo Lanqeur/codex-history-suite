@@ -5,6 +5,7 @@ import shutil
 import sqlite3
 import uuid
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -20,6 +21,7 @@ from .knowledge import (
     insert_source_snapshot,
     rebuild_conservative_relations,
     rebuild_family_scopes,
+    refresh_evidence_rollups,
 )
 from .parser import parse_snapshot
 from .schema import connect, initialize, rebuild_fts
@@ -134,13 +136,80 @@ def plan(config: ProfileConfig, *, mode: str) -> dict[str, Any]:
         connection = connect(database, readonly=True)
         try:
             previous = previous_sources(connection)
+            pending_row = connection.execute(
+                "SELECT COUNT(*),COALESCE(SUM(length(text)),0) FROM knowledge "
+                "WHERE tier='fact_block' "
+                "AND COALESCE(json_extract(metadata_json,'$.incremental_append'),0)=1 "
+                "AND COALESCE(json_extract(metadata_json,'$.model_consolidated_build_id'),'')=''"
+            ).fetchone()
+            pending_model_records = int(pending_row[0])
+            pending_model_chars = int(pending_row[1])
+            pending_thread_ids = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT DISTINCT scope_id FROM knowledge WHERE tier='fact_block' "
+                    "AND COALESCE(json_extract(metadata_json,'$.incremental_append'),0)=1 "
+                    "AND COALESCE(json_extract(metadata_json,'$.model_consolidated_build_id'),'')=''"
+                )
+            }
         finally:
             connection.close()
+    else:
+        pending_model_records = 0
+        pending_model_chars = 0
+        pending_thread_ids = set()
     if mode == "full" or not database:
         changes = [SourceChange("added", source, None, "full build") for source in sources]
+        pending_model_records = 0
+        pending_model_chars = 0
+        pending_thread_ids = set()
     else:
         changes = classify_changes(sources, previous)
     actionable = [change for change in changes if change.kind != "unchanged"]
+    affected_thread_ids = pending_thread_ids | {
+        str(change.source.thread_id if change.source else change.previous.get("thread_id"))
+        for change in actionable
+        if change.source or change.previous
+    }
+    affected_scope_count = 0
+    writer_context_chars = 0
+    if database and affected_thread_ids:
+        connection = connect(database, readonly=True)
+        try:
+            placeholders = ",".join("?" for _ in affected_thread_ids)
+            affected_scope_ids = {
+                str(row[0])
+                for row in connection.execute(
+                    f"SELECT DISTINCT scope_id FROM scope_threads "
+                    f"WHERE thread_id IN ({placeholders})",
+                    sorted(affected_thread_ids),
+                )
+            }
+            missing_direct = affected_thread_ids - {
+                str(row[0])
+                for row in connection.execute(
+                    f"SELECT scope_id FROM scopes WHERE scope_type='thread' "
+                    f"AND scope_id IN ({placeholders})",
+                    sorted(affected_thread_ids),
+                )
+            }
+            affected_scope_count = len(affected_scope_ids) + len(missing_direct)
+            if affected_scope_ids:
+                scope_placeholders = ",".join("?" for _ in affected_scope_ids)
+                writer_context_chars = int(
+                    connection.execute(
+                        f"SELECT COALESCE(SUM(length(text)),0) FROM knowledge "
+                        f"WHERE scope_id IN ({scope_placeholders}) AND tier IN ('ledger','overview')",
+                        sorted(affected_scope_ids),
+                    ).fetchone()[0]
+                )
+            writer_context_chars += len(missing_direct) * 1_000
+        finally:
+            connection.close()
+    affected_scope_count = max(affected_scope_count, len(actionable))
+    if mode == "full":
+        affected_scope_count = max(affected_scope_count, len(sources) * 2)
+        writer_context_chars = 0
     summarization = resolve_summarization(config)
     estimate = estimate_build(
         config,
@@ -148,6 +217,10 @@ def plan(config: ProfileConfig, *, mode: str) -> dict[str, Any]:
         changes=changes,
         database=database,
         summarization=summarization,
+        pending_model_records=pending_model_records,
+        pending_model_chars=pending_model_chars,
+        affected_scope_count=affected_scope_count,
+        writer_context_chars=writer_context_chars,
     )
     counts: dict[str, int] = {}
     for change in changes:
@@ -165,6 +238,10 @@ def plan(config: ProfileConfig, *, mode: str) -> dict[str, Any]:
             "Model-first auto mode will fall back to deterministic extractive summaries because "
             + str(summarization["fallback_reason"])
             + ". Configure the model API key for the recommended higher-quality build."
+        )
+    if pending_model_records:
+        warnings.append(
+            f"{pending_model_records} incrementally ingested fact blocks are waiting for model consolidation."
         )
     elif summarization["effective_mode"] == "unavailable":
         warnings.append(
@@ -187,6 +264,13 @@ def plan(config: ProfileConfig, *, mode: str) -> dict[str, Any]:
         "source_count": len(sources),
         "change_counts": counts,
         "actionable_count": len(actionable),
+        "pending_model_records": pending_model_records,
+        "pending_model_chars": pending_model_chars,
+        "work_required": bool(actionable)
+        or bool(
+            pending_model_records
+            and summarization["effective_mode"] == "openai-compatible"
+        ),
         "changed_bytes": estimate["source"]["actionable_source_bytes"],
         "new_or_reprocessed_bytes": estimate["source"]["new_or_reprocessed_bytes"],
         "summarization_mode": config.summary_mode,
@@ -197,10 +281,17 @@ def plan(config: ProfileConfig, *, mode: str) -> dict[str, Any]:
         ),
         "estimated_input_tokens_if_model_enabled": summary_tokens["input_expected"],
         "estimated_output_tokens": (
-            summary_tokens["output_expected"] if summary_tokens["would_call_model"] else 0
+            summary_tokens["output_expected"]
+            + summary_tokens.get("writer_output_expected", 0)
+            if summary_tokens["would_call_model"]
+            else 0
         ),
-        "estimated_output_tokens_if_model_enabled": summary_tokens["output_expected"],
+        "estimated_output_tokens_if_model_enabled": summary_tokens["output_expected"]
+        + summary_tokens.get("writer_output_expected", 0),
         "estimated_embedding_tokens_upper_bound": token_estimate["embedding_input_upper"],
+        "estimated_embedding_tokens_expected": token_estimate[
+            "embedding_input_expected"
+        ],
         "estimated_summary_cost_cny": cost_estimate["summary_upper_no_cache"],
         "estimated_summary_cost_cny_if_model_enabled": cost_estimate[
             "summary_if_model_enabled_upper_no_cache"
@@ -358,7 +449,18 @@ def _promote(
     database: Path,
     *,
     semantic_candidate: Path | None = None,
+    completion_status: str = "unknown",
 ) -> dict[str, Any]:
+    if completion_status == "unknown":
+        status_connection = connect(database, readonly=True)
+        try:
+            row = status_connection.execute(
+                "SELECT value FROM metadata WHERE key='knowledge_completion_status'"
+            ).fetchone()
+            if row:
+                completion_status = str(row[0])
+        finally:
+            status_connection.close()
     relative = database.relative_to(config.root).as_posix()
     payload = {
         "schema_version": "codex-history-active-v1",
@@ -367,6 +469,7 @@ def _promote(
         "database": relative,
         "promoted_at": utc_now(),
         "incremental_ready": True,
+        "knowledge_completion_status": completion_status,
     }
     semantic_target = config.root / "semantic/chroma"
     semantic_previous = config.root / f"semantic/.previous-{build_id}"
@@ -408,9 +511,13 @@ def _build_locked(
         raise RuntimeError(
             f"Estimated cost {build_plan['estimated_cost_cny']:.6f} CNY exceeds limit {max_cost_cny:.6f} CNY"
         )
-    if kind == "incremental" and build_plan["actionable_count"] == 0:
+    if kind == "incremental" and not build_plan["work_required"]:
         return {
-            "status": "no_changes",
+            "status": (
+                "pending_model_consolidation"
+                if build_plan.get("pending_model_records")
+                else "no_changes"
+            ),
             "build_id": build_plan["active_build_id"],
             "plan": build_plan,
             "database": str(active_database(config)),
@@ -525,6 +632,7 @@ def _build_locked(
                         parsed,
                         config,
                         index_new_knowledge=True,
+                        build_id=build_id,
                     )
                     totals["threads"] += 1
                     totals["preserved_curated_scopes"] += int(
@@ -549,26 +657,54 @@ def _build_locked(
                 snapshot = snapshots[change.source.source_id]
                 insert_source_snapshot(connection, snapshot)
                 parsed = parse_snapshot(snapshot, config)
-                inserted = insert_parsed_thread(connection, snapshot, parsed, config)
+                inserted = insert_parsed_thread(
+                    connection,
+                    snapshot,
+                    parsed,
+                    config,
+                    ingest_build_id=build_id,
+                    incremental_append=kind == "full",
+                )
                 totals["threads"] += 1
                 for key, value in inserted.items():
                     totals[key] += value
+            if kind == "full":
+                connection.execute(
+                    "INSERT INTO metadata(key,value) VALUES('canonical_snapshot_complete','true') "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+                )
+                connection.execute(
+                    "INSERT INTO metadata(key,value) VALUES('knowledge_completion_status','pending_model_consolidation') "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+                )
             report.update(totals)
 
         with run.stage(connection, "lineage") as report:
-            if hydrated_incremental:
-                report.update(
-                    {
-                        "preserved": True,
-                        "note": "Curated family scopes and relations retained during append",
-                    }
+            if kind == "full" or hydrated_incremental:
+                curated_families = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM scopes WHERE scope_type='family' "
+                        "AND human_verdict NOT LIKE 'deterministic%'"
+                    ).fetchone()[0]
                 )
+                if curated_families:
+                    refresh_evidence_rollups(connection)
+                    report.update(
+                        {
+                            "preserved": True,
+                            "curated_family_scopes": curated_families,
+                            "note": "Curated family scopes retained; evidence rollups refreshed",
+                        }
+                    )
+                else:
+                    report["family_scopes"] = rebuild_family_scopes(connection, build_id)
+                report["relations"] = rebuild_conservative_relations(connection)
             else:
                 report["family_scopes"] = rebuild_family_scopes(connection, build_id)
                 report["relations"] = rebuild_conservative_relations(connection)
 
         with run.stage(connection, "summarize") as report:
-            from .summarize import summarize_scopes
+            from .summarize import summarize_incremental, summarize_scopes
 
             affected_threads = {
                 str(change.source.thread_id if change.source else change.previous.get("thread_id"))
@@ -604,15 +740,6 @@ def _build_locked(
                             )
                         }
                     )
-                scope_ids = sorted(
-                    set(scope_ids)
-                    | {
-                        str(row[0])
-                        for row in connection.execute(
-                            "SELECT scope_id FROM scopes WHERE scope_type='family'"
-                        )
-                    }
-                )
             if scope_ids:
                 placeholders = ",".join("?" for _ in scope_ids)
                 scope_types = {
@@ -629,16 +756,21 @@ def _build_locked(
                         scope_id,
                     ),
                 )
-            if hydrated_incremental:
-                scope_ids = []
-            report.update(
-                summarize_scopes(
+            if kind == "full" or hydrated_incremental:
+                summary_result = summarize_incremental(
+                    config,
+                    connection,
+                    build_id=build_id,
+                    max_cost_cny=max_cost_cny,
+                )
+            else:
+                summary_result = summarize_scopes(
                     config,
                     connection,
                     scope_ids=scope_ids,
                     max_cost_cny=max_cost_cny,
                 )
-            )
+            report.update(summary_result)
 
         with run.stage(connection, "index") as report:
             connection.execute(
@@ -649,7 +781,7 @@ def _build_locked(
             )
             rebuild_fts(connection)
             semantic_report: dict[str, Any] = {"enabled": False}
-            if config.embedding_enabled and not hydrated_incremental:
+            if config.embedding_enabled:
                 from .semantic import refresh_embeddings
 
                 semantic_candidate = _prepare_semantic_candidate(config, build_dir)
@@ -665,15 +797,6 @@ def _build_locked(
                     max_cost_cny=remaining_cost,
                     chroma_path=semantic_candidate,
                 )
-            elif config.embedding_enabled and hydrated_incremental:
-                semantic_report = {
-                    "enabled": True,
-                    "mode": "preserve-existing",
-                    "embedded": 0,
-                    "input_tokens": 0,
-                    "actual_cost_cny": 0.0,
-                    "status": "partial-until-explicit-semantic-refresh",
-                }
             report.update(
                 {
                     "knowledge": connection.execute("SELECT COUNT(*) FROM knowledge").fetchone()[0],
@@ -711,12 +834,18 @@ def _build_locked(
 
         with run.stage(connection, "promote") as report:
             if promote:
+                completion_row = connection.execute(
+                    "SELECT value FROM metadata WHERE key='knowledge_completion_status'"
+                ).fetchone()
                 report.update(
                     _promote(
                         config,
                         build_id,
                         database,
                         semantic_candidate=semantic_candidate,
+                        completion_status=(
+                            str(completion_row[0]) if completion_row else "unknown"
+                        ),
                     )
                 )
                 promoted_at = report["promoted_at"]
@@ -1143,7 +1272,12 @@ def equivalence_audit(config: ProfileConfig, *, keep_reference: bool = False) ->
     if not active:
         raise RuntimeError("No active build to compare")
     with file_lock(config.lock_path):
-        reference = build_full(config, promote=False, acquire_lock=False)
+        reference_config = replace(
+            config,
+            summary_mode="extractive",
+            embedding_enabled=False,
+        )
+        reference = build_full(reference_config, promote=False, acquire_lock=False)
         result = compare_databases(active, Path(reference["database"]))
         result.update(
             {

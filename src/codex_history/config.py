@@ -84,9 +84,19 @@ class ProfileConfig:
     summary_input_price_cny: float = 1.0
     summary_cached_input_price_cny: float = 0.2
     summary_output_price_cny: float = 2.0
+    writer_provider: str = "dashscope"
+    writer_model: str = "qwen3.7-max"
+    writer_endpoint: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    writer_api_key_env: str = "DASHSCOPE_API_KEY"
+    writer_env_file: str = ""
+    writer_thinking_enabled: bool | None = False
+    writer_input_price_cny: float = 6.0
+    writer_cached_input_price_cny: float = 1.2
+    writer_output_price_cny: float = 18.0
     estimate_bytes_per_token: float = 3.0
     estimate_summary_input_ratio: float = 0.30
     estimate_summary_output_ratio: float = 0.08
+    estimate_embedding_input_ratio: float = 0.15
     estimate_cached_input_ratio: float = 0.0
     estimate_sqlite_to_source_ratio: float = 0.18
     estimate_artifact_to_source_ratio: float = 0.08
@@ -98,7 +108,7 @@ class ProfileConfig:
     embedding_endpoint: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     embedding_api_key_env: str = "DASHSCOPE_API_KEY"
     embedding_env_file: str = ""
-    embedding_input_price_cny: float = 0.0
+    embedding_input_price_cny: float = 0.5
     artifact_capture_paths: bool = False
     artifact_max_file_bytes: int = 100 * 1024 * 1024
     runtime_python: str = ""
@@ -185,10 +195,22 @@ input_price_cny_per_million = 1.0
 cached_input_price_cny_per_million = 0.2
 output_price_cny_per_million = 2.0
 
+[profiles.{profile}.summarization.writer]
+provider = "dashscope"
+model = "qwen3.7-max"
+endpoint = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+api_key_env = "DASHSCOPE_API_KEY"
+env_file = ""
+thinking_enabled = false
+input_price_cny_per_million = 6.0
+cached_input_price_cny_per_million = 1.2
+output_price_cny_per_million = 18.0
+
 [profiles.{profile}.estimation]
 bytes_per_token = 3.0
 summary_input_ratio = 0.30
 summary_output_ratio = 0.08
+embedding_input_ratio = 0.15
 cached_input_ratio = 0.0
 sqlite_to_source_ratio = 0.18
 artifact_to_source_ratio = 0.08
@@ -202,7 +224,7 @@ dimensions = 512
 endpoint = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 api_key_env = "DASHSCOPE_API_KEY"
 env_file = ""
-input_price_cny_per_million = 0.0
+input_price_cny_per_million = 0.5
 
 [profiles.{profile}.artifacts]
 capture_existing_paths = false
@@ -217,6 +239,7 @@ python = ""
 
 def _profile_from_item(home: Path, profile: str, item: Mapping[str, Any]) -> ProfileConfig:
     summary = item.get("summarization", {})
+    writer = summary.get("writer", {})
     estimation = item.get("estimation", {})
     embedding = item.get("embedding", {})
     artifacts = item.get("artifacts", {})
@@ -256,9 +279,27 @@ def _profile_from_item(home: Path, profile: str, item: Mapping[str, Any]) -> Pro
             summary.get("cached_input_price_cny_per_million", 0.2)
         ),
         summary_output_price_cny=float(summary.get("output_price_cny_per_million", 2.0)),
+        writer_provider=str(writer.get("provider", "dashscope")),
+        writer_model=str(writer.get("model", "qwen3.7-max")),
+        writer_endpoint=str(
+            writer.get("endpoint", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+        ),
+        writer_api_key_env=str(writer.get("api_key_env", "DASHSCOPE_API_KEY")),
+        writer_env_file=str(writer.get("env_file", "")),
+        writer_thinking_enabled=(
+            bool(writer["thinking_enabled"]) if "thinking_enabled" in writer else False
+        ),
+        writer_input_price_cny=float(writer.get("input_price_cny_per_million", 6.0)),
+        writer_cached_input_price_cny=float(
+            writer.get("cached_input_price_cny_per_million", 1.2)
+        ),
+        writer_output_price_cny=float(writer.get("output_price_cny_per_million", 18.0)),
         estimate_bytes_per_token=float(estimation.get("bytes_per_token", 3.0)),
         estimate_summary_input_ratio=float(estimation.get("summary_input_ratio", 0.30)),
         estimate_summary_output_ratio=float(estimation.get("summary_output_ratio", 0.08)),
+        estimate_embedding_input_ratio=float(
+            estimation.get("embedding_input_ratio", 0.15)
+        ),
         estimate_cached_input_ratio=float(estimation.get("cached_input_ratio", 0.0)),
         estimate_sqlite_to_source_ratio=float(
             estimation.get("sqlite_to_source_ratio", 0.18)
@@ -278,7 +319,7 @@ def _profile_from_item(home: Path, profile: str, item: Mapping[str, Any]) -> Pro
         ),
         embedding_api_key_env=str(embedding.get("api_key_env", "DASHSCOPE_API_KEY")),
         embedding_env_file=str(embedding.get("env_file", "")),
-        embedding_input_price_cny=float(embedding.get("input_price_cny_per_million", 0.0)),
+        embedding_input_price_cny=float(embedding.get("input_price_cny_per_million", 0.5)),
         artifact_capture_paths=bool(artifacts.get("capture_existing_paths", False)),
         artifact_max_file_bytes=int(artifacts.get("max_file_bytes", 100 * 1024 * 1024)),
         runtime_python=str(runtime.get("python", "")),
@@ -347,9 +388,16 @@ def _validate_profile(config: ProfileConfig) -> None:
             config.summary_cached_input_price_cny,
         ),
         ("summarization.output_price_cny_per_million", config.summary_output_price_cny),
+        ("summarization.writer.input_price_cny_per_million", config.writer_input_price_cny),
+        (
+            "summarization.writer.cached_input_price_cny_per_million",
+            config.writer_cached_input_price_cny,
+        ),
+        ("summarization.writer.output_price_cny_per_million", config.writer_output_price_cny),
         ("embedding.input_price_cny_per_million", config.embedding_input_price_cny),
         ("estimation.summary_input_ratio", config.estimate_summary_input_ratio),
         ("estimation.summary_output_ratio", config.estimate_summary_output_ratio),
+        ("estimation.embedding_input_ratio", config.estimate_embedding_input_ratio),
         ("estimation.sqlite_to_source_ratio", config.estimate_sqlite_to_source_ratio),
         ("estimation.artifact_to_source_ratio", config.estimate_artifact_to_source_ratio),
         ("estimation.semantic_to_source_ratio", config.estimate_semantic_to_source_ratio),
@@ -412,6 +460,21 @@ def resolve_summarization(config: ProfileConfig) -> dict[str, object]:
     )
     if not missing and not key_available:
         missing.append(f"${config.summary_api_key_env}")
+    writer_missing = [
+        label
+        for label, value in (
+            ("writer.endpoint", config.writer_endpoint),
+            ("writer.model", config.writer_model),
+            ("writer.api_key_env", config.writer_api_key_env),
+        )
+        if not value
+    ]
+    writer_key_available = bool(
+        configured_secret(config.writer_api_key_env, config.writer_env_file)
+    )
+    if not writer_missing and not writer_key_available:
+        writer_missing.append(f"${config.writer_api_key_env}")
+    missing.extend(writer_missing)
 
     if requested == "extractive":
         effective = "extractive"
@@ -430,8 +493,12 @@ def resolve_summarization(config: ProfileConfig) -> dict[str, object]:
         "effective_mode": effective,
         "provider": config.summary_provider,
         "model": config.summary_model,
+        "writer_provider": config.writer_provider,
+        "writer_model": config.writer_model,
         "api_key_env": config.summary_api_key_env,
         "api_key_available": key_available,
+        "writer_api_key_env": config.writer_api_key_env,
+        "writer_api_key_available": writer_key_available,
         "fallback": requested == "auto" and effective == "extractive",
         "fallback_reason": fallback_reason,
     }

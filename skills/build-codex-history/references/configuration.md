@@ -23,7 +23,7 @@ Transcript storage is treated as a versioned, private input format. Unknown JSON
 
 ## Summarization
 
-New profiles use `summarization.mode = "auto"`. Auto mode calls the configured OpenAI-compatible model when its endpoint, model, API-key environment variable, and key are available. If any of those are absent, it reports the missing item and falls back to deterministic `extractive` summaries. Use `"extractive"` to force offline operation or `"openai-compatible"` to require a model and fail on incomplete configuration.
+New profiles use `summarization.mode = "auto"`. Auto mode uses a low-cost reducer for evidence-to-ledger consolidation and a separate high-quality writer for thread/family overviews. Both must be configured. If either key or endpoint is absent, ingestion still preserves deterministic core/fact evidence, but the build is explicitly marked `pending_model_consolidation`; this is an emergency offline fallback, not a completed knowledge layer. A later `update` processes that backlog even when no transcript changed. Use `"extractive"` to force this offline staging behavior or `"openai-compatible"` to require both models and fail on incomplete configuration.
 
 The generated quality/cost preset is:
 
@@ -39,23 +39,35 @@ thinking_enabled = false
 input_price_cny_per_million = 1.0
 cached_input_price_cny_per_million = 0.2
 output_price_cny_per_million = 2.0
+
+[profiles.default.summarization.writer]
+provider = "dashscope"
+model = "qwen3.7-max"
+endpoint = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+api_key_env = "DASHSCOPE_API_KEY"
+env_file = ""
+thinking_enabled = false
+input_price_cny_per_million = 6.0
+cached_input_price_cny_per_million = 1.2
+output_price_cny_per_million = 18.0
 ```
 
-Prices are user-owned planning inputs, not a live billing feed. Verify the provider's current region, deployment, cache, tier, and batch pricing before a paid build. The DeepSeek V4 Flash defaults above reflect the recommended economical mainland-China DashScope preset at the time of release. `thinking_enabled = false` avoids paying for reasoning tokens on this structured extraction workload.
+Prices are user-owned planning inputs, not a live billing feed. Verify the provider's current region, deployment, cache, tier, and batch pricing before a paid build. DeepSeek handles the token-heavy reducer stage; Qwen handles the much smaller final overview stage. `thinking_enabled = false` avoids reasoning-token cost on this structured workload.
 
-The model must return cited Record IDs; unsupported claims remain unlinked. Model/provider failures do not trigger a silent fallback. Only missing configuration in `auto` mode does.
+Every reducer response must account for every supplied Record ID, either in an evidence-linked ledger item or an explicit no-new-fact list. One repair call is allowed; repeated omissions fail the candidate build. Writer claims and assets must cite ledger Record IDs. Provider failures, malformed responses, and exhausted budgets never trigger a silent fallback.
 
-Model responses are cached by stage version, model, prompt hash, and input hash. A clean full rebuild reuses identical cached outputs.
+New ledger generations are appended rather than rewriting old ledgers. Existing overviews are archived in `knowledge_versions` before replacement. Model responses are cached by stable scope/evidence input rather than local build ID, so source-side cache entries can travel in a delta and prevent duplicate calls on another device.
 
 ## Planning Estimates
 
-`plan` and `update --dry-run` calculate both the effective build and the model-enabled alternative. This means a new user can estimate model cost before setting an API key. The report separates expected and upper input/output tokens, provider cached input, embedding tokens, expected cost, conservative no-cache cost, and managed disk usage.
+`plan` and `update --dry-run` calculate both the effective build and the model-enabled alternative. The report separates reducer and writer tokens/prices, pending fact-block backlog, provider cached input, embedding tokens, expected cost, conservative no-cache cost, and managed disk usage.
 
 ```toml
 [profiles.default.estimation]
 bytes_per_token = 3.0
 summary_input_ratio = 0.30
 summary_output_ratio = 0.08
+embedding_input_ratio = 0.15
 cached_input_ratio = 0.0
 sqlite_to_source_ratio = 0.18
 artifact_to_source_ratio = 0.08
@@ -68,7 +80,7 @@ The storage range covers current-state content-addressed transcript snapshots, t
 
 ## Semantic Retrieval
 
-Set `embedding.enabled = true` to use ChromaDB. Install the `semantic` package extra and configure endpoint, API-key environment variable, optional `env_file`, model, dimensions, and input price. The tested preset is DashScope `text-embedding-v4` at 512 dimensions.
+Set `embedding.enabled = true` to use ChromaDB. Install the `semantic` package extra and configure endpoint, API-key environment variable, optional `env_file`, model, dimensions, and input price. The tested preset is DashScope `text-embedding-v4` at 512 dimensions; generated profiles use an editable CNY 0.5/million input-token planning price. `embedding_input_ratio` estimates unique semantic-document tokens from new model-relevant transcript bytes and is deliberately separate from summary density. Semantic candidate text is capped at 3,900 characters through deterministic head/middle/tail projection and batches are limited to eight documents, so provider limits cannot truncate authoritative SQLite/FTS/Evidence text.
 
 SQLite FTS remains authoritative and available without Chroma. Deleting or rebuilding Chroma cannot delete historical evidence.
 

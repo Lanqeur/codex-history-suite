@@ -14,11 +14,11 @@ Resolve `../../scripts/codex_history.py` relative to this Skill directory. Run i
 1. Run `doctor --json`. Explain failed checks and storage warnings before proceeding.
 2. If uninitialized, run `init`. Use discovered Codex homes only when unambiguous; otherwise pass one or more explicit `--source` paths.
 3. Run `discover --json`, then `plan --mode full --json` for an initial build or `update --dry-run --json` for later changes.
-4. Report source/change counts, total and new/reprocessed bytes, requested and effective summarization modes, fallback reason, expected/upper model tokens, cached input assumptions, expected/upper CNY cost, and low/expected/upper managed storage. When `auto` falls back because the API key is absent, also report the potential model cost and explain that model summaries are the recommended quality path.
+4. Report source/change counts, total and new/reprocessed bytes, pending model fact blocks, requested and effective summarization modes, reducer/writer models, fallback reason, expected/upper model tokens, cached input assumptions, expected/upper CNY cost, and low/expected/upper managed storage. When `auto` lacks either model key, explain that deterministic evidence can be staged but remains `pending_model_consolidation`, not a finished knowledge layer.
 5. Never start paid work without a user-approved `--max-cost-cny` value. Use the conservative `estimated_cost_cny` from the plan as the minimum safe limit unless the user intentionally changes configuration and reruns the plan.
 6. Run `build --max-cost-cny N --json` or `update --max-cost-cny N --json`. Keep promotion enabled unless the user explicitly requests a staging-only build.
-7. Confirm every state-machine stage completed and the build audit passed. Report the completed build's actual `usage` and `storage`, and compare actual cost with the plan. A failed build must leave the prior `active.json` untouched.
-8. After the first incremental update, after pipeline changes, or when correctness is disputed, run `audit --equivalence --json`. Treat any table digest difference as a release failure.
+7. Confirm every state-machine stage completed, the evidence coverage gate passed, and the build audit passed. Report the completed build's actual `usage`, `storage`, and `knowledge_completion_status`, and compare actual cost with the plan. A failed build must leave the prior `active.json` untouched.
+8. After the first incremental update, after pipeline changes, or when correctness is disputed, run `audit --equivalence --json`. Treat authority-layer differences as a release failure; inspect generation-specific `derived_layer_differences` separately.
 
 The fixed state machine is `discover -> snapshot -> ingest -> lineage -> summarize -> index -> audit -> promote`. Chunked snapshots and artifact CAS are immutable and content addressed. SQLite is authoritative; Chroma supplies semantic candidates only.
 
@@ -61,4 +61,4 @@ Use `library sync DESTINATION --from A --from B` when the user wants offline two
 
 Read [references/multi-device.md](references/multi-device.md) before handling divergent transcript copies, path mappings, repeated synchronization, or import recovery.
 
-`auto` may fall back only when required model configuration or the API key is absent. A provider error, malformed response, exhausted budget, or interrupted request must fail the staging build rather than silently replacing model output with extractive output.
+`auto` may stage deterministic evidence only when required model configuration or an API key is absent, and must label the result `pending_model_consolidation`. A provider error, malformed response, incomplete Record-ID coverage, exhausted budget, or interrupted request must fail the staging build rather than silently replacing model output with extractive output. A later model-enabled `update` must process pending records even when source files are unchanged.

@@ -54,7 +54,7 @@ python3 scripts/codex_history.py --profile default library export-delta DEVICE-0
 
 `apply-delta` is restricted to profile-managed imported sources. It requires the receiver's active generation to equal the declared base generation, stages immutable blobs, atomically reconstructs only changed transcript files, and runs the normal incremental audit/promotion pipeline. On failure it restores source files and leaves the prior active authority in place. Applying the same target generation again returns `already_applied`. A skipped delta, unrelated library, divergent local generation, unsafe archive path, or content mismatch is a hard error.
 
-Model-cache deltas are enabled by default so the receiver can reuse source-side summarization work. Omitting them may cause paid model work during `apply-delta`; always review the target plan and pass an explicit `--max-cost-cny` when its configuration can call a model. Existing Chroma is preserved, while newly appended lexical knowledge may remain marked `partial-until-explicit-semantic-refresh` until a separately budgeted embedding refresh.
+Model-cache deltas are enabled by default so the receiver can reproduce source-side reducer/writer results without duplicate model charges. Cache keys exclude device-local build IDs. Omitting caches may cause paid work during `apply-delta`; always review the target plan and pass an explicit `--max-cost-cny` when its configuration can call a model. Chroma refresh is copy-on-write and embeds only missing document hashes after successful consolidation.
 
 ## Naming And Lineage
 
@@ -91,7 +91,7 @@ Different thread IDs remain different threads even when they share a branch pref
 
 A query-only legacy bundle without reconstructable transcript chunks remains valid for federated search, but merge rejects it instead of silently dropping that library's history.
 
-Run merge without `--build` first. It returns source counts, conflict methods, a stable source digest, and a build plan. After approval, repeat with `--build --max-cost-cny N`. Repeating the same merge yields the same source digest and an incremental `no_changes` result.
+Run merge without `--build` first. It returns source counts, conflict methods, a stable source digest, and a build plan. After approval, repeat with `--build --max-cost-cny N`. Repeating the same merge yields the same source digest and either `no_changes` after model completion or `pending_model_consolidation` when an offline fallback still has unfinished higher layers.
 
 ## Offline Two-Way Convergence
 

@@ -144,7 +144,7 @@ def test_device_bundle_import_federated_search_merge_and_convergence(
     assert repeated["profile"] == merged["profile"]
     assert repeated["changed"] is False
     assert repeated["source_digest"] == merged["source_digest"]
-    assert repeated["build"]["status"] == "no_changes"
+    assert repeated["build"]["status"] == "pending_model_consolidation"
 
     convergence_bundle = tmp_path / "shared-history.zip"
     export_library(merged_config, convergence_bundle)

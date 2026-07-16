@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.0 - 2026-07-16
+
+- Replace hydrated incremental summary bypasses with generation-based model consolidation: DeepSeek reduces new fact blocks into append-only ledgers and Qwen updates only affected thread/family overviews.
+- Treat extractive ingestion as an explicit `pending_model_consolidation` state and allow later model backfill even when source transcripts have not changed.
+- Require exact reducer Record-ID coverage, evidence-linked writer claims, one bounded repair attempt, and atomic rollback on malformed or incomplete model output.
+- Detect content changes inside an existing turn, preserve old ledgers, archive replaced overviews/assets in `knowledge_versions`, and refresh evidence rollups plus conservative relations.
+- Restore copy-on-write incremental Chroma refresh, bound semantic candidate projections and batch sizes to provider limits, and add realistic embedding token/pricing estimates.
+- Separate reducer, writer, embedding, and provider-cache costs; keep stable model-cache keys portable across generation deltas.
+- Redefine equivalence around canonical source/evidence authority while reporting generation-specific model-layer differences separately.
+- Add backlog recovery, coverage-gate rollback, semantic projection, and two-model pipeline tests plus updated bilingual operating guidance.
+
 ## 0.4.0 - 2026-07-15
 
 - Add canonical normalized transcript snapshots with stable source identities, source inventories, coverage generations, and image externalization into the artifact CAS.

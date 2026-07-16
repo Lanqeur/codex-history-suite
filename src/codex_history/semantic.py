@@ -184,7 +184,7 @@ def refresh_embeddings(
     connection: sqlite3.Connection,
     *,
     max_cost_cny: float | None,
-    batch_size: int = 10,
+    batch_size: int = 8,
     chroma_path: Path | None = None,
 ) -> dict[str, Any]:
     settings = EmbeddingSettings.from_config(config)

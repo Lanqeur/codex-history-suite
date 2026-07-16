@@ -194,6 +194,33 @@ def _archive_knowledge_versions(connection: sqlite3.Connection, scope_id: str, b
         )
 
 
+def _archive_record_version(
+    connection: sqlite3.Connection, record_id: str, build_id: str
+) -> None:
+    row = connection.execute(
+        "SELECT * FROM knowledge WHERE record_id=?", (record_id,)
+    ).fetchone()
+    if row is None:
+        return
+    now = utc_now()
+    version_no = connection.execute(
+        "SELECT COALESCE(MAX(version_no),0)+1 FROM knowledge_versions WHERE record_id=?",
+        (record_id,),
+    ).fetchone()[0]
+    connection.execute(
+        "INSERT OR IGNORE INTO knowledge_versions(version_id,record_id,version_no,valid_from,valid_to,build_id,row_json) VALUES(?,?,?,?,?,?,?)",
+        (
+            stable_id("version", record_id, version_no, build_id),
+            record_id,
+            version_no,
+            row["valid_from"] or row["asserted_at"] or now,
+            now,
+            build_id,
+            canonical_json(dict(row)),
+        ),
+    )
+
+
 def delete_thread(connection: sqlite3.Connection, thread_id: str, build_id: str) -> None:
     source_row = connection.execute(
         "SELECT source_id FROM threads WHERE thread_id=?", (thread_id,)
@@ -347,12 +374,20 @@ def hydrate_parsed_thread(
     config: ProfileConfig,
     *,
     index_new_knowledge: bool = False,
+    build_id: str = "",
 ) -> dict[str, int]:
     existing = connection.execute(
         "SELECT 1 FROM threads WHERE thread_id=?", (parsed.thread_id,)
     ).fetchone()
     if not existing:
-        inserted = insert_parsed_thread(connection, snapshot, parsed, config)
+        inserted = insert_parsed_thread(
+            connection,
+            snapshot,
+            parsed,
+            config,
+            ingest_build_id=build_id if index_new_knowledge else "",
+            incremental_append=index_new_knowledge,
+        )
         inserted["preserved_curated_scope"] = 0
         return inserted
     previous_events = {
@@ -362,9 +397,9 @@ def hydrate_parsed_thread(
         )
     }
     previous_turns = {
-        str(row[0])
+        str(row[0]): str(row[1])
         for row in connection.execute(
-            "SELECT turn_id FROM turns WHERE thread_id=?", (parsed.thread_id,)
+            "SELECT turn_id,content_sha256 FROM turns WHERE thread_id=?", (parsed.thread_id,)
         )
     }
     connection.execute("DELETE FROM canonical_events WHERE thread_id=?", (parsed.thread_id,))
@@ -381,7 +416,12 @@ def hydrate_parsed_thread(
             snapshot,
             parsed,
             event_ids={event.event_id for event in parsed.events} - previous_events,
-            turn_ids={turn.turn_id for turn in parsed.turns} - previous_turns,
+            turn_ids={
+                turn.turn_id
+                for turn in parsed.turns
+                if previous_turns.get(turn.turn_id) != turn.content_sha256
+            },
+            build_id=build_id,
         )
         if index_new_knowledge
         else {"evidence": 0, "fact_blocks": 0}
@@ -599,15 +639,36 @@ def _insert_record(
                 "INSERT OR IGNORE INTO record_evidence_occurrences(record_id,occurrence_id,scope_match) VALUES(?,?,?)",
                 (record_id, occurrence["occurrence_id"], int(occurrence["thread_id"] == scope_id)),
             )
-    content_sha = hashlib.sha256(normalize_text(text).encode("utf-8")).hexdigest()
+    semantic_text = _semantic_projection(text)
+    content_sha = hashlib.sha256(normalize_text(semantic_text).encode("utf-8")).hexdigest()
     document_id = stable_id("semantic", content_sha)
     connection.execute(
         "INSERT OR IGNORE INTO semantic_documents(document_id,content_sha256,document_text,record_count,created_at) VALUES(?,?,?,?,?)",
-        (document_id, content_sha, text, 0, now),
+        (document_id, content_sha, semantic_text, 0, now),
     )
     connection.execute(
         "INSERT OR REPLACE INTO semantic_document_records(document_id,record_id) VALUES(?,?)",
         (document_id, record_id),
+    )
+
+
+def _semantic_projection(text: str, max_chars: int = 3_900) -> str:
+    if len(text) <= max_chars:
+        return text
+    first_marker = "\n[semantic projection: middle sample]\n"
+    second_marker = "\n[semantic projection: tail sample]\n"
+    content_budget = max_chars - len(first_marker) - len(second_marker)
+    head_size = int(content_budget * 0.40)
+    middle_size = int(content_budget * 0.25)
+    tail_size = content_budget - head_size - middle_size
+    midpoint = len(text) // 2
+    middle_start = max(0, midpoint - middle_size // 2)
+    return (
+        text[:head_size]
+        + first_marker
+        + text[middle_start : middle_start + middle_size]
+        + second_marker
+        + text[-tail_size:]
     )
 
 
@@ -850,6 +911,7 @@ def _insert_incremental_knowledge(
     *,
     event_ids: set[str],
     turn_ids: set[str],
+    build_id: str,
 ) -> dict[str, int]:
     evidence_by_event: dict[str, tuple[str, str]] = {}
     for event in parsed.events:
@@ -892,6 +954,7 @@ def _insert_incremental_knowledge(
                 "tool_name": event.tool_name,
                 "call_id": event.call_id,
                 "incremental_append": True,
+                "ingest_build_id": build_id,
             },
         )
         for asset_type in _asset_types(event):
@@ -919,6 +982,7 @@ def _insert_incremental_knowledge(
                     "derived_by": "deterministic-asset-classifier-v1",
                     "event_id": event.event_id,
                     "incremental_append": True,
+                    "ingest_build_id": build_id,
                 },
             )
 
@@ -938,6 +1002,16 @@ def _insert_incremental_knowledge(
                 if event.event_id in evidence_by_event
             )
         )
+        for event in events:
+            if event.event_id in evidence_by_event:
+                continue
+            existing_record = connection.execute(
+                "SELECT evidence_refs_json FROM knowledge WHERE record_id=?",
+                (stable_id("record", "event", parsed.thread_id, event.event_id),),
+            ).fetchone()
+            if existing_record:
+                evidence_refs.extend(json.loads(existing_record[0]))
+        evidence_refs = list(dict.fromkeys(evidence_refs))
         _insert_record(
             connection,
             record_id=stable_id("record", "turn", parsed.thread_id, turn.turn_id),
@@ -961,6 +1035,7 @@ def _insert_incremental_knowledge(
                 "turn_seq": turn.turn_seq,
                 "source_status": turn.status,
                 "incremental_append": True,
+                "ingest_build_id": build_id,
             },
         )
         fact_blocks += 1
@@ -976,8 +1051,16 @@ def insert_parsed_thread(
     snapshot: SnapshotFile,
     parsed: ParsedThread,
     config: ProfileConfig,
+    *,
+    ingest_build_id: str = "",
+    incremental_append: bool = False,
 ) -> dict[str, int]:
     _insert_thread_structure(connection, snapshot, parsed)
+    ingest_metadata = (
+        {"incremental_append": True, "ingest_build_id": ingest_build_id}
+        if incremental_append
+        else {}
+    )
     overview = _thread_overview(parsed)
     _insert_scope(connection, parsed, overview)
     evidence_by_event: dict[str, tuple[str, str]] = {}
@@ -1016,6 +1099,7 @@ def insert_parsed_thread(
                 "payload_type": event.payload_type,
                 "tool_name": event.tool_name,
                 "call_id": event.call_id,
+                **ingest_metadata,
             },
         )
         scope_evidence += 1
@@ -1038,7 +1122,11 @@ def insert_parsed_thread(
                 confidence=confidence,
                 occurred_start_at=event.timestamp,
                 occurred_end_at=event.timestamp,
-                metadata={"derived_by": "deterministic-asset-classifier-v1", "event_id": event.event_id},
+                metadata={
+                    "derived_by": "deterministic-asset-classifier-v1",
+                    "event_id": event.event_id,
+                    **ingest_metadata,
+                },
             )
 
     events_by_turn: dict[str, list[ParsedEvent]] = defaultdict(list)
@@ -1074,7 +1162,12 @@ def insert_parsed_thread(
             confidence="deterministic_extract",
             occurred_start_at=turn.started_at,
             occurred_end_at=turn.completed_at,
-            metadata={"turn_id": turn.turn_id, "turn_seq": turn.turn_seq, "source_status": turn.status},
+            metadata={
+                "turn_id": turn.turn_id,
+                "turn_seq": turn.turn_seq,
+                "source_status": turn.status,
+                **ingest_metadata,
+            },
         )
         fact_records.append(record_id)
         fact_evidence.extend(evidence_refs)
@@ -1159,6 +1252,79 @@ class _DSU:
         right_root = self.find(right)
         if left_root != right_root:
             self.parent[max(left_root, right_root)] = min(left_root, right_root)
+
+
+def refresh_evidence_rollups(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        "UPDATE evidence SET occurrence_count=(SELECT COUNT(*) FROM evidence_occurrences eo WHERE eo.evidence_id=evidence.evidence_id)"
+    )
+    for row in connection.execute("SELECT evidence_id FROM evidence").fetchall():
+        occurrence_rows = connection.execute(
+            "SELECT thread_id,canonical_turn_id,position,occurred_start_at,occurred_end_at,metadata_json "
+            "FROM evidence_occurrences WHERE evidence_id=? "
+            "ORDER BY thread_id,turn_seq,position,occurrence_id",
+            (row["evidence_id"],),
+        ).fetchall()
+        thread_ids = sorted({str(item["thread_id"]) for item in occurrence_rows})
+        scope_ids: set[str] = set(thread_ids)
+        if thread_ids:
+            placeholders = ",".join("?" for _ in thread_ids)
+            scope_ids.update(
+                str(item[0])
+                for item in connection.execute(
+                    f"SELECT DISTINCT scope_id FROM scope_threads WHERE thread_id IN ({placeholders})",
+                    thread_ids,
+                )
+            )
+        starts = [item["occurred_start_at"] for item in occurrence_rows if item["occurred_start_at"]]
+        ends = [item["occurred_end_at"] for item in occurrence_rows if item["occurred_end_at"]]
+        representative = occurrence_rows[0] if occurrence_rows else None
+        representative_event = (
+            (json.loads(representative["metadata_json"]) or {}).get("event_id")
+            if representative
+            else None
+        )
+        connection.execute(
+            "UPDATE evidence SET thread_ids_json=?,scope_ids_json=?,occurrence_count=?,"
+            "first_occurred_at=?,last_occurred_at=?,item_id=?,source_task_id=? WHERE evidence_id=?",
+            (
+                canonical_json(thread_ids),
+                canonical_json(sorted(scope_ids)),
+                len(occurrence_rows),
+                min(starts) if starts else None,
+                max(ends) if ends else None,
+                representative_event,
+                representative["canonical_turn_id"] if representative else "",
+                row["evidence_id"],
+            ),
+        )
+    connection.execute(
+        "UPDATE semantic_documents SET record_count=(SELECT COUNT(*) FROM semantic_document_records sr WHERE sr.document_id=semantic_documents.document_id)"
+    )
+    connection.execute(
+        "DELETE FROM semantic_documents WHERE document_id NOT IN (SELECT DISTINCT document_id FROM semantic_document_records)"
+    )
+    connection.execute(
+        "UPDATE artifact_files SET path_count=(SELECT COUNT(*) FROM artifact_paths ap WHERE ap.sha256=artifact_files.sha256),transcript_occurrences_mapped=(SELECT COUNT(*) FROM artifact_paths ap WHERE ap.sha256=artifact_files.sha256)"
+    )
+    connection.execute("DELETE FROM record_evidence_occurrences")
+    connection.execute(
+        """
+        INSERT INTO record_evidence_occurrences(record_id,occurrence_id,scope_match)
+        SELECT ke.record_id,eo.occurrence_id,
+          CASE WHEN k.scope_id=eo.thread_id OR EXISTS(
+            SELECT 1 FROM scope_threads st
+            WHERE st.scope_id=k.scope_id AND st.thread_id=eo.thread_id
+          ) THEN 1 ELSE 0 END
+        FROM knowledge_evidence ke
+        JOIN knowledge k ON k.record_id=ke.record_id
+        JOIN evidence_occurrences eo ON eo.evidence_id=ke.evidence_id
+        """
+    )
+    connection.executemany(
+        "INSERT OR IGNORE INTO aliases(alias,canonical,alias_kind,weight) VALUES(?,?,?,?)",
+        DEFAULT_ALIASES,
+    )
 
 
 def rebuild_family_scopes(connection: sqlite3.Connection, build_id: str) -> int:
@@ -1249,76 +1415,7 @@ def rebuild_family_scopes(connection: sqlite3.Connection, build_id: str) -> int:
             metadata={"thread_ids": thread_ids, "method": "parent-lineage-v1"},
         )
         count += 1
-    connection.execute(
-        "UPDATE evidence SET occurrence_count=(SELECT COUNT(*) FROM evidence_occurrences eo WHERE eo.evidence_id=evidence.evidence_id)"
-    )
-    for row in connection.execute("SELECT evidence_id FROM evidence").fetchall():
-        occurrence_rows = connection.execute(
-            "SELECT thread_id,canonical_turn_id,position,occurred_start_at,occurred_end_at,metadata_json "
-            "FROM evidence_occurrences WHERE evidence_id=? "
-            "ORDER BY thread_id,turn_seq,position,occurrence_id",
-            (row["evidence_id"],),
-        ).fetchall()
-        thread_ids = sorted({str(item["thread_id"]) for item in occurrence_rows})
-        scope_ids: set[str] = set(thread_ids)
-        if thread_ids:
-            placeholders = ",".join("?" for _ in thread_ids)
-            scope_ids.update(
-                str(item[0])
-                for item in connection.execute(
-                    f"SELECT DISTINCT scope_id FROM scope_threads WHERE thread_id IN ({placeholders})",
-                    thread_ids,
-                )
-            )
-        starts = [item["occurred_start_at"] for item in occurrence_rows if item["occurred_start_at"]]
-        ends = [item["occurred_end_at"] for item in occurrence_rows if item["occurred_end_at"]]
-        representative = occurrence_rows[0] if occurrence_rows else None
-        representative_event = (
-            (json.loads(representative["metadata_json"]) or {}).get("event_id")
-            if representative
-            else None
-        )
-        connection.execute(
-            "UPDATE evidence SET thread_ids_json=?,scope_ids_json=?,occurrence_count=?,"
-            "first_occurred_at=?,last_occurred_at=?,item_id=?,source_task_id=? WHERE evidence_id=?",
-            (
-                canonical_json(thread_ids),
-                canonical_json(sorted(scope_ids)),
-                len(occurrence_rows),
-                min(starts) if starts else None,
-                max(ends) if ends else None,
-                representative_event,
-                representative["canonical_turn_id"] if representative else "",
-                row["evidence_id"],
-            ),
-        )
-    connection.execute(
-        "UPDATE semantic_documents SET record_count=(SELECT COUNT(*) FROM semantic_document_records sr WHERE sr.document_id=semantic_documents.document_id)"
-    )
-    connection.execute(
-        "DELETE FROM semantic_documents WHERE document_id NOT IN (SELECT DISTINCT document_id FROM semantic_document_records)"
-    )
-    connection.execute(
-        "UPDATE artifact_files SET path_count=(SELECT COUNT(*) FROM artifact_paths ap WHERE ap.sha256=artifact_files.sha256),transcript_occurrences_mapped=(SELECT COUNT(*) FROM artifact_paths ap WHERE ap.sha256=artifact_files.sha256)"
-    )
-    connection.execute("DELETE FROM record_evidence_occurrences")
-    connection.execute(
-        """
-        INSERT INTO record_evidence_occurrences(record_id,occurrence_id,scope_match)
-        SELECT ke.record_id,eo.occurrence_id,
-          CASE WHEN k.scope_id=eo.thread_id OR EXISTS(
-            SELECT 1 FROM scope_threads st
-            WHERE st.scope_id=k.scope_id AND st.thread_id=eo.thread_id
-          ) THEN 1 ELSE 0 END
-        FROM knowledge_evidence ke
-        JOIN knowledge k ON k.record_id=ke.record_id
-        JOIN evidence_occurrences eo ON eo.evidence_id=ke.evidence_id
-        """
-    )
-    connection.executemany(
-        "INSERT OR IGNORE INTO aliases(alias,canonical,alias_kind,weight) VALUES(?,?,?,?)",
-        DEFAULT_ALIASES,
-    )
+    refresh_evidence_rollups(connection)
     return count
 
 
@@ -1441,6 +1538,118 @@ def rebuild_conservative_relations(connection: sqlite3.Connection) -> dict[str, 
     return {"total": sum(inserted.values()), **dict(sorted(inserted.items()))}
 
 
+def insert_model_ledger_items(
+    connection: sqlite3.Connection,
+    *,
+    scope_id: str,
+    items: list[dict[str, Any]],
+    generation_id: str,
+    build_id: str,
+    model: str,
+    cache_key: str,
+) -> list[str]:
+    scope = connection.execute("SELECT * FROM scopes WHERE scope_id=?", (scope_id,)).fetchone()
+    if scope is None:
+        raise KeyError(scope_id)
+    inserted: list[str] = []
+    valid_statuses = {
+        "verified",
+        "executed",
+        "planned",
+        "failed",
+        "blocked",
+        "uncertain",
+        "mixed",
+    }
+    for ordinal, item in enumerate(items):
+        text = normalize_text(str(item.get("text") or ""))
+        supporting = list(dict.fromkeys(str(value) for value in item.get("record_ids") or []))
+        if not text or not supporting:
+            continue
+        placeholders = ",".join("?" for _ in supporting)
+        rows = connection.execute(
+            f"SELECT record_id,evidence_refs_json,occurred_start_at,occurred_end_at "
+            f"FROM knowledge WHERE record_id IN ({placeholders})",
+            supporting,
+        ).fetchall()
+        found = {str(row["record_id"]) for row in rows}
+        if found != set(supporting):
+            raise ValueError("Ledger item references an unavailable source record")
+        evidence_refs: list[str] = []
+        starts: list[str] = []
+        ends: list[str] = []
+        for row in rows:
+            evidence_refs.extend(json.loads(row["evidence_refs_json"]))
+            if row["occurred_start_at"]:
+                starts.append(str(row["occurred_start_at"]))
+            if row["occurred_end_at"]:
+                ends.append(str(row["occurred_end_at"]))
+        requested_status = str(item.get("status") or "uncertain")
+        status_group = requested_status if requested_status in valid_statuses else "uncertain"
+        category = normalize_text(str(item.get("category") or "historical_fact"))
+        record_id = stable_id(
+            "record",
+            "incremental-ledger",
+            scope_id,
+            generation_id,
+            ordinal,
+            text,
+        )
+        _insert_record(
+            connection,
+            record_id=record_id,
+            tier="ledger",
+            asset_type="",
+            scope_id=scope_id,
+            scope_type=str(scope["scope_type"]),
+            scope_title=str(scope["scope_title"]),
+            category=category,
+            text=text,
+            status=requested_status,
+            status_group=status_group,
+            evidence_refs=list(dict.fromkeys(evidence_refs))[:512],
+            source_path=f"codex-history-scope://{scope_id}",
+            source_locator=f"model-ledger:{model}",
+            confidence="model_evidence_linked",
+            occurred_start_at=min(starts) if starts else None,
+            occurred_end_at=max(ends) if ends else None,
+            metadata={
+                "model": model,
+                "cache_key": cache_key,
+                "generation_id": generation_id,
+                "ingest_build_id": build_id,
+                "supporting_record_ids": supporting,
+                "method": "incremental-ledger-v1",
+            },
+        )
+        inserted.append(record_id)
+    return inserted
+
+
+def mark_model_consolidated(
+    connection: sqlite3.Connection,
+    *,
+    record_ids: list[str],
+    build_id: str,
+) -> None:
+    if not record_ids:
+        return
+    now = utc_now()
+    for record_id in record_ids:
+        row = connection.execute(
+            "SELECT metadata_json FROM knowledge WHERE record_id=?", (record_id,)
+        ).fetchone()
+        if row is None:
+            continue
+        metadata = _parsed_json(row["metadata_json"], {})
+        metadata["model_consolidated_build_id"] = build_id
+        metadata["model_consolidated_at"] = now
+        connection.execute(
+            "UPDATE knowledge SET metadata_json=? WHERE record_id=?",
+            (canonical_json(metadata), record_id),
+        )
+
+
 def apply_model_scope_summary(
     connection: sqlite3.Connection,
     *,
@@ -1450,6 +1659,7 @@ def apply_model_scope_summary(
     assets: list[dict[str, Any]],
     model: str,
     cache_key: str,
+    build_id: str = "",
 ) -> dict[str, int]:
     scope = connection.execute("SELECT * FROM scopes WHERE scope_id=?", (scope_id,)).fetchone()
     if scope is None:
@@ -1458,7 +1668,7 @@ def apply_model_scope_summary(
     allowed_records = {
         str(row[0])
         for row in connection.execute(
-            "SELECT record_id FROM knowledge WHERE scope_id=? AND tier IN ('fact_block','core','overview')",
+            "SELECT record_id FROM knowledge WHERE scope_id=? AND tier IN ('fact_block','core','ledger','overview')",
             (scope_id,),
         )
         if str(row[0]) != overview_record_id
@@ -1470,7 +1680,7 @@ def apply_model_scope_summary(
             allowed_records.update(
                 str(row[0])
                 for row in connection.execute(
-                    f"SELECT record_id FROM knowledge WHERE scope_id IN ({placeholders}) AND tier IN ('overview','fact_block')",
+                    f"SELECT record_id FROM knowledge WHERE scope_id IN ({placeholders}) AND tier IN ('overview','ledger','fact_block')",
                     thread_ids,
                 )
             )
@@ -1501,6 +1711,8 @@ def apply_model_scope_summary(
             }
         )
 
+    if build_id:
+        _archive_record_version(connection, overview_record_id, build_id)
     connection.execute(
         "DELETE FROM overview_claims WHERE overview_record_id=?", (overview_record_id,)
     )
@@ -1534,6 +1746,7 @@ def apply_model_scope_summary(
             "cache_key": cache_key,
             "claim_count": len(clean_claims),
             "method": "evidence-linked-writer-v1",
+            "build_id": build_id,
         },
     )
     connection.execute(
@@ -1575,6 +1788,8 @@ def apply_model_scope_summary(
         (scope_id,),
     ).fetchall()
     for row in model_asset_rows:
+        if build_id:
+            _archive_record_version(connection, str(row["record_id"]), build_id)
         connection.execute("DELETE FROM knowledge WHERE record_id=?", (row["record_id"],))
     accepted_assets = 0
     for ordinal, asset in enumerate(assets):
@@ -1620,6 +1835,7 @@ def apply_model_scope_summary(
                 "cache_key": cache_key,
                 "supporting_record_ids": record_ids,
                 "ordinal": ordinal,
+                "build_id": build_id,
             },
         )
         accepted_assets += 1

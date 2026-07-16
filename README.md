@@ -43,7 +43,7 @@ python3 -m pip install .
 codex-history doctor
 ```
 
-New profiles use model-first `auto` summarization. The generated preset recommends DashScope's non-thinking `deepseek-v4-flash`; when `DASHSCOPE_API_KEY` is unavailable, it reports the reason and falls back to deterministic `extractive` summaries. This keeps first use functional, but model summaries are strongly recommended for better cross-turn synthesis, durable assets, and evidence-linked overviews.
+New profiles use a model-first two-stage preset: non-thinking `deepseek-v4-flash` reduces the token-heavy new evidence into append-only ledgers, then non-thinking `qwen3.7-max` updates the much smaller thread/family overviews. When `DASHSCOPE_API_KEY` is unavailable, deterministic evidence is still ingested, but the library is explicitly marked `pending_model_consolidation`. This is a searchable emergency fallback, not a finished summary layer; a later model-enabled `update` completes the backlog even when no transcript changed.
 
 Existing profiles are never rewritten during a plugin upgrade. To adopt the new behavior, copy the summarization and estimation sections from [the configuration reference](skills/build-codex-history/references/configuration.md) into the existing `config.toml`, then rerun `plan`.
 
@@ -52,9 +52,9 @@ export DASHSCOPE_API_KEY='your-key'  # PowerShell: $env:DASHSCOPE_API_KEY='your-
 python3 scripts/codex_history.py plan --mode full --json
 ```
 
-The generated prices are editable planning inputs. As of 2026-07-15, Alibaba Cloud lists `deepseek-v4-flash` at CNY 1 per million input tokens and CNY 2 per million output tokens in the Chinese mainland deployment; always verify the [current Model Studio pricing](https://help.aliyun.com/zh/model-studio/model-pricing). Direct DeepSeek API users can use its OpenAI-compatible endpoint and enter converted CNY prices from the [official DeepSeek pricing page](https://api-docs.deepseek.com/quick_start/pricing).
+The generated prices are editable planning inputs. The preset records CNY 1/2 per million input/output tokens for `deepseek-v4-flash`, CNY 6/1.2/18 for Qwen writer uncached-input/cached-input/output, and CNY 0.5 per million input tokens for `text-embedding-v4`. Always verify the [current Model Studio pricing](https://help.aliyun.com/zh/model-studio/model-pricing) for the selected region and deployment.
 
-`plan` and `update --dry-run` report transcript bytes, new/reprocessed bytes, expected and upper summary tokens, expected cached input, output and embedding tokens, expected and conservative CNY cost, and a low/expected/upper disk estimate split into snapshots, SQLite, artifact CAS, semantic index, and model-response cache. Inline data-URI base64 payloads are scanned and excluded from model-token estimates while remaining in snapshot storage estimates. The report still shows the potential model cost when `auto` has fallen back, so a key is not required just to budget a build.
+`plan` and `update --dry-run` report transcript bytes, new/reprocessed bytes, pending fact blocks, separate reducer/writer tokens and prices, expected cached input, embedding tokens, expected and conservative CNY cost, and a low/expected/upper disk estimate. Inline data-URI base64 is excluded from model-token estimates while remaining in snapshot storage. A key is not required just to budget a build.
 
 Completed builds return an actual `usage` summary for model input, provider-cached input, output, embedding tokens, response-cache hits, and CNY cost, plus `storage` totals for the active core components and the whole retained profile.
 
@@ -82,7 +82,7 @@ python3 scripts/codex_history.py library list --json
 python3 scripts/codex_history.py library search 'release decision' --deep --json
 ```
 
-The next delta can use the previous delta as `--base`. Each delta contains the complete target source inventory but packages only blobs absent from its base generation. `apply-delta` requires the exact `library_id` and base source generation, reconstructs only changed normalized transcripts, runs the ordinary audited incremental pipeline, and is idempotent. Missing, out-of-order, cross-library, or tampered deltas are rejected before promotion. This makes the full SQLite, existing Chroma index, historical snapshots, and artifact CAS a one-time transfer rather than a recurring multi-gigabyte copy.
+The next delta can use the previous delta as `--base`. Each delta contains the complete target source inventory but packages only blobs absent from its base generation. Stable evidence-based model cache keys are included by default, so the receiver can reproduce source-side consolidation without duplicate model charges. `apply-delta` requires the exact `library_id` and base source generation and rejects missing, out-of-order, cross-library, or tampered deltas before promotion.
 
 Imported profiles are named from the source device and profile, with collision suffixes added automatically. A stable `library_id` recognizes later generations of the same library; a newer import updates that profile while preserving the prior generation under `backups/imports`. Every bundle entry is verified with SHA-256, unsafe archive paths are rejected, and immutable transcript chunks, artifacts, semantic files, and model-cache entries share a global content-addressed blob store through hard links when the filesystem permits it.
 
@@ -121,11 +121,11 @@ discover -> snapshot -> ingest -> lineage -> summarize -> index -> audit -> prom
 
 Every stage is checkpointed in the staging SQLite database and in `runs/<build-id>/run.json`. The prior active build remains available after any failure.
 
-Paid builds require an explicit `--max-cost-cny` after reviewing the dry-run. Exact model-response cache hits cost zero; provider-side cached input is costed separately using the user-entered cached-input price and expected hit ratio. API failures never silently downgrade a paid model build to extractive mode.
+Paid builds require an explicit `--max-cost-cny` after reviewing the dry-run. Every reducer input Record ID must be represented in a ledger fact or an explicit no-new-fact list; one failed repair, provider error, malformed writer response, or exhausted budget fails the candidate build and leaves the prior active library untouched. Exact model-response cache hits cost zero.
 
 ## Incremental Invariant
 
-`codex-history audit --equivalence` creates a clean full reference build from the same current sources and compares stable logical digests for sources, chunks, events, turns, scopes, Evidence, Knowledge, claims, artifacts, and semantic documents. Incremental updates are releasable only when this comparison passes.
+`codex-history audit --equivalence` creates a clean extractive reference build and requires exact equality for canonical sources, parsed events/turns, Evidence occurrences, deterministic core/fact records, and artifacts. Model ledgers, overviews, claims, and semantic documents are generation-specific; their differences are reported separately instead of being misclassified as source-authority failures.
 
 Fresh builds generate only conservative, evidence-exact fact relations. Verified tool outputs can validate the matching call, and completed goals can validate the same earlier objective. Ambiguous contradiction, invalidation, and reopening labels are never inferred automatically.
 

@@ -153,6 +153,10 @@ def estimate_build(
     changes: list[Any],
     database: Path | None,
     summarization: dict[str, object],
+    pending_model_records: int = 0,
+    pending_model_chars: int = 0,
+    affected_scope_count: int = 0,
+    writer_context_chars: int = 0,
 ) -> dict[str, Any]:
     total_source_bytes = sum(int(source.size_bytes) for source in sources)
     actionable_source_bytes = sum(
@@ -173,6 +177,8 @@ def estimate_build(
     expected_input = int(raw_token_equivalent * summary_ratio)
     if processed_bytes:
         expected_input += max(1, sum(change.kind != "unchanged" for change in changes)) * 500
+    pending_input = max(0, int(pending_model_chars / 2))
+    expected_input += pending_input
     low_input = int(expected_input * 0.65)
     high_input = int(expected_input * 1.65)
     output_ratio = max(0.0, config.estimate_summary_output_ratio)
@@ -182,21 +188,58 @@ def estimate_build(
     cached_input = int(expected_input * cache_ratio)
     uncached_input = max(0, expected_input - cached_input)
 
-    expected_model_cost = (
+    expected_reducer_cost = (
         uncached_input / 1_000_000 * config.summary_input_price_cny
         + cached_input / 1_000_000 * config.summary_cached_input_price_cny
         + expected_output / 1_000_000 * config.summary_output_price_cny
     )
-    upper_model_cost = (
+    upper_reducer_cost = (
         high_input / 1_000_000 * config.summary_input_price_cny
         + high_output / 1_000_000 * config.summary_output_price_cny
     )
+    writer_context_tokens = max(0, int(writer_context_chars / 2))
+    writer_input = (
+        expected_output + writer_context_tokens + max(0, affected_scope_count) * 500
+    )
+    writer_input_upper = (
+        high_output + writer_context_tokens + max(0, affected_scope_count) * 1_500
+    )
+    writer_output = max(0, affected_scope_count) * 1_800
+    writer_output_upper = max(0, affected_scope_count) * 3_500
+    writer_cached = int(writer_input * cache_ratio)
+    expected_writer_cost = (
+        (writer_input - writer_cached) / 1_000_000 * config.writer_input_price_cny
+        + writer_cached / 1_000_000 * config.writer_cached_input_price_cny
+        + writer_output / 1_000_000 * config.writer_output_price_cny
+    )
+    upper_writer_cost = (
+        writer_input_upper / 1_000_000 * config.writer_input_price_cny
+        + writer_output_upper / 1_000_000 * config.writer_output_price_cny
+    )
+    expected_model_cost = expected_reducer_cost + expected_writer_cost
+    upper_model_cost = upper_reducer_cost + upper_writer_cost
     model_enabled = summarization.get("effective_mode") == "openai-compatible"
 
-    embedding_tokens = int(processed_bytes / 2) if config.embedding_enabled else 0
-    embedding_cost = embedding_tokens / 1_000_000 * config.embedding_input_price_cny
-    effective_expected_cost = (expected_model_cost if model_enabled else 0.0) + embedding_cost
-    effective_upper_cost = (upper_model_cost if model_enabled else 0.0) + embedding_cost
+    embedding_tokens_expected = 0
+    embedding_tokens_upper = 0
+    if config.embedding_enabled:
+        embedding_tokens_expected = int(
+            processed_content["model_relevant_bytes"]
+            * config.estimate_embedding_input_ratio
+        ) + (expected_output + writer_output if model_enabled else 0)
+        embedding_tokens_upper = int(embedding_tokens_expected * 1.5)
+    embedding_cost_expected = (
+        embedding_tokens_expected / 1_000_000 * config.embedding_input_price_cny
+    )
+    embedding_cost_upper = (
+        embedding_tokens_upper / 1_000_000 * config.embedding_input_price_cny
+    )
+    effective_expected_cost = (
+        expected_model_cost if model_enabled else 0.0
+    ) + embedding_cost_expected
+    effective_upper_cost = (
+        upper_model_cost if model_enabled else 0.0
+    ) + embedding_cost_upper
 
     sqlite_ratio = float(
         calibration.get("sqlite_to_source_ratio", config.estimate_sqlite_to_source_ratio)
@@ -221,7 +264,7 @@ def estimate_build(
     semantic_expected = int(total_source_bytes * semantic_ratio)
     existing_model_cache = _directory_bytes(config.cache_dir / "model")
     model_cache_expected = existing_model_cache + (
-        int(expected_output * 6) if model_enabled else 0
+        int((expected_output + writer_output) * 6) if model_enabled else 0
     )
     storage_expected = (
         snapshot_expected
@@ -270,27 +313,51 @@ def estimate_build(
                 "uncached_input_expected": uncached_input,
                 "output_expected": expected_output,
                 "output_upper": high_output,
+                "reducer_input_expected": expected_input,
+                "reducer_output_expected": expected_output,
+                "writer_input_expected": writer_input,
+                "writer_input_upper": writer_input_upper,
+                "writer_output_expected": writer_output,
+                "writer_output_upper": writer_output_upper,
+                "writer_existing_context_tokens": writer_context_tokens,
+                "pending_fact_block_records": pending_model_records,
+                "pending_fact_block_input_tokens": pending_input,
             },
-            "embedding_input_upper": embedding_tokens,
+            "embedding_input_expected": embedding_tokens_expected,
+            "embedding_input_upper": embedding_tokens_upper,
             "api_total_expected": (
-                (expected_input + expected_output) if model_enabled else 0
+                (expected_input + expected_output + writer_input + writer_output)
+                if model_enabled
+                else 0
             )
-            + embedding_tokens,
-            "api_total_upper": ((high_input + high_output) if model_enabled else 0)
-            + embedding_tokens,
+            + embedding_tokens_expected,
+            "api_total_upper": (
+                (high_input + high_output + writer_input_upper + writer_output_upper)
+                if model_enabled
+                else 0
+            )
+            + embedding_tokens_upper,
         },
         "pricing_cny_per_million": {
-            "summary_input": config.summary_input_price_cny,
-            "summary_cached_input": config.summary_cached_input_price_cny,
-            "summary_output": config.summary_output_price_cny,
+            "reducer_input": config.summary_input_price_cny,
+            "reducer_cached_input": config.summary_cached_input_price_cny,
+            "reducer_output": config.summary_output_price_cny,
+            "writer_input": config.writer_input_price_cny,
+            "writer_cached_input": config.writer_cached_input_price_cny,
+            "writer_output": config.writer_output_price_cny,
             "embedding_input": config.embedding_input_price_cny,
         },
         "cost_cny": {
             "summary_expected": round(expected_model_cost if model_enabled else 0.0, 6),
             "summary_upper_no_cache": round(upper_model_cost if model_enabled else 0.0, 6),
+            "reducer_expected": round(expected_reducer_cost if model_enabled else 0.0, 6),
+            "reducer_upper_no_cache": round(upper_reducer_cost if model_enabled else 0.0, 6),
+            "writer_expected": round(expected_writer_cost if model_enabled else 0.0, 6),
+            "writer_upper_no_cache": round(upper_writer_cost if model_enabled else 0.0, 6),
             "summary_if_model_enabled_expected": round(expected_model_cost, 6),
             "summary_if_model_enabled_upper_no_cache": round(upper_model_cost, 6),
-            "embedding_upper": round(embedding_cost, 6),
+            "embedding_expected": round(embedding_cost_expected, 6),
+            "embedding_upper": round(embedding_cost_upper, 6),
             "total_expected": round(effective_expected_cost, 6),
             "total_upper": round(effective_upper_cost, 6),
             "model_cache_note": "Exact Codex History model-cache hits cost zero and can only reduce this estimate.",
@@ -325,6 +392,7 @@ def estimate_build(
             "bytes_per_token": bytes_per_token,
             "summary_input_ratio": round(summary_ratio, 6),
             "summary_output_ratio": output_ratio,
+            "embedding_input_ratio": config.estimate_embedding_input_ratio,
             "expected_provider_cache_ratio": cache_ratio,
             "sqlite_to_source_ratio": round(sqlite_ratio, 6),
             "artifact_to_source_ratio": round(artifact_ratio, 6),

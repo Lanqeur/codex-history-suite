@@ -55,7 +55,7 @@ LOGICAL_TABLES: dict[str, tuple[str, ...]] = {
     "knowledge": (
         "record_id", "tier", "asset_type", "scope_id", "scope_type", "scope_title", "category",
         "theme", "phase", "text", "status", "status_group", "evidence_count",
-        "evidence_refs_json", "source_path", "source_locator", "confidence", "metadata_json",
+        "evidence_refs_json", "source_path", "source_locator", "confidence",
         "occurred_start_at", "occurred_end_at", "observed_at", "verified_at", "valid_from",
         "valid_to", "temporal_basis", "temporal_confidence",
     ),
@@ -93,6 +93,21 @@ LOGICAL_TABLES: dict[str, tuple[str, ...]] = {
 }
 
 
+EQUIVALENCE_AUTHORITY_TABLES = {
+    "source_files",
+    "source_chunks",
+    "threads",
+    "turns",
+    "canonical_events",
+    "scope_threads",
+    "evidence",
+    "evidence_occurrences",
+    "artifact_files",
+    "artifact_paths",
+    "ledger_artifacts",
+}
+
+
 def _table_exists(connection: sqlite3.Connection, table: str) -> bool:
     return bool(
         connection.execute(
@@ -115,6 +130,16 @@ def table_digest(
         digest.update(b"\n")
         count += 1
     return count, digest.hexdigest()
+
+
+def _query_digest(connection: sqlite3.Connection, query: str) -> dict[str, Any]:
+    digest = hashlib.sha256()
+    count = 0
+    for row in connection.execute(query):
+        digest.update(canonical_json(list(row)).encode("utf-8"))
+        digest.update(b"\n")
+        count += 1
+    return {"rows": count, "sha256": digest.hexdigest()}
 
 
 def logical_digest(connection: sqlite3.Connection) -> dict[str, Any]:
@@ -240,18 +265,45 @@ def compare_databases(left: Path, right: Path) -> dict[str, Any]:
     try:
         left_digest = logical_digest(left_connection)
         right_digest = logical_digest(right_connection)
+        knowledge_columns = LOGICAL_TABLES["knowledge"]
+        knowledge_query = (
+            f"SELECT {','.join(knowledge_columns)} FROM knowledge "
+            "WHERE tier IN ('core','fact_block') "
+            f"ORDER BY {','.join(knowledge_columns)}"
+        )
+        left_authority_knowledge = _query_digest(left_connection, knowledge_query)
+        right_authority_knowledge = _query_digest(right_connection, knowledge_query)
     finally:
         left_connection.close()
         right_connection.close()
-    differences = {
+    all_differences = {
         table: {"left": left_digest["tables"][table], "right": right_digest["tables"][table]}
         for table in LOGICAL_TABLES
         if left_digest["tables"][table] != right_digest["tables"][table]
     }
+    authority_differences = {
+        table: detail
+        for table, detail in all_differences.items()
+        if table in EQUIVALENCE_AUTHORITY_TABLES
+    }
+    if left_authority_knowledge != right_authority_knowledge:
+        authority_differences["knowledge_authority"] = {
+            "left": left_authority_knowledge,
+            "right": right_authority_knowledge,
+        }
     return {
         "created_at": utc_now(),
-        "passed": not differences,
+        "passed": not authority_differences,
         "left_sha256": left_digest["sha256"],
         "right_sha256": right_digest["sha256"],
-        "differences": differences,
+        "differences": authority_differences,
+        "derived_layer_differences": {
+            table: detail
+            for table, detail in all_differences.items()
+            if table not in EQUIVALENCE_AUTHORITY_TABLES
+        },
+        "equivalence_basis": (
+            "canonical sources, parsed events, evidence occurrences, deterministic core/fact "
+            "records, and artifacts; model-derived ledgers and overviews are generation-specific"
+        ),
     }

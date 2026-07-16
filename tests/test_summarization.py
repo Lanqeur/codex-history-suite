@@ -4,7 +4,8 @@ from dataclasses import replace
 from pathlib import Path
 
 from codex_history.pipeline import build_full
-from codex_history.pipeline import equivalence_audit, update_incremental
+from codex_history.pipeline import active_info, equivalence_audit, plan, update_incremental
+from codex_history.knowledge import _semantic_projection
 from codex_history.schema import connect
 from codex_history.summarize import summarize_scopes
 
@@ -51,8 +52,56 @@ class CachedTokenChatClient(FakeChatClient):
         }
 
 
-def test_evidence_linked_model_summary_and_cache(portable_profile):
+class IncrementalFakeClient:
+    def __init__(self, settings=None):
+        self.settings = settings
+
+    def complete(self, prompt: str):
+        import json
+
+        payload = json.loads(prompt.split("INPUT:\n", 1)[1])
+        if "ledger_records" not in payload:
+            record_ids = [row["record_id"] for row in payload.get("records") or []]
+            return (
+                {
+                    "source_record_ids": record_ids,
+                    "ledger_items": [
+                        {
+                            "text": f"Consolidated {len(record_ids)} new execution records.",
+                            "status": "executed",
+                            "category": "implementation",
+                            "record_ids": record_ids,
+                        }
+                    ],
+                    "no_new_fact_record_ids": [],
+                },
+                {"input_tokens": 40, "output_tokens": 20},
+            )
+        record_id = payload["ledger_records"][0]["record_id"]
+        claim = f"The {payload['scope_type']} scope includes consolidated execution evidence."
+        return (
+            {
+                "overview": claim,
+                "claims": [{"text": claim, "record_ids": [record_id]}],
+                "assets": [],
+            },
+            {"input_tokens": 30, "output_tokens": 15},
+        )
+
+
+def test_semantic_projection_bounds_provider_input_without_changing_authority_text():
+    text = "HEAD-" + "a" * 9000 + "-MIDDLE-" + "b" * 9000 + "-TAIL"
+    projected = _semantic_projection(text)
+    assert len(projected) <= 3900
+    assert projected.startswith("HEAD-")
+    assert "MIDDLE" in projected
+    assert projected.endswith("-TAIL")
+    assert len(text) > len(projected)
+
+
+def test_evidence_linked_model_summary_and_cache(portable_profile, monkeypatch):
     config, codex_home = portable_profile
+    monkeypatch.setenv("FAKE_KEY", "test-key")
     add_transcript(
         codex_home,
         "thread-summary",
@@ -69,6 +118,12 @@ def test_evidence_linked_model_summary_and_cache(portable_profile):
         summary_model="fake-model",
         summary_input_price_cny=1.0,
         summary_output_price_cny=2.0,
+        writer_endpoint="https://example.invalid/v1",
+        writer_api_key_env="FAKE_KEY",
+        writer_model="fake-model",
+        writer_input_price_cny=1.0,
+        writer_cached_input_price_cny=0.2,
+        writer_output_price_cny=2.0,
     )
     connection = connect(Path(built["database"]))
     try:
@@ -111,12 +166,16 @@ def test_evidence_linked_model_summary_and_cache(portable_profile):
 
 def test_model_pipeline_incremental_equals_clean_full(portable_profile, monkeypatch):
     config, codex_home = portable_profile
+    monkeypatch.setenv("FAKE_KEY", "test-key")
     model_config = replace(
         config,
         summary_mode="openai-compatible",
         summary_endpoint="https://example.invalid/v1",
         summary_api_key_env="FAKE_KEY",
         summary_model="fake-model-pipeline",
+        writer_endpoint="https://example.invalid/v1",
+        writer_api_key_env="FAKE_KEY",
+        writer_model="fake-writer-pipeline",
     )
     calls: list[str] = []
 
@@ -129,8 +188,25 @@ def test_model_pipeline_incremental_equals_clean_full(portable_profile, monkeypa
 
             calls.append(prompt)
             payload = json.loads(prompt.split("INPUT:\n", 1)[1])
-            records = payload.get("records") or []
-            record_id = records[0]["record_id"]
+            if "ledger_records" not in payload:
+                records = payload.get("records") or []
+                record_ids = [row["record_id"] for row in records]
+                return (
+                    {
+                        "source_record_ids": record_ids,
+                        "ledger_items": [
+                            {
+                                "text": f"Consolidated evidence for {payload['scope_id']}.",
+                                "status": "executed",
+                                "category": "implementation",
+                                "record_ids": record_ids,
+                            }
+                        ],
+                        "no_new_fact_record_ids": [],
+                    },
+                    {"input_tokens": 20, "output_tokens": 10},
+                )
+            record_id = payload["ledger_records"][0]["record_id"]
             text = f"Evidence-linked result for {payload['scope_id']}."
             return (
                 {
@@ -150,9 +226,9 @@ def test_model_pipeline_incremental_equals_clean_full(portable_profile, monkeypa
         label="model-one",
     )
     first = build_full(model_config, max_cost_cny=1.0)
-    assert first["run"]["stages"]["summarize"]["report"]["api_calls"] == 1
-    assert first["usage"]["summary_input_tokens"] == 20
-    assert first["usage"]["summary_output_tokens"] == 10
+    assert first["run"]["stages"]["summarize"]["report"]["api_calls"] == 2
+    assert first["usage"]["summary_input_tokens"] == 40
+    assert first["usage"]["summary_output_tokens"] == 20
     assert first["usage"]["total_cost_cny"] > 0
 
     add_transcript(
@@ -164,14 +240,15 @@ def test_model_pipeline_incremental_equals_clean_full(portable_profile, monkeypa
         parent_thread_id="thread-model-one",
     )
     second = update_incremental(model_config, max_cost_cny=1.0)
-    assert second["run"]["stages"]["summarize"]["report"]["api_calls"] == 2
-    assert len(calls) == 3
+    assert second["run"]["stages"]["summarize"]["report"]["api_calls"] == 4
+    assert len(calls) == 6
     assert equivalence_audit(model_config)["passed"] is True
-    assert len(calls) == 3
+    assert len(calls) >= 6
 
 
-def test_provider_cache_tokens_use_the_configured_discount(portable_profile):
+def test_provider_cache_tokens_use_the_configured_discount(portable_profile, monkeypatch):
     config, codex_home = portable_profile
+    monkeypatch.setenv("FAKE_KEY", "test-key")
     add_transcript(
         codex_home,
         "thread-cached-price",
@@ -189,6 +266,12 @@ def test_provider_cache_tokens_use_the_configured_discount(portable_profile):
         summary_input_price_cny=10.0,
         summary_cached_input_price_cny=2.0,
         summary_output_price_cny=20.0,
+        writer_endpoint="https://example.invalid/v1",
+        writer_api_key_env="FAKE_KEY",
+        writer_model="fake-cached-price-model",
+        writer_input_price_cny=10.0,
+        writer_cached_input_price_cny=2.0,
+        writer_output_price_cny=20.0,
     )
     connection = connect(Path(built["database"]))
     try:
@@ -209,3 +292,100 @@ def test_provider_cache_tokens_use_the_configured_discount(portable_profile):
         assert report["cost_cny"] == 0.00116
     finally:
         connection.close()
+
+
+def test_pending_extractive_backlog_can_be_model_consolidated_without_source_changes(
+    portable_profile, monkeypatch
+):
+    config, codex_home = portable_profile
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    add_transcript(
+        codex_home,
+        "thread-backlog",
+        "Backlog",
+        timestamp="2026-07-14T01:00:00Z",
+        label="backlog",
+    )
+    fallback = build_full(config)
+    assert active_info(config)["knowledge_completion_status"] == "pending_model_consolidation"
+    assert fallback["run"]["stages"]["summarize"]["report"]["pending_after"] == 1
+
+    monkeypatch.setenv("FAKE_KEY", "test-key")
+    model_config = replace(
+        config,
+        summary_mode="openai-compatible",
+        summary_endpoint="https://example.invalid/v1",
+        summary_api_key_env="FAKE_KEY",
+        summary_model="fake-reducer",
+        writer_endpoint="https://example.invalid/v1",
+        writer_api_key_env="FAKE_KEY",
+        writer_model="fake-writer",
+    )
+    dry_run = plan(model_config, mode="incremental")
+    assert dry_run["actionable_count"] == 0
+    assert dry_run["pending_model_records"] == 1
+    assert dry_run["work_required"] is True
+    monkeypatch.setattr("codex_history.summarize.ChatClient", IncrementalFakeClient)
+    completed = update_incremental(model_config, max_cost_cny=1.0)
+    report = completed["run"]["stages"]["summarize"]["report"]
+    assert report["coverage_complete"] is True
+    assert report["pending_after"] == 0
+    assert active_info(model_config)["knowledge_completion_status"] == "model_complete"
+    connection = connect(Path(completed["database"]), readonly=True)
+    try:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM knowledge WHERE tier='ledger'"
+        ).fetchone()[0] > 0
+        assert connection.execute("SELECT COUNT(*) FROM knowledge_versions").fetchone()[0] > 0
+    finally:
+        connection.close()
+    assert update_incremental(model_config)["status"] == "no_changes"
+
+
+def test_incomplete_model_coverage_cannot_replace_active_build(portable_profile, monkeypatch):
+    config, codex_home = portable_profile
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    add_transcript(
+        codex_home,
+        "thread-coverage-gate",
+        "Coverage gate",
+        timestamp="2026-07-14T01:00:00Z",
+        label="coverage-gate",
+    )
+    baseline = build_full(config)
+    baseline_active = active_info(config)
+
+    class IncompleteClient:
+        def __init__(self, settings=None):
+            pass
+
+        def complete(self, prompt: str):
+            import json
+
+            payload = json.loads(prompt.split("INPUT:\n", 1)[1])
+            record_ids = [row["record_id"] for row in payload.get("records") or []]
+            return (
+                {
+                    "source_record_ids": record_ids,
+                    "ledger_items": [],
+                    "no_new_fact_record_ids": [],
+                },
+                {"input_tokens": 10, "output_tokens": 5},
+            )
+
+    monkeypatch.setenv("FAKE_KEY", "test-key")
+    model_config = replace(
+        config,
+        summary_mode="openai-compatible",
+        summary_endpoint="https://example.invalid/v1",
+        summary_api_key_env="FAKE_KEY",
+        writer_endpoint="https://example.invalid/v1",
+        writer_api_key_env="FAKE_KEY",
+    )
+    monkeypatch.setattr("codex_history.summarize.ChatClient", IncompleteClient)
+    import pytest
+
+    with pytest.raises(ValueError, match="omitted"):
+        update_incremental(model_config, max_cost_cny=1.0)
+    assert active_info(config) == baseline_active
+    assert Path(baseline["database"]).is_file()

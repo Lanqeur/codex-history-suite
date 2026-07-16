@@ -313,7 +313,7 @@ def _doctor(home: Path, profile_name: str | None) -> dict[str, Any]:
         result["summarization"] = resolve_summarization(config)
         if result["summarization"]["fallback"]:
             result["warnings"].append(
-                "Model-first summarization is falling back to extractive mode: "
+                "Model consolidation is unavailable; extractive evidence will remain pending: "
                 + str(result["summarization"]["fallback_reason"])
             )
         runtime = _runtime_probe(config.runtime_python)
