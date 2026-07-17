@@ -8,7 +8,11 @@ from pathlib import Path
 
 import pytest
 
-from codex_history.artifact_capture import _find_git_root, _is_codex_storage
+from codex_history.artifact_capture import (
+    _find_git_root,
+    _is_codex_storage,
+    _scope_for_thread,
+)
 from codex_history.cli import main as cli_main
 from codex_history.audit import audit_database
 from codex_history.coverage import knowledge_coverage
@@ -21,7 +25,7 @@ from codex_history.pipeline import (
     plan,
     update_incremental,
 )
-from codex_history.schema import connect
+from codex_history.schema import connect, initialize
 from codex_history.source import classify_changes, discover_sources, snapshot_source
 
 from conftest import add_transcript, goal_row
@@ -48,6 +52,68 @@ def test_codex_storage_detection_covers_windows_and_posix_paths():
     assert _is_codex_storage(Path("/home/user/.codex/sessions/example.jsonl"))
     assert _is_codex_storage(Path("/mnt/c/Users/A/.codex/.tmp/plugins/file.zip"))
     assert not _is_codex_storage(Path("/workspace/codex-history-suite/file.zip"))
+
+
+def test_artifact_scope_uses_thread_mapping_instead_of_thread_id(tmp_path: Path):
+    connection = connect(tmp_path / "scope.sqlite3")
+    try:
+        initialize(connection)
+        connection.execute(
+            """
+            INSERT INTO threads(
+                thread_id,title,transcript_relative_path,line_count,event_count,
+                turn_count,message_count,user_message_count,assistant_message_count,
+                tool_call_count,tool_output_count,goal_event_count,compacted_count,indexed_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "thread-original",
+                "Mapped thread",
+                "thread.jsonl",
+                1,
+                1,
+                1,
+                1,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                "2026-07-17T00:00:00Z",
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO scopes(
+                scope_id,scope_type,scope_title,thread_ids_json,thread_titles_json,
+                overview,human_verdict,evidence_rows,overview_path,ledger_path
+            ) VALUES(?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "thread-thread-original",
+                "thread",
+                "Mapped thread",
+                '["thread-original"]',
+                '["Mapped thread"]',
+                "",
+                "test",
+                0,
+                "",
+                "",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO scope_threads(scope_id,thread_id,ordinal) VALUES(?,?,?)",
+            ("thread-thread-original", "thread-original", 0),
+        )
+        assert (
+            _scope_for_thread(connection, "thread-original")
+            == "thread-thread-original"
+        )
+        assert _scope_for_thread(connection, "missing-thread") is None
+    finally:
+        connection.close()
 
 
 def test_model_first_build_requires_an_explicit_cost_limit(portable_profile, monkeypatch):

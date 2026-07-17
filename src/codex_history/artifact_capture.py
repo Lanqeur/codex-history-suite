@@ -521,6 +521,30 @@ def _observation_exists(
     )
 
 
+def _scope_for_thread(
+    connection: sqlite3.Connection,
+    thread_id: str,
+) -> str | None:
+    row = connection.execute(
+        """
+        SELECT scopes.scope_id
+        FROM scope_threads
+        JOIN scopes ON scopes.scope_id=scope_threads.scope_id
+        WHERE scope_threads.thread_id=?
+        ORDER BY CASE scopes.scope_type
+                   WHEN 'thread' THEN 0
+                   WHEN 'family' THEN 1
+                   ELSE 2
+                 END,
+                 scope_threads.ordinal,
+                 scopes.scope_id
+        LIMIT 1
+        """,
+        (thread_id,),
+    ).fetchone()
+    return str(row[0]) if row else None
+
+
 def _repository_candidate(
     config: ProfileConfig,
     connection: sqlite3.Connection,
@@ -984,31 +1008,33 @@ def _insert_observation(
     evidence_row = connection.execute(
         "SELECT evidence_id FROM evidence WHERE item_id=?", (reference.event_id,)
     ).fetchone()
-    ledger_id = stable_id(
-        "ledger-artifact",
-        reference.thread_id,
-        reference.event_id,
-        str(artifact["sha256"]),
-        role,
-        length=40,
-    )
-    connection.execute(
-        """
-        INSERT OR IGNORE INTO ledger_artifacts(
-            ledger_artifact_id,scope_id,ref,role,evidence_refs_json,source_path,
-            source_locator
-        ) VALUES(?,?,?,?,?,?,?)
-        """,
-        (
-            ledger_id,
-            reference.thread_id,
-            artifact["artifact_uri"],
+    scope_id = _scope_for_thread(connection, reference.thread_id)
+    if scope_id:
+        ledger_id = stable_id(
+            "ledger-artifact",
+            scope_id,
+            reference.event_id,
+            str(artifact["sha256"]),
             role,
-            canonical_json([str(evidence_row[0])] if evidence_row else []),
-            _source_uri(reference),
-            reference.raw_path,
-        ),
-    )
+            length=40,
+        )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO ledger_artifacts(
+                ledger_artifact_id,scope_id,ref,role,evidence_refs_json,source_path,
+                source_locator
+            ) VALUES(?,?,?,?,?,?,?)
+            """,
+            (
+                ledger_id,
+                scope_id,
+                artifact["artifact_uri"],
+                role,
+                canonical_json([str(evidence_row[0])] if evidence_row else []),
+                _source_uri(reference),
+                reference.raw_path,
+            ),
+        )
     return True
 
 
