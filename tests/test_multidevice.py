@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import zipfile
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -22,8 +23,13 @@ from codex_history.library import (
     verify_bundle,
     verify_delta,
 )
-from codex_history.pipeline import active_database, build_full, update_incremental
-from codex_history.pipeline import plan
+from codex_history.pipeline import (
+    active_database,
+    build_full,
+    capture_artifacts,
+    plan,
+    update_incremental,
+)
 from codex_history.schema import connect
 
 from conftest import add_transcript, transcript_rows
@@ -230,7 +236,9 @@ def test_canonical_baseline_and_delta_avoid_full_retransfer(
         [("thread-delta", "Delta thread", "baseline-generation")],
     )
     baseline = tmp_path / "baseline.zip"
-    baseline_export = export_library(config, baseline, artifact_mode="referenced")
+    baseline_export = export_library(
+        config, baseline, artifact_mode="referenced"
+    )
     assert baseline_export["capabilities"]["incremental_sources"] is True
 
     target_home = tmp_path / "target"
@@ -295,6 +303,102 @@ def test_canonical_baseline_and_delta_avoid_full_retransfer(
     )
     assert closure["complete"] is True
     assert closure["indexed_files"] == 1
+    assert apply_delta(target_home, delta)["status"] == "already_applied"
+
+
+def test_artifact_only_delta_converges_without_transcript_generation_change(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    codex_home = tmp_path / "source/codex"
+    history_home = tmp_path / "source/history"
+    codex_home.mkdir(parents=True)
+    write_initial_config(history_home, profile="default", source_roots=[codex_home])
+    document = tmp_path / "reference.pdf"
+    document.write_bytes(b"%PDF-1.4\nportable artifact delta\n%%EOF\n")
+    transcript = add_transcript(
+        codex_home,
+        "thread-artifact-delta",
+        "Artifact-only delta",
+        timestamp="2026-07-14T01:00:00Z",
+        label="artifact-only-delta",
+    )
+    with transcript.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "timestamp": "2026-07-14T01:01:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": f'Preserve the referenced PDF "{document}".',
+                            }
+                        ],
+                    },
+                },
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+    config = load_config(history_home)
+    build_full(config)
+    baseline = tmp_path / "artifact-baseline.zip"
+    export_library(config, baseline, artifact_mode="referenced")
+    target_home = tmp_path / "target"
+    imported = import_library(target_home, baseline)
+
+    capture_config = replace(
+        config,
+        artifact_capture_paths=True,
+        artifact_exclude_temporary=False,
+    )
+    captured = capture_artifacts(capture_config)
+    assert captured["usage"]["total_api_tokens"] == 0
+    delta = tmp_path / "artifact-only.delta.zip"
+    delta_export = export_delta(
+        capture_config,
+        delta,
+        base=baseline,
+        artifact_mode="referenced",
+    )
+    assert delta_export["change_count"] == 0
+    assert (
+        delta_export["base_source_generation_id"]
+        == delta_export["target_source_generation_id"]
+    )
+    with zipfile.ZipFile(delta) as archive:
+        manifest = json.loads(archive.read("delta.json"))
+    assert manifest["artifact_delta"]["new_files"] == 1
+    assert manifest["artifact_metadata"]["counts"]["artifact_observations"] == 1
+
+    applied = apply_delta(target_home, delta)
+    assert applied["status"] == "applied"
+    assert applied["source_build"] is None
+    assert applied["artifact_build"]["usage"]["total_api_tokens"] == 0
+    imported_config = load_config(target_home, imported["profile"])
+    target_database = active_database(imported_config)
+    connection = connect(target_database, readonly=True)
+    try:
+        assert (
+            connection.execute("SELECT COUNT(*) FROM artifact_files").fetchone()[0]
+            == 1
+        )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM artifact_observations"
+            ).fetchone()[0]
+            == 1
+        )
+    finally:
+        connection.close()
+    closure, _ = inspect_artifact_closure(
+        imported_config, target_database, verify_hashes=True
+    )
+    assert closure["complete"] is True
     assert apply_delta(target_home, delta)["status"] == "already_applied"
 
 

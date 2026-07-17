@@ -110,7 +110,30 @@ class ProfileConfig:
     embedding_env_file: str = ""
     embedding_input_price_cny: float = 0.5
     artifact_capture_paths: bool = False
-    artifact_max_file_bytes: int = 100 * 1024 * 1024
+    artifact_max_file_bytes: int = 512 * 1024 * 1024
+    artifact_allowed_extensions: tuple[str, ...] = (
+        ".pdf",
+        ".ppt",
+        ".pptx",
+        ".doc",
+        ".docx",
+        ".xls",
+        ".xlsx",
+        ".csv",
+        ".zip",
+        ".tar",
+        ".gz",
+        ".tgz",
+        ".7z",
+        ".rar",
+    )
+    artifact_excluded_roots: tuple[Path, ...] = ()
+    artifact_exclude_temporary: bool = True
+    artifact_capture_git_repositories: bool = False
+    artifact_git_allow_network: bool = False
+    artifact_git_capture_dirty_worktree: bool = True
+    artifact_git_max_bytes: int = 1024 * 1024 * 1024
+    artifact_git_command_timeout_seconds: int = 600
     runtime_python: str = ""
     path_mappings: tuple[tuple[str, str], ...] = ()
 
@@ -228,7 +251,15 @@ input_price_cny_per_million = 0.5
 
 [profiles.{profile}.artifacts]
 capture_existing_paths = false
-max_file_bytes = 104857600
+max_file_bytes = 536870912
+allowed_extensions = [".pdf", ".ppt", ".pptx", ".doc", ".docx", ".xls", ".xlsx", ".csv", ".zip", ".tar", ".gz", ".tgz", ".7z", ".rar"]
+excluded_roots = []
+exclude_temporary = true
+capture_git_repositories = false
+git_allow_network = false
+git_capture_dirty_worktree = true
+git_max_bytes = 1073741824
+git_command_timeout_seconds = 600
 
 [profiles.{profile}.runtime]
 python = ""
@@ -321,7 +352,57 @@ def _profile_from_item(home: Path, profile: str, item: Mapping[str, Any]) -> Pro
         embedding_env_file=str(embedding.get("env_file", "")),
         embedding_input_price_cny=float(embedding.get("input_price_cny_per_million", 0.5)),
         artifact_capture_paths=bool(artifacts.get("capture_existing_paths", False)),
-        artifact_max_file_bytes=int(artifacts.get("max_file_bytes", 100 * 1024 * 1024)),
+        artifact_max_file_bytes=int(artifacts.get("max_file_bytes", 512 * 1024 * 1024)),
+        artifact_allowed_extensions=tuple(
+            sorted(
+                {
+                    (
+                        value.strip().lower()
+                        if str(value).strip().startswith(".")
+                        else f".{str(value).strip().lower()}"
+                    )
+                    for value in artifacts.get(
+                        "allowed_extensions",
+                        (
+                            ".pdf",
+                            ".ppt",
+                            ".pptx",
+                            ".doc",
+                            ".docx",
+                            ".xls",
+                            ".xlsx",
+                            ".csv",
+                            ".zip",
+                            ".tar",
+                            ".gz",
+                            ".tgz",
+                            ".7z",
+                            ".rar",
+                        ),
+                    )
+                    if str(value).strip()
+                }
+            )
+        ),
+        artifact_excluded_roots=tuple(
+            Path(str(value)).expanduser()
+            for value in artifacts.get("excluded_roots", ())
+            if str(value).strip()
+        ),
+        artifact_exclude_temporary=bool(artifacts.get("exclude_temporary", True)),
+        artifact_capture_git_repositories=bool(
+            artifacts.get("capture_git_repositories", False)
+        ),
+        artifact_git_allow_network=bool(artifacts.get("git_allow_network", False)),
+        artifact_git_capture_dirty_worktree=bool(
+            artifacts.get("git_capture_dirty_worktree", True)
+        ),
+        artifact_git_max_bytes=int(
+            artifacts.get("git_max_bytes", 1024 * 1024 * 1024)
+        ),
+        artifact_git_command_timeout_seconds=int(
+            artifacts.get("git_command_timeout_seconds", 600)
+        ),
         runtime_python=str(runtime.get("python", "")),
         path_mappings=tuple(parsed_mappings),
     )
@@ -414,6 +495,10 @@ def _validate_profile(config: ProfileConfig) -> None:
         errors.append("embedding.dimensions must be greater than zero")
     if config.artifact_max_file_bytes <= 0:
         errors.append("artifacts.max_file_bytes must be greater than zero")
+    if config.artifact_git_max_bytes <= 0:
+        errors.append("artifacts.git_max_bytes must be greater than zero")
+    if config.artifact_git_command_timeout_seconds <= 0:
+        errors.append("artifacts.git_command_timeout_seconds must be greater than zero")
     if errors:
         raise ValueError("Invalid Codex History profile: " + "; ".join(errors))
 

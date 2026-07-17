@@ -2,13 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-import mimetypes
-import os
 import re
 import sqlite3
-import tempfile
 from collections import defaultdict
-from pathlib import Path
 from typing import Any, Iterable
 
 from .parser import ParsedEvent, ParsedThread, ParsedTurn
@@ -29,11 +25,6 @@ DECISION_RE = re.compile(r"决定|采用|选择|同意|确定|保留|放弃|\b(d
 PREFERENCE_RE = re.compile(r"必须|不要|不需要|希望|偏好|要求|只允许|\b(prefer|must|should not|require)\b", re.IGNORECASE)
 CAPABILITY_RE = re.compile(r"完成|实现|通过|修复|支持|生成|成功|\b(implemented|completed|fixed|passed|supports?)\b", re.IGNORECASE)
 UNRESOLVED_RE = re.compile(r"待|仍需|尚未|未解决|不确定|计划|下一步|\b(todo|pending|unresolved|uncertain|planned)\b", re.IGNORECASE)
-QUOTED_PATH_RE = re.compile(r'''["']((?:[A-Za-z]:[\\/]|/)[^"'\r\n]+)["']''')
-POSIX_PATH_RE = re.compile(r"(?<![A-Za-z0-9_])(/[^\s\"'<>|]+)")
-WINDOWS_PATH_RE = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z]:[\\/][^\s\"'<>|]+)")
-
-
 DEFAULT_ALIASES = (
     ("wsl2", "wsl", "technical", 1.0),
     ("visual studio code", "vscode", "technical", 1.0),
@@ -779,67 +770,6 @@ def _insert_artifact_file(
     )
 
 
-def _candidate_paths(text: str) -> list[str]:
-    values: list[str] = []
-    values.extend(match.group(1) for match in QUOTED_PATH_RE.finditer(text))
-    values.extend(match.group(1) for match in POSIX_PATH_RE.finditer(text))
-    values.extend(match.group(1) for match in WINDOWS_PATH_RE.finditer(text))
-    cleaned: list[str] = []
-    for value in values:
-        candidate = value.rstrip(".,;:!?)]}")
-        if candidate.startswith("//") or "://" in candidate:
-            continue
-        if candidate not in cleaned:
-            cleaned.append(candidate)
-    return cleaned
-
-
-def _local_path(value: str) -> Path:
-    if os.name != "nt" and os.environ.get("WSL_DISTRO_NAME") and re.match(r"^[A-Za-z]:[\\/]", value):
-        drive = value[0].lower()
-        rest = value[2:].replace("\\", "/").lstrip("/")
-        return Path(f"/mnt/{drive}/{rest}")
-    return Path(value).expanduser()
-
-
-def _capture_file(config: ProfileConfig, path: Path) -> tuple[str, int, str, str] | None:
-    try:
-        stat = path.stat()
-    except OSError:
-        return None
-    if not path.is_file() or stat.st_size > config.artifact_max_file_bytes:
-        return None
-    config.cas_dir.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(prefix=".artifact-", dir=config.cas_dir)
-    digest = hashlib.sha256()
-    try:
-        with path.open("rb") as source, os.fdopen(descriptor, "wb") as target:
-            while True:
-                block = source.read(1024 * 1024)
-                if not block:
-                    break
-                digest.update(block)
-                target.write(block)
-            target.flush()
-            os.fsync(target.fileno())
-        sha = digest.hexdigest()
-        extension = path.suffix.lower()[:16] if path.suffix else ".bin"
-        relative = Path("files") / sha[:2] / f"{sha}{extension}"
-        destination = config.cas_dir / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if destination.exists():
-            os.unlink(temporary_name)
-        else:
-            os.replace(temporary_name, destination)
-        return sha, stat.st_size, relative.as_posix(), extension
-    except BaseException:
-        try:
-            os.unlink(temporary_name)
-        except FileNotFoundError:
-            pass
-        raise
-
-
 def _insert_artifacts(
     connection: sqlite3.Connection,
     snapshot: SnapshotFile,
@@ -864,51 +794,6 @@ def _insert_artifacts(
             keep_reason="inline_transcript_image",
             category="image",
         )
-    if not config.artifact_capture_paths:
-        return
-    seen: set[tuple[str, str]] = set()
-    for event in parsed.events:
-        for raw_path in _candidate_paths(event.text):
-            key = (event.event_id, raw_path)
-            if key in seen:
-                continue
-            seen.add(key)
-            path = _local_path(raw_path)
-            captured = _capture_file(config, path)
-            if not captured:
-                continue
-            digest, size, relative, extension = captured
-            uri = f"codex-history-artifact://sha256/{digest}"
-            indexed_path = f"transcript-ref:{snapshot.source.source_id}:{raw_path}"
-            mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-            _insert_artifact_file(
-                connection,
-                digest=digest,
-                size=size,
-                relative_path=relative,
-                uri=uri,
-                mime_type=mime_type,
-                extension=extension,
-                indexed_path=indexed_path,
-                source_open_path=raw_path,
-                keep_reason="existing_absolute_path",
-                category="referenced_file",
-            )
-            evidence_row = connection.execute(
-                "SELECT evidence_id FROM evidence WHERE item_id=?", (event.event_id,)
-            ).fetchone()
-            connection.execute(
-                "INSERT OR IGNORE INTO ledger_artifacts(ledger_artifact_id,scope_id,ref,role,evidence_refs_json,source_path,source_locator) VALUES(?,?,?,?,?,?,?)",
-                (
-                    stable_id("ledger-artifact", parsed.thread_id, event.event_id, raw_path),
-                    parsed.thread_id,
-                    uri,
-                    "referenced_file",
-                    canonical_json([evidence_row[0]] if evidence_row else []),
-                    _source_uri(snapshot.source.source_id, event.line_no),
-                    raw_path,
-                ),
-            )
 
 
 def _insert_incremental_knowledge(

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.2 - 2026-07-17
+
+- Add policy-gated absolute-path artifact discovery with WSL/Windows alias normalization, extension and size limits, automatic self-ingestion exclusions, and SHA-256 deduplication.
+- Add zero-model `library artifact-plan` and `library capture-artifacts` workflows with Event/Evidence-linked observations, copied SQLite candidates, closure audits, and atomic promotion.
+- Capture normal Git repositories as verified `bundle --all` checkpoints, partial clones as network-free HEAD archives, and dirty tracked plus non-ignored-untracked worktrees as deterministic snapshots.
+- Add artifact observations and repository checkpoints to the portable schema, logical audits, FTS, export manifests, and content-addressed storage.
+- Make deltas transport complete artifact mapping metadata and converge artifact-only generations even when the transcript source generation is unchanged.
+- Document safe capture policy, Git checkpoint behavior, artifact-only lifecycle, and cross-device incremental semantics in English and Chinese.
+
 ## 0.5.0 - 2026-07-16
 
 - Replace hydrated incremental summary bypasses with generation-based model consolidation: DeepSeek reduces new fact blocks into append-only ledgers and Qwen updates only affected thread/family overviews.

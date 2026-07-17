@@ -58,6 +58,30 @@ python3 scripts/codex_history.py plan --mode full --json
 
 构建完成后，返回结果还会提供实际 `usage` 汇总，包括模型输入、模型提供商缓存输入、输出、embedding Token、Codex History 响应缓存命中和人民币成本；`storage` 则同时给出 active 核心组件与保留历史 build 后整个 profile 的真实占用。
 
+## 引用文件与 Git 时间点快照
+
+v0.5.2 可以保存 transcript 绝对路径指向的普通文件，并为会话引用过的 Git
+仓库建立时间点 checkpoint。先启用经过审核的 artifact 策略，再执行零写入
+规划和零模型 artifact-only 构建：
+
+```bash
+python3 scripts/codex_history.py --profile default library artifact-plan \
+  --since 2026-07-10T00:00:00Z --json
+python3 scripts/codex_history.py --profile default library capture-artifacts \
+  --since 2026-07-10T00:00:00Z --json
+```
+
+规划器会统一 WSL/Windows 路径别名，排除当前 profile、Codex 来源目录、已登记
+artifact 根、用户配置的排除根与临时目录，再应用扩展名白名单和单文件上限，
+最后按 SHA-256 去重。实际采集会复制 active SQLite，新增带 Event/Evidence
+关系和捕获时间的文件观察记录，重建 artifact FTS，验证 CAS 闭合后原子晋升；
+摘要模型和 embedding 调用均为零。
+
+普通完整 clone 使用 `git bundle --all`。partial clone 默认生成不联网的当前
+HEAD archive，不会暗中下载缺失历史；联网补齐必须显式开启。脏仓库会同时保存
+历史 artifact 与确定性的 tracked/untracked worktree 快照。仓库指纹未变化时
+直接复用已有 checkpoint。
+
 ## 多设备知识库
 
 v0.4 增加了“规范基线 + 严格代际 delta”。每台电脑先设置稳定身份，只传输一次完整基线；以后只移动新增的内容寻址 transcript chunk、artifact 和模型缓存：
@@ -82,7 +106,7 @@ python3 scripts/codex_history.py library list --json
 python3 scripts/codex_history.py library search '发布 决策' --deep --json
 ```
 
-下一份 delta 可以把上一份 delta 作为 `--base`。delta 保留完整的目标来源清单，但 ZIP 只携带基代中不存在的 blob。`apply-delta` 会严格检查 `library_id` 与基代 source generation，只重建发生变化的规范化 transcript，再走普通的审计式增量状态机；重复应用保持幂等。缺代、乱序、跨库或篡改的 delta 都会在晋升前拒绝。完整 SQLite、已有 Chroma、历史 snapshot 与 artifact CAS 因此只需传输一次。
+下一份 delta 可以把上一份 delta 作为 `--base`。delta 保留完整的目标来源清单和 artifact 映射，但 ZIP 只携带基代中不存在的 blob。`apply-delta` 会严格检查 `library_id` 与兼容的 source generation，只重建发生变化的规范化 transcript，再走普通的审计式增量状态机；即使 transcript generation 没变，纯 artifact delta 仍会以零模型调用合并映射并校验 CAS 闭合，不会被误判为已应用。重复应用保持幂等，缺代、乱序、跨库或篡改的 delta 都会在晋升前拒绝。完整 SQLite、已有 Chroma、历史 snapshot 与 artifact CAS 因此只需传输一次。
 
 导入 profile 默认按“来源设备名 + 原 profile 名”自动命名，重名时自动追加数字。稳定的 `library_id` 会识别同一个设备库的后续版本：新 bundle 会更新对应 profile，同时把旧代保存在 `backups/imports`。bundle 内每个文件都执行 SHA-256 校验，并拒绝危险压缩路径；不可变 transcript chunk、artifact、语义索引和模型缓存会进入全局内容寻址 blob 仓库，在文件系统允许时通过硬链接实现物理去重。
 

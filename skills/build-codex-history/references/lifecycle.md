@@ -25,6 +25,20 @@ Only affected threads are reparsed. Curated family membership is preserved; dete
 
 When `auto` lacks model configuration, ingest and promotion may still stage searchable deterministic evidence, but `active.json` and SQLite metadata report `pending_model_consolidation`. With no later source changes, `update` returns that status until both models are available; once configured, the same command processes the pending backlog.
 
+## Artifact-Only Builds
+
+`library capture-artifacts` uses the same eight checkpointed stages but preserves
+all transcript, knowledge, relation, and semantic rows. `discover` records the
+reviewed path/Git plan, `ingest` adds content-addressed files, repository
+checkpoints, and Event/Evidence observations, `summarize` records zero calls,
+`index` rebuilds only artifact FTS, and `audit` verifies SQLite plus CAS closure
+before promotion. A failure leaves the prior active build unchanged.
+
+Occurrence time is the transcript event timestamp. Capture time is when the
+currently accessible file or repository state was observed. A historical path
+backfill must never claim that newly captured bytes are proven to be the exact
+bytes that existed at the earlier occurrence time.
+
 ## Release Invariant
 
 `audit --equivalence` performs a clean extractive full build from the same current sources and requires exact equality for canonical sources, parsed events/turns, Evidence occurrences, deterministic core/fact records, and artifacts. Model ledgers, Overview text, claims, semantic documents, and other generation-specific derived layers are reported separately as `derived_layer_differences`; they are not expected to be byte-identical between staged incremental consolidation and a one-shot rebuild.

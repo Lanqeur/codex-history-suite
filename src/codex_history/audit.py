@@ -85,6 +85,16 @@ LOGICAL_TABLES: dict[str, tuple[str, ...]] = {
         "ledger_artifact_id", "scope_id", "ref", "role", "evidence_refs_json",
         "source_path", "source_locator",
     ),
+    "repository_checkpoints": (
+        "checkpoint_id", "repository_root", "head_commit", "branch", "refs_sha256",
+        "worktree_sha256", "capture_mode", "history_artifact_sha256",
+        "worktree_artifact_sha256", "is_dirty", "is_partial_clone", "metadata_json",
+    ),
+    "artifact_observations": (
+        "observation_id", "event_id", "source_id", "thread_id", "artifact_sha256",
+        "repository_checkpoint_id", "original_path", "resolved_path", "occurrence_at",
+        "capture_method", "metadata_json",
+    ),
     "semantic_documents": (
         "document_id", "content_sha256", "document_text", "record_count",
     ),
@@ -105,6 +115,8 @@ EQUIVALENCE_AUTHORITY_TABLES = {
     "artifact_files",
     "artifact_paths",
     "ledger_artifacts",
+    "repository_checkpoints",
+    "artifact_observations",
 }
 
 

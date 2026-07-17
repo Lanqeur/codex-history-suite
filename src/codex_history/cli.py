@@ -24,7 +24,9 @@ from .coverage import knowledge_coverage
 from .pipeline import (
     active_database,
     active_info,
+    artifact_capture_plan,
     build_full,
+    capture_artifacts,
     compact_canonical_storage,
     equivalence_audit,
     hydrate_canonical_baseline,
@@ -213,6 +215,21 @@ def _management_parser() -> argparse.ArgumentParser:
     )
     artifact_audit.add_argument("--verify-hashes", action="store_true")
     artifact_audit.add_argument("--json", action="store_true")
+
+    artifact_plan = library_commands.add_parser(
+        "artifact-plan",
+        help="dry-run safe absolute-path and Git repository checkpoint capture",
+    )
+    artifact_plan.add_argument("--since", default="")
+    artifact_plan.add_argument("--json", action="store_true")
+
+    capture = library_commands.add_parser(
+        "capture-artifacts",
+        help="run a zero-model artifact-only build and atomically promote it",
+    )
+    capture.add_argument("--since", default="")
+    capture.add_argument("--no-promote", action="store_true")
+    capture.add_argument("--json", action="store_true")
 
     adopt_artifacts = library_commands.add_parser(
         "adopt-artifacts", help="verify and attach or materialize an existing artifact CAS"
@@ -619,6 +636,24 @@ def main(argv: list[str] | None = None) -> int:
             )
             _print(value, as_json=args.json)
             return 0 if value["complete"] else 2
+        if args.library_command == "artifact-plan":
+            config = load_config(home, args.profile)
+            _print(
+                artifact_capture_plan(config, since=args.since),
+                as_json=args.json,
+            )
+            return 0
+        if args.library_command == "capture-artifacts":
+            config = load_config(home, args.profile)
+            _print(
+                capture_artifacts(
+                    config,
+                    since=args.since,
+                    promote=not args.no_promote,
+                ),
+                as_json=args.json,
+            )
+            return 0
         if args.library_command == "adopt-artifacts":
             config = load_config(home, args.profile)
             database = active_database(config)

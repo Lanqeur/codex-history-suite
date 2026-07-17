@@ -4,6 +4,7 @@
 
 - Storage and profiles
 - Source discovery
+- Referenced files and Git checkpoints
 - Summarization
 - Semantic retrieval
 - Optional runtime
@@ -20,6 +21,46 @@ Each profile owns immutable chunked snapshots, artifact CAS, builds, model cache
 `source_roots` normally contains one or more Codex homes. The adapter scans `sessions/**/*.jsonl`, optional `archived_sessions/*.jsonl`, `session_index.jsonl`, and compatible state databases. WSL discovery considers both Linux and Windows Codex homes, but explicit source roots win.
 
 Transcript storage is treated as a versioned, private input format. Unknown JSON records remain in canonical raw evidence even when they do not become searchable knowledge.
+
+## Referenced Files And Git Checkpoints
+
+Absolute-path capture is opt-in. Use a narrow document/archive allowlist because
+unfiltered transcript paths commonly point back into Codex exports, caches,
+databases, generated queues, and temporary workspaces.
+
+```toml
+[profiles.default.artifacts]
+capture_existing_paths = true
+max_file_bytes = 536870912
+allowed_extensions = [".pdf", ".ppt", ".pptx", ".doc", ".docx", ".xls", ".xlsx", ".csv", ".zip", ".tar", ".gz", ".tgz", ".7z", ".rar"]
+excluded_roots = ["/mnt/d/CodexTranscriptArchive"]
+exclude_temporary = true
+capture_git_repositories = true
+git_allow_network = false
+git_capture_dirty_worktree = true
+git_max_bytes = 1073741824
+git_command_timeout_seconds = 600
+```
+
+`artifact-plan` is mandatory before the first capture or a policy expansion. It
+does not write files. It reports parsed paths, exclusions, existing files,
+content hashes already available in any registered CAS, new bytes, repository
+modes, and pending observations. `capture-artifacts` creates a copied candidate
+SQLite database, captures only the approved plan, records occurrence time
+separately from capture time, audits database-to-CAS closure, and atomically
+promotes. It never calls summary or embedding models.
+
+Complete clones use `git bundle --all`. With `git_allow_network = false`, partial
+clones use a HEAD archive and `GIT_NO_LAZY_FETCH=1`; this prevents a checkpoint
+from unexpectedly downloading old blobs. Set network access to true only after
+reviewing repository size. Dirty repositories add a deterministic worktree
+archive containing tracked and non-ignored untracked files. Ignored files and
+`.git` are not copied into that archive.
+
+Profile storage, source transcript roots, registered external artifact roots,
+and the platform temporary directory are excluded automatically. Set
+`exclude_temporary = false` only when temporary files are intentional evidence.
+Add archive/export roots to `excluded_roots` to prevent self-ingestion loops.
 
 ## Summarization
 

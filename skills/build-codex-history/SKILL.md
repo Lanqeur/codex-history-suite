@@ -35,9 +35,32 @@ python3 ../../scripts/codex_history.py update --max-cost-cny 5 --json
 python3 ../../scripts/codex_history.py audit --equivalence --json
 python3 ../../scripts/codex_history.py status --json
 python3 ../../scripts/codex_history.py coverage --json
+python3 ../../scripts/codex_history.py library artifact-plan --since TIMESTAMP --json
+python3 ../../scripts/codex_history.py library capture-artifacts --since TIMESTAMP --json
 ```
 
 Use `--home` and `--profile` before the command for non-default installations.
+
+## Referenced Files And Repositories
+
+Never enable broad absolute-path capture without first reviewing `library
+artifact-plan`. Require an extension allowlist and exclude Codex History storage,
+source transcript roots, registered artifact roots, archive/export roots, and
+temporary output unless the user intentionally includes it. The planner must
+deduplicate by content hash, not path spelling; WSL and Windows aliases can
+identify the same file.
+
+Use `library capture-artifacts` for a backfill that should not rerun
+summarization. It copies the active authority, records Event/Evidence-linked
+artifact observations with separate occurrence/capture timestamps, creates Git
+checkpoints, audits closure, and only then promotes. Report zero model and
+embedding calls explicitly.
+
+Normal Git repositories use a complete bundle. Partial clones default to a
+network-free HEAD archive; never enable history completion without explaining
+that missing blobs can be downloaded. Dirty repositories require an additional
+tracked plus non-ignored-untracked worktree snapshot. Reuse an existing
+checkpoint when its refs and worktree fingerprints are unchanged.
 
 ## Migration And Recovery
 

@@ -7,7 +7,7 @@ from .util import utc_now
 
 
 SCHEMA_NAME = "codex-history-suite"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 BASE_SCHEMA = r"""
@@ -344,6 +344,50 @@ CREATE TABLE IF NOT EXISTS ledger_artifacts(
     source_locator TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS repository_checkpoints(
+    checkpoint_id TEXT PRIMARY KEY,
+    repository_root TEXT NOT NULL,
+    head_commit TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    refs_sha256 TEXT NOT NULL,
+    worktree_sha256 TEXT NOT NULL,
+    capture_mode TEXT NOT NULL,
+    history_artifact_sha256 TEXT REFERENCES artifact_files(sha256),
+    worktree_artifact_sha256 TEXT REFERENCES artifact_files(sha256),
+    is_dirty INTEGER NOT NULL,
+    is_partial_clone INTEGER NOT NULL,
+    captured_at TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    UNIQUE(repository_root,refs_sha256,worktree_sha256,capture_mode)
+);
+
+CREATE TABLE IF NOT EXISTS artifact_observations(
+    observation_id TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL REFERENCES canonical_events(event_id) ON DELETE CASCADE,
+    source_id TEXT NOT NULL REFERENCES source_files(source_id) ON DELETE CASCADE,
+    thread_id TEXT NOT NULL REFERENCES threads(thread_id) ON DELETE CASCADE,
+    artifact_sha256 TEXT NOT NULL REFERENCES artifact_files(sha256) ON DELETE CASCADE,
+    repository_checkpoint_id TEXT REFERENCES repository_checkpoints(checkpoint_id) ON DELETE SET NULL,
+    original_path TEXT NOT NULL,
+    resolved_path TEXT NOT NULL,
+    occurrence_at TEXT,
+    captured_at TEXT NOT NULL,
+    capture_method TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    UNIQUE(event_id,original_path,artifact_sha256,capture_method)
+);
+
+CREATE INDEX IF NOT EXISTS repository_checkpoints_root_idx
+    ON repository_checkpoints(repository_root,captured_at);
+CREATE INDEX IF NOT EXISTS repository_checkpoints_head_idx
+    ON repository_checkpoints(head_commit);
+CREATE INDEX IF NOT EXISTS artifact_observations_event_idx
+    ON artifact_observations(event_id);
+CREATE INDEX IF NOT EXISTS artifact_observations_artifact_idx
+    ON artifact_observations(artifact_sha256);
+CREATE INDEX IF NOT EXISTS artifact_observations_checkpoint_idx
+    ON artifact_observations(repository_checkpoint_id);
+
 CREATE TABLE IF NOT EXISTS semantic_documents(
     document_id TEXT PRIMARY KEY,
     content_sha256 TEXT NOT NULL UNIQUE,
@@ -655,7 +699,7 @@ def initialize(connection: sqlite3.Connection) -> None:
         (
             SCHEMA_VERSION,
             utc_now(),
-            "Add normalized transcript snapshot metadata for incremental portability",
+            "Add versioned artifact observations and Git repository checkpoints",
         ),
     )
     values = {

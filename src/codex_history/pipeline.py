@@ -400,7 +400,7 @@ def _new_database(
     build_dir = config.builds_dir / build_id
     build_dir.mkdir(parents=True, exist_ok=False)
     database = build_dir / "codex_history.sqlite3"
-    if kind in {"incremental", "hydrate", "compact"}:
+    if kind in {"incremental", "hydrate", "compact", "artifact"}:
         parent = active_database(config)
         if not parent:
             raise RuntimeError("Incremental update requires an active build")
@@ -676,6 +676,27 @@ def _build_locked(
                 connection.execute(
                     "INSERT INTO metadata(key,value) VALUES('knowledge_completion_status','pending_model_consolidation') "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+                )
+            if (
+                config.artifact_capture_paths
+                or config.artifact_capture_git_repositories
+            ):
+                from .artifact_capture import (
+                    apply_artifact_capture,
+                    plan_artifact_capture,
+                )
+
+                artifact_plan = plan_artifact_capture(
+                    config,
+                    connection,
+                    active_build_id=build_id,
+                    database=database,
+                )
+                totals["artifact_capture"] = apply_artifact_capture(
+                    config,
+                    connection,
+                    artifact_plan,
+                    build_dir=build_dir,
                 )
             report.update(totals)
 
@@ -1239,6 +1260,363 @@ def compact_canonical_storage(
                 "build_dir": str(build_dir),
                 "promoted": promote,
                 "compaction": run.data["stages"]["ingest"]["report"],
+                "audit": read_json(build_dir / "audit.json"),
+            }
+        finally:
+            connection.close()
+
+
+def artifact_capture_plan(
+    config: ProfileConfig,
+    *,
+    since: str = "",
+) -> dict[str, Any]:
+    ensure_profile_dirs(config)
+    database = active_database(config)
+    active = active_info(config) or {}
+    if not database:
+        raise RuntimeError("Artifact capture planning requires an active database")
+    from .artifact_capture import plan_artifact_capture
+
+    connection = connect(database, readonly=True)
+    try:
+        return plan_artifact_capture(
+            config,
+            connection,
+            active_build_id=str(active.get("build_id") or ""),
+            database=database,
+            since=since,
+        ).public()
+    finally:
+        connection.close()
+
+
+def capture_artifacts(
+    config: ProfileConfig,
+    *,
+    since: str = "",
+    promote: bool = True,
+) -> dict[str, Any]:
+    ensure_profile_dirs(config)
+    current_database = active_database(config)
+    current_active = active_info(config) or {}
+    if not current_database:
+        raise RuntimeError("Artifact capture requires an active database")
+    if not (
+        config.artifact_capture_paths
+        or config.artifact_capture_git_repositories
+    ):
+        raise RuntimeError(
+            "Artifact capture is disabled. Enable artifacts.capture_existing_paths "
+            "or artifacts.capture_git_repositories, then run artifact-plan again."
+        )
+    from .artifact_capture import apply_artifact_capture, plan_artifact_capture
+
+    with file_lock(config.lock_path):
+        planning_connection = connect(current_database, readonly=True)
+        try:
+            capture_plan = plan_artifact_capture(
+                config,
+                planning_connection,
+                active_build_id=str(current_active.get("build_id") or ""),
+                database=current_database,
+                since=since,
+            )
+        finally:
+            planning_connection.close()
+        public_plan = capture_plan.public()
+        if not capture_plan.work_required:
+            return {
+                "status": "no_changes",
+                "build_id": current_active.get("build_id"),
+                "database": str(current_database),
+                "plan": public_plan,
+                "usage": {
+                    "total_api_tokens": 0,
+                    "total_cost_cny": 0.0,
+                },
+            }
+
+        build_id = _build_id("artifact")
+        build_dir = config.builds_dir / build_id
+        manifest_path = build_dir / "artifact-manifest.json"
+        database, connection = _new_database(
+            config,
+            build_id,
+            "artifact",
+            str(current_active.get("build_id") or "") or None,
+            manifest_path,
+        )
+        run = RunState(config, build_id, "artifact", build_dir)
+        try:
+            with run.stage(connection, "discover") as report:
+                report.update(public_plan)
+                atomic_write_json(
+                    manifest_path,
+                    {
+                        "schema_version": "codex-history-artifact-manifest-v1",
+                        "build_id": build_id,
+                        "parent_build_id": current_active.get("build_id"),
+                        "created_at": utc_now(),
+                        "since": since,
+                        "plan": public_plan,
+                    },
+                )
+            with run.stage(connection, "snapshot") as report:
+                report.update(
+                    {
+                        "mode": "content-addressed-file-and-repository-checkpoints",
+                        "ordinary_files": len(capture_plan.files),
+                        "git_repositories": len(capture_plan.repositories),
+                    }
+                )
+            with run.stage(connection, "ingest") as report:
+                report.update(
+                    apply_artifact_capture(
+                        config,
+                        connection,
+                        capture_plan,
+                        build_dir=build_dir,
+                    )
+                )
+                connection.execute(
+                    "INSERT INTO metadata(key,value) VALUES('artifact_capture_last_at',?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (utc_now(),),
+                )
+                connection.execute(
+                    "INSERT INTO metadata(key,value) VALUES('artifact_capture_build_id',?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (build_id,),
+                )
+                connection.execute(
+                    "INSERT INTO metadata(key,value) VALUES('artifact_capture_since',?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (since,),
+                )
+            with run.stage(connection, "lineage") as report:
+                report.update(
+                    {
+                        "preserved": True,
+                        "note": "Knowledge, evidence, scopes, and relations were preserved",
+                    }
+                )
+            with run.stage(connection, "summarize") as report:
+                report.update(
+                    {
+                        "mode": "preserve-existing",
+                        "model_calls": 0,
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cost_cny": 0.0,
+                    }
+                )
+            with run.stage(connection, "index") as report:
+                rebuild_fts(connection)
+                report.update(
+                    {
+                        "artifact_fts_rebuilt": True,
+                        "semantic_preserved": True,
+                        "embedding_calls": 0,
+                    }
+                )
+            with run.stage(connection, "audit") as report:
+                audit = audit_connection(connection)
+                artifact_closure, _ = inspect_artifact_closure(
+                    config,
+                    database,
+                    verify_hashes=False,
+                )
+                audit["artifact_closure"] = artifact_closure
+                audit["checks"].append(
+                    {
+                        "name": "artifact_closure",
+                        "passed": artifact_closure["complete"],
+                        "detail": artifact_closure,
+                    }
+                )
+                audit["passed"] = audit["passed"] and artifact_closure["complete"]
+                report.update(audit)
+                atomic_write_json(build_dir / "audit.json", audit)
+                if not audit["passed"]:
+                    raise RuntimeError("Artifact-only build audit failed")
+                connection.execute(
+                    "UPDATE builds SET logical_digest=? WHERE build_id=?",
+                    (audit["logical_digest"]["sha256"], build_id),
+                )
+            with run.stage(connection, "promote") as report:
+                if promote:
+                    report.update(_promote(config, build_id, database))
+                    promoted_at = report["promoted_at"]
+                else:
+                    report["promoted"] = False
+                    promoted_at = None
+                connection.execute(
+                    "UPDATE builds SET status='complete',completed_at=?,promoted_at=? "
+                    "WHERE build_id=?",
+                    (utc_now(), promoted_at, build_id),
+                )
+            run.complete()
+            return {
+                "status": "complete",
+                "build_id": build_id,
+                "kind": "artifact",
+                "database": str(database),
+                "build_dir": str(build_dir),
+                "promoted": promote,
+                "plan": public_plan,
+                "capture": run.data["stages"]["ingest"]["report"],
+                "usage": {
+                    "summary_input_tokens": 0,
+                    "summary_output_tokens": 0,
+                    "embedding_input_tokens": 0,
+                    "total_api_tokens": 0,
+                    "summary_cost_cny": 0.0,
+                    "embedding_cost_cny": 0.0,
+                    "total_cost_cny": 0.0,
+                },
+                "storage": actual_managed_storage(config, database),
+                "audit": read_json(build_dir / "audit.json"),
+                "run": read_json(run.path),
+            }
+        finally:
+            connection.close()
+
+
+def apply_artifact_metadata_build(
+    config: ProfileConfig,
+    payload: dict[str, Any],
+    *,
+    promote: bool = True,
+) -> dict[str, Any]:
+    ensure_profile_dirs(config)
+    current_database = active_database(config)
+    current_active = active_info(config) or {}
+    if not current_database:
+        raise RuntimeError("Artifact metadata application requires an active database")
+    from .artifact_capture import apply_artifact_metadata
+
+    with file_lock(config.lock_path):
+        build_id = _build_id("artifact")
+        build_dir = config.builds_dir / build_id
+        manifest_path = build_dir / "artifact-manifest.json"
+        database, connection = _new_database(
+            config,
+            build_id,
+            "artifact",
+            str(current_active.get("build_id") or "") or None,
+            manifest_path,
+        )
+        run = RunState(config, build_id, "artifact", build_dir)
+        try:
+            with run.stage(connection, "discover") as report:
+                report.update(
+                    {
+                        "mode": "portable-artifact-metadata",
+                        "schema_version": payload.get("schema_version"),
+                        "digest": payload.get("digest"),
+                        "counts": payload.get("counts", {}),
+                    }
+                )
+                atomic_write_json(
+                    manifest_path,
+                    {
+                        "schema_version": "codex-history-artifact-manifest-v1",
+                        "build_id": build_id,
+                        "parent_build_id": current_active.get("build_id"),
+                        "created_at": utc_now(),
+                        "mode": "portable-artifact-metadata",
+                        "metadata_digest": payload.get("digest"),
+                    },
+                )
+            with run.stage(connection, "snapshot") as report:
+                report.update(
+                    {
+                        "mode": "reuse-installed-content-addressed-artifacts",
+                        "copied_transcript_bytes": 0,
+                    }
+                )
+            with run.stage(connection, "ingest") as report:
+                report.update(apply_artifact_metadata(connection, payload))
+                connection.execute(
+                    "INSERT INTO metadata(key,value) VALUES('artifact_metadata_last_at',?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (utc_now(),),
+                )
+                connection.execute(
+                    "INSERT INTO metadata(key,value) VALUES('artifact_metadata_digest',?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (str(payload.get("digest") or ""),),
+                )
+            with run.stage(connection, "lineage") as report:
+                report["preserved"] = True
+            with run.stage(connection, "summarize") as report:
+                report.update(
+                    {
+                        "mode": "preserve-existing",
+                        "model_calls": 0,
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cost_cny": 0.0,
+                    }
+                )
+            with run.stage(connection, "index") as report:
+                rebuild_fts(connection)
+                report.update(
+                    {
+                        "artifact_fts_rebuilt": True,
+                        "semantic_preserved": True,
+                        "embedding_calls": 0,
+                    }
+                )
+            with run.stage(connection, "audit") as report:
+                audit = audit_connection(connection)
+                artifact_closure, _ = inspect_artifact_closure(
+                    config,
+                    database,
+                    verify_hashes=False,
+                )
+                audit["artifact_closure"] = artifact_closure
+                audit["checks"].append(
+                    {
+                        "name": "artifact_closure",
+                        "passed": artifact_closure["complete"],
+                        "detail": artifact_closure,
+                    }
+                )
+                audit["passed"] = audit["passed"] and artifact_closure["complete"]
+                report.update(audit)
+                atomic_write_json(build_dir / "audit.json", audit)
+                if not audit["passed"]:
+                    raise RuntimeError("Portable artifact metadata audit failed")
+                connection.execute(
+                    "UPDATE builds SET logical_digest=? WHERE build_id=?",
+                    (audit["logical_digest"]["sha256"], build_id),
+                )
+            with run.stage(connection, "promote") as report:
+                if promote:
+                    report.update(_promote(config, build_id, database))
+                    promoted_at = report["promoted_at"]
+                else:
+                    report["promoted"] = False
+                    promoted_at = None
+                connection.execute(
+                    "UPDATE builds SET status='complete',completed_at=?,promoted_at=? "
+                    "WHERE build_id=?",
+                    (utc_now(), promoted_at, build_id),
+                )
+            run.complete()
+            return {
+                "status": "complete",
+                "build_id": build_id,
+                "kind": "artifact",
+                "database": str(database),
+                "promoted": promote,
+                "metadata": run.data["stages"]["ingest"]["report"],
+                "usage": {
+                    "total_api_tokens": 0,
+                    "total_cost_cny": 0.0,
+                },
                 "audit": read_json(build_dir / "audit.json"),
             }
         finally:

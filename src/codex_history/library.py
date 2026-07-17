@@ -16,6 +16,10 @@ from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Iterable, Mapping
 
 from .audit import audit_database
+from .artifact_capture import (
+    ARTIFACT_METADATA_SCHEMA,
+    export_artifact_metadata,
+)
 from .artifacts import (
     artifact_export_entries,
     artifact_records,
@@ -30,7 +34,14 @@ from .config import (
     profile_names,
 )
 from .coverage import knowledge_coverage, source_inventory
-from .pipeline import active_database, active_info, build_full, plan, update_incremental
+from .pipeline import (
+    active_database,
+    active_info,
+    apply_artifact_metadata_build,
+    build_full,
+    plan,
+    update_incremental,
+)
 from .schema import connect, initialize
 from .util import (
     atomic_write_bytes,
@@ -142,6 +153,14 @@ def _settings_from_config(config: ProfileConfig) -> dict[str, Any]:
         "artifacts": {
             "capture_existing_paths": config.artifact_capture_paths,
             "max_file_bytes": config.artifact_max_file_bytes,
+            "allowed_extensions": list(config.artifact_allowed_extensions),
+            "excluded_roots": [str(path) for path in config.artifact_excluded_roots],
+            "exclude_temporary": config.artifact_exclude_temporary,
+            "capture_git_repositories": config.artifact_capture_git_repositories,
+            "git_allow_network": config.artifact_git_allow_network,
+            "git_capture_dirty_worktree": config.artifact_git_capture_dirty_worktree,
+            "git_max_bytes": config.artifact_git_max_bytes,
+            "git_command_timeout_seconds": config.artifact_git_command_timeout_seconds,
         },
         "runtime": {"python": ""},
     }
@@ -353,6 +372,7 @@ def export_library(
     connection = connect(database, readonly=True)
     try:
         inventory = source_inventory(connection)
+        artifact_metadata = export_artifact_metadata(connection)
     finally:
         connection.close()
     artifact_closure, artifact_entries = artifact_export_entries(
@@ -399,6 +419,7 @@ def export_library(
             "source_generation_id": inventory["generation_id"],
             "source_inventory": inventory,
             "artifact_inventory": artifact_inventory,
+            "artifact_metadata_digest": artifact_metadata["digest"],
             "cache_inventory": cache_inventory,
             "history_coverage": history_coverage,
             "profile_config": _settings_from_config(config),
@@ -772,6 +793,7 @@ def export_delta(
     connection = connect(database, readonly=True)
     try:
         current_inventory = source_inventory(connection)
+        artifact_metadata = export_artifact_metadata(connection)
     finally:
         connection.close()
     if not current_inventory["snapshot_complete"]:
@@ -879,6 +901,8 @@ def export_delta(
         identity["library_id"],
         base_generation,
         target_generation,
+        current_artifacts["digest"],
+        artifact_metadata["digest"],
         artifact_mode,
         length=32,
     )
@@ -900,6 +924,7 @@ def export_delta(
         "source_inventory": current_inventory,
         "base_artifact_inventory": base_artifact_inventory,
         "artifact_inventory": current_artifacts,
+        "artifact_metadata": artifact_metadata,
         "cache_inventory": current_cache,
         "target_artifact_closure": {
             key: artifact_closure.get(key)
@@ -923,6 +948,7 @@ def export_delta(
                 for record in records
                 if record["role"] == "artifact_cas"
             ),
+            "metadata_digest": artifact_metadata["digest"],
         },
         "changes": changes,
         "capabilities": {
@@ -1087,6 +1113,28 @@ def verify_delta(path: Path) -> dict[str, Any]:
             )
         if int(artifact_delta.get("new_files") or 0) != len(packaged_artifacts):
             errors.append("delta artifact file count disagrees with manifest")
+        artifact_metadata = dict(manifest.get("artifact_metadata") or {})
+        if artifact_metadata.get("schema_version") != ARTIFACT_METADATA_SCHEMA:
+            errors.append(
+                "delta has unsupported artifact metadata schema: "
+                f"{artifact_metadata.get('schema_version') or 'missing'}"
+            )
+        metadata_tables = dict(artifact_metadata.get("tables") or {})
+        metadata_digest = hashlib.sha256(
+            canonical_json(metadata_tables).encode("utf-8")
+        ).hexdigest()
+        if metadata_digest != str(artifact_metadata.get("digest") or ""):
+            errors.append("delta artifact metadata digest mismatch")
+        if str(artifact_delta.get("metadata_digest") or "") != metadata_digest:
+            errors.append("delta artifact metadata digest disagrees with manifest")
+        metadata_artifacts = {
+            str(item.get("sha256") or "")
+            for item in metadata_tables.get("artifact_files", [])
+        }
+        if metadata_artifacts != target_artifacts:
+            errors.append(
+                "delta artifact metadata does not match target artifact inventory"
+            )
     return {
         "schema_version": DELTA_SCHEMA,
         "delta": str(path),
@@ -1892,11 +1940,33 @@ def apply_delta(
         connection = connect(database, readonly=True)
         try:
             current_inventory = source_inventory(connection)
+            current_artifact_metadata = export_artifact_metadata(connection)
         finally:
             connection.close()
+        current_artifact_inventory = _artifact_inventory(database)
         current_generation = _inventory_generation(current_inventory)
         required_generation = str(manifest["base_source_generation_id"])
-        if current_generation == str(manifest["target_source_generation_id"]):
+        target_generation = str(manifest["target_source_generation_id"])
+        target_artifact_inventory = dict(manifest.get("artifact_inventory") or {})
+        target_artifact_digest = str(target_artifact_inventory.get("digest") or "")
+        target_artifact_metadata = dict(manifest.get("artifact_metadata") or {})
+        target_artifact_metadata_digest = str(
+            target_artifact_metadata.get("digest") or ""
+        )
+        artifact_mode = str(
+            (manifest.get("artifact_delta") or {}).get("mode") or "referenced"
+        )
+        artifacts_required = artifact_mode != "none"
+        source_up_to_date = current_generation == target_generation
+        artifacts_up_to_date = (
+            not artifacts_required
+            or (
+                current_artifact_inventory["digest"] == target_artifact_digest
+                and current_artifact_metadata["digest"]
+                == target_artifact_metadata_digest
+            )
+        )
+        if source_up_to_date and artifacts_up_to_date:
             return {
                 "status": "already_applied",
                 "profile": selected,
@@ -1905,7 +1975,7 @@ def apply_delta(
                 "target_source_generation_id": current_generation,
                 "changes": 0,
             }
-        if current_generation != required_generation:
+        if current_generation not in {required_generation, target_generation}:
             raise RuntimeError(
                 "Delta base generation mismatch: target is "
                 f"{current_generation}, delta requires {required_generation}"
@@ -1921,77 +1991,127 @@ def apply_delta(
             method = _copy_from_zip(home, archive, record, target, shared=True)
             install_stats[method] += 1
 
-    source_root = config.source_roots[0].resolve()
-    backup_root = config.root / "backups/deltas" / str(manifest["delta_id"])
-    backup_root.mkdir(parents=True, exist_ok=True)
-    identities = _read_source_identities(source_root)
-    restore: list[tuple[Path, Path | None]] = []
-    for change in manifest.get("changes", []):
-        old = identities.get(str(change["source_id"]))
-        target = (
-            source_root / str(old["relative_path"])
-            if old
-            else source_root
-            / f"sessions/imported/{_slug(str(change['source_id']), 'source')}.jsonl"
-        )
-        if target.is_file():
-            backup = backup_root / target.relative_to(source_root)
-            backup.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                os.link(target, backup)
-            except OSError:
+    source_build: dict[str, Any] | None = None
+    artifact_build: dict[str, Any] | None = None
+    if not source_up_to_date:
+        source_root = config.source_roots[0].resolve()
+        backup_root = config.root / "backups/deltas" / str(manifest["delta_id"])
+        backup_root.mkdir(parents=True, exist_ok=True)
+        identities = _read_source_identities(source_root)
+        restore: list[tuple[Path, Path | None]] = []
+        for change in manifest.get("changes", []):
+            old = identities.get(str(change["source_id"]))
+            target = (
+                source_root / str(old["relative_path"])
+                if old
+                else source_root
+                / f"sessions/imported/{_slug(str(change['source_id']), 'source')}.jsonl"
+            )
+            if target.is_file():
+                backup = backup_root / target.relative_to(source_root)
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    os.link(target, backup)
+                except OSError:
+                    shutil.copy2(target, backup)
+                restore.append((target, backup))
+            else:
+                restore.append((target, None))
+        for name in ("source_identity.jsonl", "session_index.jsonl"):
+            target = source_root / name
+            if target.is_file():
+                backup = backup_root / name
                 shutil.copy2(target, backup)
-            restore.append((target, backup))
+                restore.append((target, backup))
+        try:
+            _write_inventory_sources(
+                config, manifest["source_inventory"], manifest["changes"]
+            )
+            source_build = update_incremental(config, max_cost_cny=max_cost_cny)
+        except BaseException:
+            for target, backup in reversed(restore):
+                if backup is None:
+                    target.unlink(missing_ok=True)
+                elif backup.is_file():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(backup, target)
+            raise
         else:
-            restore.append((target, None))
-    for name in ("source_identity.jsonl", "session_index.jsonl"):
-        target = source_root / name
-        if target.is_file():
-            backup = backup_root / name
-            shutil.copy2(target, backup)
-            restore.append((target, backup))
+            shutil.rmtree(backup_root, ignore_errors=True)
+
+    updated_database = active_database(config)
+    if not updated_database:
+        raise RuntimeError("Delta application did not leave an active database")
+    connection = connect(updated_database, readonly=True)
     try:
-        _write_inventory_sources(
-            config, manifest["source_inventory"], manifest["changes"]
+        metadata_after_source = export_artifact_metadata(connection)
+    finally:
+        connection.close()
+    artifacts_after_source = _artifact_inventory(updated_database)
+    if artifacts_required and (
+        metadata_after_source["digest"] != target_artifact_metadata_digest
+        or artifacts_after_source["digest"] != target_artifact_digest
+    ):
+        artifact_build = apply_artifact_metadata_build(
+            config, target_artifact_metadata
         )
-        build = update_incremental(config, max_cost_cny=max_cost_cny)
         updated_database = active_database(config)
         if not updated_database:
-            raise RuntimeError("Incremental update did not promote a database")
-        connection = connect(updated_database, readonly=True)
-        try:
-            updated_inventory = source_inventory(connection)
-        finally:
-            connection.close()
-        target_generation = str(manifest["target_source_generation_id"])
-        if _inventory_generation(updated_inventory) != target_generation:
-            raise RuntimeError(
-                "Applied delta did not converge to its target source generation"
-            )
-        active_payload = active_info(config) or {}
+            raise RuntimeError("Artifact metadata update did not promote a database")
+
+    connection = connect(updated_database, readonly=True)
+    try:
+        updated_inventory = source_inventory(connection)
+        updated_artifact_metadata = export_artifact_metadata(connection)
+    finally:
+        connection.close()
+    updated_artifact_inventory = _artifact_inventory(updated_database)
+    if _inventory_generation(updated_inventory) != target_generation:
+        raise RuntimeError(
+            "Applied delta did not converge to its target source generation"
+        )
+    if (
+        artifacts_required
+        and updated_artifact_inventory["digest"] != target_artifact_digest
+    ):
+        raise RuntimeError(
+            "Applied delta did not converge to its target artifact inventory"
+        )
+    if (
+        artifacts_required
+        and updated_artifact_metadata["digest"] != target_artifact_metadata_digest
+    ):
+        raise RuntimeError(
+            "Applied delta did not converge to its target artifact metadata"
+        )
+    active_payload = active_info(config) or {}
+    active_payload.update(
+        {
+            "incremental_ready": True,
+            "source_generation_id": target_generation,
+            "last_delta_id": manifest["delta_id"],
+            "history_coverage": knowledge_coverage(
+                config, updated_database, active=active_payload
+            ),
+        }
+    )
+    if artifacts_required:
         active_payload.update(
             {
-                "incremental_ready": True,
-                "source_generation_id": target_generation,
-                "last_delta_id": manifest["delta_id"],
-                "history_coverage": knowledge_coverage(
-                    config, updated_database, active=active_payload
-                ),
+                "artifact_inventory_digest": target_artifact_digest,
+                "artifact_metadata_digest": target_artifact_metadata_digest,
             }
         )
-        atomic_write_json(config.active_path, active_payload)
-    except BaseException:
-        for target, backup in reversed(restore):
-            if backup is None:
-                target.unlink(missing_ok=True)
-            elif backup.is_file():
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(backup, target)
-        raise
-    else:
-        shutil.rmtree(backup_root, ignore_errors=True)
+    atomic_write_json(config.active_path, active_payload)
     catalog["profiles"][selected]["source_generation_id"] = target_generation
     catalog["profiles"][selected]["last_delta_id"] = manifest["delta_id"]
+    if artifacts_required:
+        catalog["profiles"][selected]["artifact_inventory_digest"] = (
+            target_artifact_digest
+        )
+        catalog["profiles"][selected]["artifact_metadata_digest"] = (
+            target_artifact_metadata_digest
+        )
     save_catalog(home, catalog)
     return {
         "status": "applied",
@@ -2002,7 +2122,9 @@ def apply_delta(
         "target_source_generation_id": target_generation,
         "changes": len(manifest.get("changes", [])),
         "content_install": dict(install_stats),
-        "build": build,
+        "build": artifact_build or source_build,
+        "source_build": source_build,
+        "artifact_build": artifact_build,
         "history_coverage": active_payload["history_coverage"],
     }
 

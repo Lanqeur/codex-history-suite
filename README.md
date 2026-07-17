@@ -58,6 +58,33 @@ The generated prices are editable planning inputs. The preset records CNY 1/2 pe
 
 Completed builds return an actual `usage` summary for model input, provider-cached input, output, embedding tokens, response-cache hits, and CNY cost, plus `storage` totals for the active core components and the whole retained profile.
 
+## Referenced Files And Git Checkpoints
+
+Version 0.5.2 can preserve ordinary files named by absolute transcript paths and
+checkpoint referenced Git repositories without mixing source trees into the
+transcript database. Enable the reviewed artifact policy, inspect the zero-write
+plan, then run a zero-model artifact-only build:
+
+```bash
+python3 scripts/codex_history.py --profile default library artifact-plan \
+  --since 2026-07-10T00:00:00Z --json
+python3 scripts/codex_history.py --profile default library capture-artifacts \
+  --since 2026-07-10T00:00:00Z --json
+```
+
+The plan canonicalizes WSL/Windows path aliases, excludes the profile, Codex
+source homes, registered artifact roots, configured roots, and temporary
+storage, applies an extension allowlist and size limits, then deduplicates by
+SHA-256. A capture build copies the active SQLite authority, adds versioned
+Event/Evidence artifact observations, rebuilds artifact FTS, audits closure, and
+atomically promotes with zero summary or embedding calls.
+
+Normal Git clones use `git bundle --all`. Partial clones default to a network-free
+HEAD archive rather than silently downloading missing history; enabling network
+completion is explicit. Dirty repositories retain the history artifact plus a
+deterministic tracked-and-untracked worktree snapshot. Unchanged repository
+fingerprints reuse the existing checkpoint.
+
 ## Multiple Devices
 
 Version 0.4 adds canonical baselines plus generation-checked deltas. Give each machine a stable identity, create and transfer one complete baseline, then move only new content-addressed transcript chunks, artifacts, and model-cache entries:
@@ -82,7 +109,7 @@ python3 scripts/codex_history.py library list --json
 python3 scripts/codex_history.py library search 'release decision' --deep --json
 ```
 
-The next delta can use the previous delta as `--base`. Each delta contains the complete target source inventory but packages only blobs absent from its base generation. Stable evidence-based model cache keys are included by default, so the receiver can reproduce source-side consolidation without duplicate model charges. `apply-delta` requires the exact `library_id` and base source generation and rejects missing, out-of-order, cross-library, or tampered deltas before promotion.
+The next delta can use the previous delta as `--base`. Each delta contains the complete target source inventory and artifact mappings but packages only blobs absent from its base generation. Stable evidence-based model cache keys are included by default, so the receiver can reproduce source-side consolidation without duplicate model charges. `apply-delta` requires the exact `library_id` and a compatible source generation, and rejects missing, out-of-order, cross-library, or tampered deltas before promotion. An artifact-only delta remains actionable when its transcript generation is unchanged; it merges mappings and verifies CAS closure with zero model calls.
 
 Imported profiles are named from the source device and profile, with collision suffixes added automatically. A stable `library_id` recognizes later generations of the same library; a newer import updates that profile while preserving the prior generation under `backups/imports`. Every bundle entry is verified with SHA-256, unsafe archive paths are rejected, and immutable transcript chunks, artifacts, semantic files, and model-cache entries share a global content-addressed blob store through hard links when the filesystem permits it.
 
