@@ -14,6 +14,27 @@
 
 `codex-history-source://SOURCE_ID#line=N` is a portable source locator. `codex-history-artifact://sha256/DIGEST` identifies a CAS object independently of its original absolute path.
 
+## Conversation Exports
+
+`conversation` reconstructs normalized source events from snapshot chunk byte
+offsets; it does not rebuild message text from FTS or summarized knowledge rows.
+The `codex-history-conversation-export-v1` payload records the source ID, line,
+byte interval, event ID, content SHA-256, thread, turn, timestamp, and source
+event type for each exported item.
+
+Codex transcripts can represent one visible user or assistant message twice as
+both a `response_item` and an `event_msg`. The exporter prefers the visible
+`event_msg`, merges artifact references found only in its matching response
+item, and reports suppressed duplicates. Injected environment, permission,
+Skill, app, and plugin contexts are excluded unless `--include-internal` is set.
+Tool calls, tool outputs, and goal states are independent evidence and remain in
+source order by default.
+
+`--include-raw` embeds the complete normalized JSON event. Inline source images
+have already been replaced by content-addressed artifact URIs; `--embed-images`
+resolves available image objects and adds data URLs to make the export
+self-contained. These switches can substantially increase output size.
+
 ## Time
 
 - `occurred_start_at/end_at`: source-event time.

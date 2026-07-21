@@ -5,7 +5,7 @@
 Codex History Suite turns local Codex transcripts into a portable, evidence-first knowledge base. One core engine powers two Codex Skills:
 
 - `build-codex-history`: initialize, discover, plan, build, incrementally update, audit, migrate, repair, and back up.
-- `codex-history`: read-only progressive and federated search, context assembly, claim inspection, evidence trace, comparison, and artifact lookup.
+- `codex-history`: read-only progressive and federated search, context assembly, claim inspection, evidence trace, conversation-range export, comparison, and artifact lookup.
 
 The builder never edits source transcripts. It snapshots them into fixed-size content-addressed chunks, externalizes inline images into an artifact CAS, preserves canonical raw events, derives turns and Evidence, builds SQLite FTS and optional Chroma embeddings, audits the staging database, and atomically promotes `active.json` only after success.
 
@@ -42,6 +42,34 @@ To install the CLI:
 python3 -m pip install .
 codex-history doctor
 ```
+
+## Original Conversation Evidence Viewer
+
+The knowledge layers are navigation aids, not a replacement for the original
+record. Version 0.6 can reconstruct selected conversations directly from the
+canonical snapshot and package them into a self-contained offline HTML viewer:
+
+```bash
+# Find thread IDs by title or title fragment.
+python3 scripts/codex_history.py conversation 'payment callback' --list
+
+# Export human turns 4 through 12 with visible messages, tool calls, and goals.
+python3 scripts/codex_history.py conversation THREAD_ID --turn-range 4:12 \
+  --include-raw --embed-images -o payment-evidence.html
+
+# Combine every thread in a scope, constrained by event time.
+python3 scripts/codex_history.py conversation --scope FAMILY_ID \
+  --since 2026-06-01 --until 2026-06-30 -o family-evidence.html
+```
+
+The viewer works without a server or network connection. It supports thread,
+text, role, and time filtering; incremental rendering for long exports; exact
+event provenance; evidence selection and drag ordering; and exporting the
+chosen sequence as HTML, Markdown, or JSON. By default it omits injected
+environment/plugin context and leaves images as content-addressed references.
+Use `--include-internal`, `--include-raw`, or `--embed-images` only when that
+extra audit depth or portability is needed. No model call or knowledge-base
+rebuild is required.
 
 New profiles use a model-first two-stage preset: non-thinking `deepseek-v4-flash` reduces the token-heavy new evidence into append-only ledgers, then non-thinking `qwen3.7-max` updates the much smaller thread/family overviews. When `DASHSCOPE_API_KEY` is unavailable, deterministic evidence is still ingested, but the library is explicitly marked `pending_model_consolidation`. This is a searchable emergency fallback, not a finished summary layer; a later model-enabled `update` completes the backlog even when no transcript changed.
 

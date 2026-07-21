@@ -1,6 +1,6 @@
 ---
 name: codex-history
-description: Retrieve, compare, and trace the user's local Codex conversation history from one or multiple Codex History Suite profiles. Use when work depends on prior decisions, unresolved tasks, failures and recoveries, verified capabilities, collaboration preferences, branch-family differences, exact historical tool calls, evidence IDs, overview claims, or files preserved in the artifact CAS. This Skill is read-only.
+description: Retrieve, compare, trace, and export the user's local Codex conversation history from one or multiple Codex History Suite profiles. Use when work depends on prior decisions, unresolved tasks, failures and recoveries, verified capabilities, collaboration preferences, branch-family differences, exact historical messages or tool calls, evidence IDs, overview claims, reviewable conversation ranges, or files preserved in the artifact CAS. This Skill is read-only.
 ---
 
 # Codex History
@@ -15,7 +15,8 @@ Use progressive disclosure over the active local SQLite/Chroma knowledge base. R
 4. Use `--time-match contained` for work fully within a window, `overlaps` for cross-period research, and `--as-of` for historical validity.
 5. Run `claims SCOPE_OR_OVERVIEW_ID` to inspect sentence-level support.
 6. Run `trace RECORD_OR_EVIDENCE_ID` before relying on consequential completion, failure, decision, or tool-output claims. Use `--raw` only when summarized evidence is insufficient.
-7. Use `artifacts` for content-addressed historical files and images.
+7. Use `conversation` when the user or another agent needs to inspect, combine, or share a bounded sequence of original messages and tool evidence. Start with `--list`, then constrain the export by thread/scope, turn range, or event time.
+8. Use `artifacts` for content-addressed historical files and images.
 
 ## Commands
 
@@ -27,10 +28,15 @@ python3 ../../scripts/codex_history.py search '部署 -支付' --recent 30d
 python3 ../../scripts/codex_history.py claims SCOPE_OR_OVERVIEW_ID
 python3 ../../scripts/codex_history.py trace RECORD_OR_EVIDENCE_ID
 python3 ../../scripts/codex_history.py artifacts test_agent_workflow_contracts.py
+python3 ../../scripts/codex_history.py conversation '会话标题关键词' --list
+python3 ../../scripts/codex_history.py conversation THREAD_ID --turn-range 4:12 --include-raw --embed-images -o evidence.html
+python3 ../../scripts/codex_history.py conversation --scope FAMILY_ID --since 2026-06-01 --until 2026-06-30 -o family-evidence.html
 python3 ../../scripts/codex_history.py stats
 ```
 
 Add `--json` for programmatic filtering. If no active build exists, stop and direct the user to explicitly invoke `$build-codex-history`; do not initialize or update from this read-only Skill.
+
+Conversation export defaults to visible user/assistant messages plus tool and goal events. It suppresses duplicate Codex event representations and injected environment/plugin context. Add `--include-internal` only when internal context is material, `--include-raw` for the complete normalized source event, and `--embed-images` for a self-contained cross-device viewer. Prefer a bounded export over an entire large thread. The offline viewer lets a human filter, select, reorder, and export an evidence sequence as HTML, Markdown, or JSON.
 
 For cross-device questions, start with the read-only federated command. Omit `--from` to search every enabled library, or repeat it to constrain the authorities:
 

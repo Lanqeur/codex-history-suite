@@ -1,0 +1,415 @@
+from __future__ import annotations
+
+import json
+from typing import Any
+
+
+def _json_for_script(value: Any) -> str:
+    return (
+        json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        .replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
+def render_conversation_html(payload: dict[str, Any]) -> str:
+    title = str(payload.get("title") or "Codex conversation evidence")
+    safe_title = (
+        title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    )
+    data = _json_for_script(payload)
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'none'; font-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>{safe_title}</title>
+  <style>
+    :root {{
+      color-scheme: dark;
+      --bg: #111315;
+      --panel: #171a1d;
+      --panel-2: #1d2124;
+      --line: #34393d;
+      --line-soft: #282d30;
+      --text: #ecebea;
+      --muted: #9ca1a5;
+      --faint: #71777b;
+      --accent: #e86f51;
+      --accent-soft: #3b2823;
+      --user: #243139;
+      --tool: #1a211d;
+      --goal: #2d281a;
+      --green: #77b58a;
+      --blue: #79a8c5;
+      --amber: #d5aa5d;
+      --danger: #d87373;
+      --header-h: 58px;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }}
+    * {{ box-sizing: border-box; }}
+    html, body {{ margin: 0; min-height: 100%; background: var(--bg); color: var(--text); }}
+    body {{ overflow: hidden; }}
+    button, input {{ font: inherit; }}
+    button {{ color: inherit; }}
+    .icon {{ width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; pointer-events: none; }}
+    .app-header {{
+      height: var(--header-h); display: flex; align-items: center; gap: 14px; padding: 0 16px;
+      border-bottom: 1px solid var(--line); background: #151719;
+    }}
+    .brand {{ min-width: 0; flex: 1; }}
+    .brand h1 {{ margin: 0; font-size: 15px; line-height: 1.25; font-weight: 650; letter-spacing: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    .brand-meta {{ margin-top: 3px; color: var(--muted); font-size: 11px; letter-spacing: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    .header-actions {{ flex: 0 0 auto; display: flex; gap: 7px; align-items: center; }}
+    .icon-btn, .command-btn {{
+      border: 1px solid var(--line); background: var(--panel-2); min-height: 34px; border-radius: 6px;
+      display: inline-flex; align-items: center; justify-content: center; gap: 7px; cursor: pointer;
+    }}
+    .icon-btn {{ width: 34px; padding: 0; }}
+    .command-btn {{ padding: 0 11px; font-size: 12px; }}
+    .icon-btn:hover, .command-btn:hover {{ border-color: #596065; background: #252a2d; }}
+    .icon-btn:focus-visible, .command-btn:focus-visible, input:focus-visible, .thread-item:focus-visible {{ outline: 2px solid var(--accent); outline-offset: 2px; }}
+    .workspace {{ height: calc(100vh - var(--header-h)); display: grid; grid-template-columns: 252px minmax(0, 1fr) 326px; }}
+    .sidebar, .evidence-tray {{ min-height: 0; background: var(--panel); }}
+    .sidebar {{ border-right: 1px solid var(--line); display: flex; flex-direction: column; }}
+    .sidebar-head, .tray-head {{ height: 48px; padding: 0 12px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line-soft); }}
+    .section-title {{ margin: 0; font-size: 12px; font-weight: 650; letter-spacing: 0; color: #d8d7d5; }}
+    .count {{ color: var(--faint); font: 11px ui-monospace, SFMono-Regular, Consolas, monospace; }}
+    .thread-list {{ overflow: auto; padding: 8px; }}
+    .thread-item {{
+      width: 100%; text-align: left; border: 1px solid transparent; border-radius: 6px; background: transparent;
+      padding: 9px 10px; margin: 0 0 3px; cursor: pointer; display: block;
+    }}
+    .thread-item:hover {{ background: #202427; }}
+    .thread-item.active {{ background: var(--accent-soft); border-color: #684035; }}
+    .thread-title {{ font-size: 12px; line-height: 1.45; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; }}
+    .thread-meta {{ margin-top: 5px; color: var(--muted); font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; }}
+    .main {{ min-width: 0; min-height: 0; display: grid; grid-template-rows: auto auto minmax(0, 1fr); }}
+    .filters {{ padding: 10px 14px; border-bottom: 1px solid var(--line-soft); background: #15181a; display: grid; grid-template-columns: minmax(180px, 1fr) auto; gap: 10px; align-items: center; }}
+    .mobile-thread-select {{ display: none; width: 100%; height: 35px; padding: 0 9px; border-radius: 6px; border: 1px solid var(--line); background: #101214; color: var(--text); }}
+    .search-wrap {{ position: relative; }}
+    .search-wrap .icon {{ position: absolute; left: 10px; top: 9px; color: var(--muted); }}
+    .search {{ width: 100%; height: 35px; padding: 0 10px 0 34px; border-radius: 6px; border: 1px solid var(--line); background: #101214; color: var(--text); }}
+    .role-filters {{ display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }}
+    .role-chip {{ position: relative; }}
+    .role-chip input {{ position: absolute; opacity: 0; pointer-events: none; }}
+    .role-chip span {{ display: block; padding: 7px 9px; border: 1px solid var(--line); border-radius: 5px; color: var(--muted); font-size: 11px; cursor: pointer; }}
+    .role-chip input:checked + span {{ color: var(--text); border-color: #63696d; background: var(--panel-2); }}
+    .range-row {{ min-height: 43px; display: flex; gap: 8px; align-items: center; padding: 7px 14px; border-bottom: 1px solid var(--line-soft); background: #131517; }}
+    .range-row input {{ height: 30px; min-width: 0; color: var(--muted); background: var(--panel); border: 1px solid var(--line); border-radius: 5px; padding: 0 7px; font-size: 11px; }}
+    .range-label {{ color: var(--faint); font-size: 10px; }}
+    .result-summary {{ margin-left: auto; color: var(--muted); font: 11px ui-monospace, SFMono-Regular, Consolas, monospace; white-space: nowrap; }}
+    .timeline {{ min-height: 0; overflow: auto; scroll-behavior: smooth; }}
+    .timeline-inner {{ width: min(100%, 980px); margin: 0 auto; padding: 12px 18px 80px; }}
+    .thread-banner {{ padding: 10px 0 13px; border-bottom: 1px solid var(--line-soft); margin-bottom: 5px; }}
+    .thread-banner h2 {{ margin: 0; font-size: 14px; font-weight: 650; letter-spacing: 0; overflow-wrap: anywhere; }}
+    .thread-banner p {{ margin: 5px 0 0; color: var(--muted); font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap: anywhere; }}
+    .message {{ display: grid; grid-template-columns: 26px minmax(0, 1fr); gap: 9px; padding: 12px 5px; border-bottom: 1px solid var(--line-soft); }}
+    .message.user {{ background: var(--user); border-radius: 6px; border-bottom-color: transparent; margin: 7px 0; padding: 12px; }}
+    .message.tool_call, .message.tool_output {{ background: var(--tool); border-left: 2px solid var(--green); padding-left: 11px; }}
+    .message.goal {{ background: var(--goal); border-left: 2px solid var(--amber); padding-left: 11px; }}
+    .select-cell {{ padding-top: 1px; }}
+    .select-cell input {{ accent-color: var(--accent); width: 15px; height: 15px; cursor: pointer; }}
+    .message-head {{ min-width: 0; display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }}
+    .role-name {{ font-size: 11px; font-weight: 700; text-transform: uppercase; color: var(--muted); }}
+    .user .role-name {{ color: var(--blue); }}
+    .assistant .role-name {{ color: #d8d7d5; }}
+    .tool_call .role-name, .tool_output .role-name {{ color: var(--green); }}
+    .goal .role-name {{ color: var(--amber); }}
+    .message-time {{ color: var(--faint); font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; }}
+    .message-tools {{ margin-left: auto; display: flex; gap: 3px; }}
+    .mini-btn {{ width: 27px; height: 27px; border: 0; background: transparent; color: var(--muted); border-radius: 5px; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; }}
+    .mini-btn:hover {{ color: var(--text); background: #2b3033; }}
+    .message-body {{ position: relative; min-width: 0; }}
+    .message-content {{ margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 13px/1.62 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; letter-spacing: 0; }}
+    .message-content.clamped {{ max-height: 340px; overflow: hidden; }}
+    .message-content.clamped::after {{ content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 56px; background: linear-gradient(transparent, var(--bg)); pointer-events: none; }}
+    .user .message-content.clamped::after {{ background: linear-gradient(transparent, var(--user)); }}
+    .tool_call .message-content.clamped::after, .tool_output .message-content.clamped::after {{ background: linear-gradient(transparent, var(--tool)); }}
+    .expand-btn {{ margin-top: 8px; border: 0; color: var(--blue); background: transparent; padding: 0; font-size: 11px; cursor: pointer; }}
+    .provenance {{ margin-top: 9px; color: var(--faint); font: 10px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap: anywhere; }}
+    .raw {{ margin-top: 9px; border-top: 1px solid var(--line-soft); padding-top: 8px; }}
+    .raw summary {{ color: var(--muted); font-size: 11px; cursor: pointer; }}
+    .raw pre {{ white-space: pre-wrap; overflow-wrap: anywhere; font: 10px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; color: #b8bcbe; }}
+    .attachments {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 8px; margin-top: 10px; }}
+    .attachment {{ margin: 0; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; background: #0d0f10; }}
+    .attachment img {{ width: 100%; display: block; max-height: 360px; object-fit: contain; }}
+    .attachment figcaption {{ padding: 6px 8px; color: var(--muted); font: 9px ui-monospace, SFMono-Regular, Consolas, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    .load-more {{ width: 100%; height: 38px; margin-top: 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); cursor: pointer; }}
+    .empty {{ padding: 60px 20px; text-align: center; color: var(--muted); font-size: 12px; }}
+    .evidence-tray {{ border-left: 1px solid var(--line); display: grid; grid-template-rows: 48px auto minmax(0, 1fr) auto; }}
+    .tray-actions {{ display: flex; gap: 5px; padding: 8px 10px; border-bottom: 1px solid var(--line-soft); }}
+    .tray-actions .command-btn {{ flex: 1; padding: 0 7px; }}
+    .selection-list {{ min-height: 0; overflow: auto; padding: 8px; }}
+    .selection-item {{ display: grid; grid-template-columns: 20px minmax(0, 1fr) auto; gap: 7px; align-items: start; padding: 8px; border: 1px solid var(--line-soft); border-radius: 6px; margin-bottom: 6px; background: #141719; }}
+    .selection-item.dragging {{ opacity: .45; }}
+    .drag-handle {{ color: var(--faint); cursor: grab; padding-top: 2px; }}
+    .selection-copy {{ min-width: 0; }}
+    .selection-copy strong {{ display: block; font-size: 10px; color: var(--muted); }}
+    .selection-copy p {{ margin: 4px 0 0; font: 10px/1.4 ui-monospace, SFMono-Regular, Consolas, monospace; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; overflow-wrap: anywhere; }}
+    .selection-controls {{ display: grid; grid-template-columns: repeat(3, 27px); gap: 2px; }}
+    .selection-controls button:disabled {{ opacity: .25; cursor: default; }}
+    .tray-footer {{ padding: 9px 10px; border-top: 1px solid var(--line-soft); display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; }}
+    .tray-footer .command-btn {{ padding: 0 5px; }}
+    .mobile-only {{ display: none; }}
+    @media (max-width: 1080px) {{
+      .workspace {{ grid-template-columns: 224px minmax(0, 1fr); }}
+      .evidence-tray {{ position: fixed; z-index: 20; right: 0; top: var(--header-h); bottom: 0; width: min(360px, 92vw); transform: translateX(100%); transition: transform .18s ease; box-shadow: -14px 0 32px #0008; }}
+      body.tray-open .evidence-tray {{ transform: translateX(0); }}
+      .mobile-only {{ display: inline-flex; }}
+    }}
+    @media (max-width: 720px) {{
+      body {{ overflow: auto; }}
+      .app-header {{ position: sticky; top: 0; z-index: 12; }}
+      .workspace {{ height: calc(100dvh - var(--header-h)); grid-template-columns: 1fr; }}
+      .sidebar {{ display: none; }}
+      .filters {{ grid-template-columns: 1fr; }}
+      .mobile-thread-select {{ display: block; }}
+      .role-filters {{ justify-content: flex-start; overflow-x: auto; flex-wrap: nowrap; }}
+      .range-row {{ flex-wrap: wrap; }}
+      .result-summary {{ width: 100%; margin-left: 0; }}
+      .timeline-inner {{ padding: 8px 10px 70px; }}
+      .command-label {{ display: none; }}
+      .command-btn {{ width: 34px; padding: 0; }}
+    }}
+    @media print {{
+      body {{ overflow: visible; background: white; color: black; }}
+      .app-header, .sidebar, .filters, .range-row, .evidence-tray, .select-cell, .message-tools, .load-more {{ display: none !important; }}
+      .workspace, .main {{ display: block; height: auto; }}
+      .timeline {{ overflow: visible; }}
+      .timeline-inner {{ width: 100%; padding: 0; }}
+      .message, .message.user, .message.tool_call, .message.tool_output, .message.goal {{ background: white; color: black; border-color: #bbb; break-inside: avoid; }}
+      .message-content.clamped {{ max-height: none; }}
+      .message-content.clamped::after {{ display: none; }}
+    }}
+  </style>
+</head>
+<body>
+  <svg width="0" height="0" aria-hidden="true" style="position:absolute"><defs>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></symbol>
+    <symbol id="i-panel" viewBox="0 0 24 24"><rect width="18" height="18" x="3" y="3" rx="2"></rect><path d="M15 3v18"></path></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"></path></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect width="14" height="14" x="8" y="8" rx="2"></rect><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"></path></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><path d="m7 10 5 5 5-5"></path><path d="M12 15V3"></path></symbol>
+    <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.5.5l2-2a5 5 0 0 0-7.1-7.1l-1.1 1.1"></path><path d="M14 11a5 5 0 0 0-7.5-.5l-2 2a5 5 0 0 0 7.1 7.1l1.1-1.1"></path></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18"></path><path d="M8 6V4h8v2"></path><path d="m19 6-1 14H6L5 6"></path></symbol>
+    <symbol id="i-grip" viewBox="0 0 24 24"><circle cx="9" cy="12" r="1"></circle><circle cx="9" cy="5" r="1"></circle><circle cx="9" cy="19" r="1"></circle><circle cx="15" cy="12" r="1"></circle><circle cx="15" cy="5" r="1"></circle><circle cx="15" cy="19" r="1"></circle></symbol>
+    <symbol id="i-printer" viewBox="0 0 24 24"><path d="M6 9V2h12v7"></path><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"></path><rect width="12" height="8" x="6" y="14"></rect></symbol>
+    <symbol id="i-up" viewBox="0 0 24 24"><path d="m18 15-6-6-6 6"></path></symbol>
+    <symbol id="i-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"></path></symbol>
+  </defs></svg>
+  <header class="app-header">
+    <div class="brand"><h1 id="app-title"></h1><div class="brand-meta" id="brand-meta"></div></div>
+    <div class="header-actions">
+      <button class="icon-btn mobile-only" id="toggle-tray" title="证据集合" aria-label="证据集合"><svg class="icon"><use href="#i-panel"></use></svg></button>
+      <button class="command-btn" id="print-page" title="打印当前视图"><svg class="icon"><use href="#i-printer"></use></svg><span class="command-label">打印</span></button>
+    </div>
+  </header>
+  <div class="workspace">
+    <aside class="sidebar">
+      <div class="sidebar-head"><h2 class="section-title">会话</h2><span class="count" id="thread-count"></span></div>
+      <nav class="thread-list" id="thread-list"></nav>
+    </aside>
+    <main class="main">
+      <div class="filters">
+        <select class="mobile-thread-select" id="mobile-thread" aria-label="选择会话"></select>
+        <label class="search-wrap"><svg class="icon"><use href="#i-search"></use></svg><input class="search" id="search" type="search" placeholder="搜索消息、工具或事件 ID" autocomplete="off"></label>
+        <div class="role-filters" id="role-filters"></div>
+      </div>
+      <div class="range-row">
+        <span class="range-label">时间</span><input id="since" type="datetime-local" title="开始时间"><span class="range-label">至</span><input id="until" type="datetime-local" title="结束时间">
+        <button class="command-btn" id="add-visible" title="把当前可见消息加入证据集合"><svg class="icon"><use href="#i-check"></use></svg><span class="command-label">加入可见项</span></button>
+        <span class="result-summary" id="result-summary"></span>
+      </div>
+      <section class="timeline" id="timeline"><div class="timeline-inner" id="timeline-inner"></div></section>
+    </main>
+    <aside class="evidence-tray" id="evidence-tray">
+      <div class="tray-head"><h2 class="section-title">证据集合</h2><span class="count" id="selection-count"></span></div>
+      <div class="tray-actions">
+        <button class="command-btn" id="copy-md" title="复制 Markdown"><svg class="icon"><use href="#i-copy"></use></svg><span>Markdown</span></button>
+        <button class="command-btn" id="clear-selection" title="清空集合"><svg class="icon"><use href="#i-trash"></use></svg><span>清空</span></button>
+      </div>
+      <div class="selection-list" id="selection-list"></div>
+      <div class="tray-footer">
+        <button class="command-btn" data-export="json" title="导出 JSON"><svg class="icon"><use href="#i-download"></use></svg><span>JSON</span></button>
+        <button class="command-btn" data-export="md" title="导出 Markdown"><svg class="icon"><use href="#i-download"></use></svg><span>MD</span></button>
+        <button class="command-btn" data-export="html" title="导出 HTML"><svg class="icon"><use href="#i-download"></use></svg><span>HTML</span></button>
+      </div>
+    </aside>
+  </div>
+  <script id="codex-history-data" type="application/json">{data}</script>
+  <script>
+  (() => {{
+    'use strict';
+    const dataset = JSON.parse(document.getElementById('codex-history-data').textContent);
+    const byId = new Map(dataset.messages.map(message => [message.id, message]));
+    const threadById = new Map(dataset.threads.map(thread => [thread.thread_id, thread]));
+    const roleLabels = {{user:'USER',assistant:'ASSISTANT',tool_call:'TOOL CALL',tool_output:'TOOL OUTPUT',goal:'GOAL'}};
+    const roleOrder = ['user','assistant','tool_call','tool_output','goal'];
+    const storageKey = `codex-history-evidence:${{dataset.export_id}}`;
+    const state = {{
+      thread: 'all', search: '', roles: new Set(roleOrder), since: '', until: '',
+      selection: loadSelection(), visibleLimit: 140, filtered: [], expanded: new Set()
+    }};
+    const dom = Object.fromEntries(['app-title','brand-meta','thread-count','thread-list','mobile-thread','search','role-filters','since','until','result-summary','timeline','timeline-inner','selection-count','selection-list','toggle-tray','print-page','add-visible','copy-md','clear-selection'].map(id => [id.replaceAll('-','_'), document.getElementById(id)]));
+
+    function loadSelection() {{
+      try {{ return JSON.parse(localStorage.getItem(storageKey) || '[]').filter(id => byId.has(id)); }}
+      catch (_) {{ return []; }}
+    }}
+    function saveSelection() {{ try {{ localStorage.setItem(storageKey, JSON.stringify(state.selection)); }} catch (_) {{}} }}
+    function el(tag, className, text) {{
+      const node = document.createElement(tag); if (className) node.className = className;
+      if (text !== undefined) node.textContent = text; return node;
+    }}
+    function svg(name) {{
+      const icon = document.createElementNS('http://www.w3.org/2000/svg','svg'); icon.setAttribute('class','icon');
+      const use = document.createElementNS('http://www.w3.org/2000/svg','use'); use.setAttribute('href',`#i-${{name}}`); icon.append(use); return icon;
+    }}
+    function formatTime(value) {{
+      if (!value) return 'time unknown'; const date = new Date(value); if (Number.isNaN(date.valueOf())) return value;
+      return new Intl.DateTimeFormat('zh-CN',{{year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}}).format(date);
+    }}
+    function short(value, size=12) {{ return value ? value.slice(0,size) : 'none'; }}
+    function activeMessages() {{
+      const query = state.search.trim().toLocaleLowerCase();
+      const since = state.since ? new Date(state.since).valueOf() : null;
+      const until = state.until ? new Date(state.until).valueOf() : null;
+      return dataset.messages.filter(message => {{
+        if (state.thread !== 'all' && message.thread_id !== state.thread) return false;
+        if (!state.roles.has(message.role)) return false;
+        const time = message.timestamp ? new Date(message.timestamp).valueOf() : null;
+        if (since !== null && (time === null || time < since)) return false;
+        if (until !== null && (time === null || time > until)) return false;
+        if (query) {{
+          const thread = threadById.get(message.thread_id);
+          const haystack = `${{message.content}} ${{message.tool_name}} ${{message.event_id}} ${{thread?.title || ''}}`.toLocaleLowerCase();
+          if (!haystack.includes(query)) return false;
+        }}
+        return true;
+      }});
+    }}
+    function renderThreads() {{
+      dom.thread_list.replaceChildren();
+      const all = threadButton({{thread_id:'all',title:'全部会话',message_count:dataset.messages.length}}, true); dom.thread_list.append(all);
+      dataset.threads.forEach(thread => dom.thread_list.append(threadButton(thread,false)));
+      dom.mobile_thread.replaceChildren();
+      [{{thread_id:'all',title:'全部会话'}},...dataset.threads].forEach(thread => {{ const option=el('option','',thread.title); option.value=thread.thread_id; option.selected=state.thread===thread.thread_id; dom.mobile_thread.append(option); }});
+      dom.thread_count.textContent = String(dataset.threads.length);
+    }}
+    function threadButton(thread, isAll) {{
+      const button = el('button',`thread-item${{state.thread===thread.thread_id?' active':''}}`); button.type='button';
+      button.append(el('span','thread-title',thread.title));
+      const count = isAll ? dataset.messages.length : thread.message_count;
+      button.append(el('span','thread-meta',`${{count}} events${{isAll?'':` · ${{short(thread.thread_id)}}`}}`));
+      button.addEventListener('click',() => {{ state.thread=thread.thread_id; state.visibleLimit=140; renderAll(); }});
+      return button;
+    }}
+    function renderRoles() {{
+      dom.role_filters.replaceChildren();
+      roleOrder.forEach(role => {{
+        const label=el('label','role-chip'); const input=document.createElement('input'); input.type='checkbox'; input.checked=state.roles.has(role);
+        input.addEventListener('change',() => {{ input.checked?state.roles.add(role):state.roles.delete(role); state.visibleLimit=140; renderTimeline(); }});
+        label.append(input,el('span','',roleLabels[role])); dom.role_filters.append(label);
+      }});
+    }}
+    function renderTimeline() {{
+      const messages=activeMessages(); state.filtered=messages; dom.timeline_inner.replaceChildren();
+      const current=state.thread==='all'?null:threadById.get(state.thread);
+      const banner=el('div','thread-banner'); banner.append(el('h2','',current?.title || '全部会话'));
+      banner.append(el('p','',current?`${{current.thread_id}} · ${{current.first_activity_at || 'unknown'}} .. ${{current.last_activity_at || 'unknown'}}`:`${{dataset.threads.length}} threads · ${{dataset.export_id}}`));
+      dom.timeline_inner.append(banner);
+      dom.result_summary.textContent=`${{Math.min(messages.length,state.visibleLimit)}} / ${{messages.length}}`;
+      if (!messages.length) {{ dom.timeline_inner.append(el('div','empty','没有匹配的消息')); return; }}
+      messages.slice(0,state.visibleLimit).forEach(message => dom.timeline_inner.append(messageNode(message)));
+      if (state.visibleLimit < messages.length) {{
+        const more=el('button','load-more',`继续加载 ${{Math.min(140,messages.length-state.visibleLimit)}} 条`); more.type='button';
+        more.addEventListener('click',() => {{ state.visibleLimit+=140; renderTimeline(); }}); dom.timeline_inner.append(more);
+      }}
+      const anchor=decodeURIComponent(location.hash.slice(1)); if (anchor && byId.has(anchor)) requestAnimationFrame(() => document.getElementById(anchor)?.scrollIntoView({{block:'center'}}));
+    }}
+    function messageNode(message) {{
+      const article=el('article',`message ${{message.role}}`); article.id=message.id;
+      const selectCell=el('div','select-cell'); const checkbox=document.createElement('input'); checkbox.type='checkbox'; checkbox.checked=state.selection.includes(message.id); checkbox.title='加入证据集合';
+      checkbox.addEventListener('change',() => toggleSelection(message.id,checkbox.checked)); selectCell.append(checkbox);
+      const body=el('div','message-body'); const head=el('div','message-head'); head.append(el('span','role-name',roleLabels[message.role] || message.role));
+      if (message.tool_name) head.append(el('span','message-time',message.tool_name));
+      head.append(el('span','message-time',formatTime(message.timestamp)));
+      const tools=el('div','message-tools'); const link=el('button','mini-btn'); link.type='button'; link.title='复制证据链接'; link.append(svg('link'));
+      link.addEventListener('click',async() => {{ location.hash=message.id; await navigator.clipboard?.writeText(location.href); }}); tools.append(link); head.append(tools);
+      const content=el('pre','message-content',message.content); const long=message.content.length>2400 || message.content.split('\\n').length>28;
+      if (long && !state.expanded.has(message.id)) content.classList.add('clamped');
+      body.append(head,content);
+      if (long) {{ const expand=el('button','expand-btn',state.expanded.has(message.id)?'收起':'展开全文'); expand.type='button'; expand.addEventListener('click',() => {{ state.expanded.has(message.id)?state.expanded.delete(message.id):state.expanded.add(message.id); renderTimeline(); }}); body.append(expand); }}
+      if (message.attachments?.length) {{
+        const attachments=el('div','attachments'); message.attachments.forEach(item => {{
+          const figure=el('figure','attachment'); if (item.available && item.data_url) {{ const image=document.createElement('img'); image.src=item.data_url; image.alt=`Image ${{short(item.sha256)}}`; figure.append(image); }}
+          figure.append(el('figcaption','',`${{item.available?'image':'missing'}} · ${{item.sha256}}`)); attachments.append(figure);
+        }}); body.append(attachments);
+      }}
+      body.append(el('div','provenance',`thread=${{short(message.thread_id)}} · turn=${{message.turn_number ?? 'n/a'}} · line=${{message.line_no}} · event=${{message.event_id}} · sha256=${{message.content_sha256}}`));
+      if (message.raw_event) {{ const details=el('details','raw'); const summary=el('summary','','Raw canonical event'); const pre=el('pre','',JSON.stringify(message.raw_event,null,2)); details.append(summary,pre); body.append(details); }}
+      article.append(selectCell,body); return article;
+    }}
+    function toggleSelection(id, enabled) {{
+      const exists=state.selection.includes(id); if (enabled&&!exists) state.selection.push(id); if (!enabled&&exists) state.selection=state.selection.filter(item=>item!==id);
+      saveSelection(); renderSelection();
+    }}
+    function moveSelection(from,to) {{ if (to<0 || to>=state.selection.length || from===to) return; const [moved]=state.selection.splice(from,1); state.selection.splice(to,0,moved); saveSelection(); renderSelection(); }}
+    function renderSelection() {{
+      dom.selection_list.replaceChildren(); dom.selection_count.textContent=String(state.selection.length);
+      state.selection.forEach((id,index) => {{
+        const message=byId.get(id); if (!message) return; const item=el('div','selection-item'); item.draggable=true; item.dataset.index=String(index);
+        const grip=el('span','drag-handle'); grip.append(svg('grip')); const copy=el('div','selection-copy'); copy.append(el('strong','',`${{index+1}} · ${{roleLabels[message.role]}} · ${{formatTime(message.timestamp)}}`),el('p','',message.content));
+        const controls=el('div','selection-controls'); const up=el('button','mini-btn'); up.type='button'; up.title='上移'; up.disabled=index===0; up.append(svg('up')); up.addEventListener('click',()=>moveSelection(index,index-1)); const down=el('button','mini-btn'); down.type='button'; down.title='下移'; down.disabled=index===state.selection.length-1; down.append(svg('down')); down.addEventListener('click',()=>moveSelection(index,index+1)); const remove=el('button','mini-btn'); remove.type='button'; remove.title='移除'; remove.append(svg('trash')); remove.addEventListener('click',()=>toggleSelection(id,false)); controls.append(up,down,remove); item.append(grip,copy,controls);
+        item.addEventListener('dragstart',event => {{ item.classList.add('dragging'); event.dataTransfer.setData('text/plain',String(index)); }}); item.addEventListener('dragend',()=>item.classList.remove('dragging'));
+        item.addEventListener('dragover',event=>event.preventDefault()); item.addEventListener('drop',event => {{ event.preventDefault(); const from=Number(event.dataTransfer.getData('text/plain')); const to=Number(item.dataset.index); if (Number.isNaN(from)) return; moveSelection(from,to); }});
+        dom.selection_list.append(item);
+      }});
+    }}
+    function selectedMessages() {{ return state.selection.map(id=>byId.get(id)).filter(Boolean); }}
+    function markdown(messages) {{
+      const lines=[`# ${{dataset.title}}`,'',`Export: ${{dataset.export_id}}`,''];
+      messages.forEach(message => {{ const thread=threadById.get(message.thread_id); lines.push(`## ${{roleLabels[message.role]}} · ${{formatTime(message.timestamp)}}`,'',`Thread: ${{thread?.title || message.thread_id}}`,'',message.content); (message.attachments || []).forEach(item => lines.push('',`Attachment: ${{item.uri}} (${{item.available?'embedded':'not embedded'}})`)); lines.push('',`Evidence: thread=${{message.thread_id}} turn=${{message.turn_number ?? 'n/a'}} line=${{message.line_no}} event=${{message.event_id}} sha256=${{message.content_sha256}}`,''); }}); return lines.join('\\n');
+    }}
+    function download(name,mime,content) {{ const blob=new Blob([content],{{type:mime}}); const url=URL.createObjectURL(blob); const link=document.createElement('a'); link.href=url; link.download=name; link.click(); setTimeout(()=>URL.revokeObjectURL(url),1000); }}
+    function escapeHtml(value) {{ return String(value).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;'); }}
+    function selectionHtml(messages) {{
+      const rows=messages.map(message=>{{ const thread=threadById.get(message.thread_id); const images=(message.attachments || []).filter(item=>item.available&&item.data_url).map(item=>`<figure><img src="${{escapeHtml(item.data_url)}}" alt="${{escapeHtml(item.sha256)}}"><figcaption>${{escapeHtml(item.uri)}}</figcaption></figure>`).join(''); const raw=message.raw_event?`<details><summary>Raw canonical event</summary><pre>${{escapeHtml(JSON.stringify(message.raw_event,null,2))}}</pre></details>`:''; return `<article><h2>${{escapeHtml(roleLabels[message.role])}} <small>${{escapeHtml(formatTime(message.timestamp))}}</small></h2><p class="thread">${{escapeHtml(thread?.title || message.thread_id)}}</p><pre>${{escapeHtml(message.content)}}</pre>${{images}}${{raw}}<footer>thread=${{escapeHtml(message.thread_id)}} · turn=${{message.turn_number ?? 'n/a'}} · line=${{message.line_no}} · event=${{escapeHtml(message.event_id)}} · sha256=${{escapeHtml(message.content_sha256)}}</footer></article>`; }}).join('');
+      return `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${{escapeHtml(dataset.title)}}</title><style>body{{max-width:920px;margin:auto;padding:24px;background:#111315;color:#ecebea;font-family:system-ui}}article{{padding:18px 0;border-bottom:1px solid #34393d}}h1{{font-size:20px}}h2{{font-size:13px}}small,footer,.thread,figcaption{{color:#9ca1a5;font:11px ui-monospace,monospace}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.6 ui-monospace,monospace}}img{{display:block;max-width:100%;max-height:720px;object-fit:contain}}figure{{margin:12px 0}}</style><body><h1>${{escapeHtml(dataset.title)}}</h1>${{rows}}</body></html>`;
+    }}
+    async function copyText(value) {{
+      if (!value) return;
+      if (navigator.clipboard?.writeText) {{ try {{ await navigator.clipboard.writeText(value); return; }} catch (_) {{}} }}
+      const area=document.createElement('textarea'); area.value=value; area.style.position='fixed'; area.style.opacity='0'; document.body.append(area); area.select(); document.execCommand('copy'); area.remove();
+    }}
+    function exportSelection(format) {{
+      const messages=selectedMessages(); if (!messages.length) return; const base=`${{dataset.export_id}}-selection`;
+      if (format==='json') download(`${{base}}.json`,'application/json',JSON.stringify({{schema_version:'codex-history-evidence-selection-v1',source_export_id:dataset.export_id,messages}},null,2));
+      if (format==='md') download(`${{base}}.md`,'text/markdown;charset=utf-8',markdown(messages));
+      if (format==='html') download(`${{base}}.html`,'text/html;charset=utf-8',selectionHtml(messages));
+    }}
+    function renderAll() {{ renderThreads(); renderRoles(); renderTimeline(); renderSelection(); }}
+
+    dom.app_title.textContent=dataset.title; dom.brand_meta.textContent=`${{dataset.statistics.threads}} threads · ${{dataset.statistics.messages}} events · ${{dataset.export_id}}`;
+    dom.mobile_thread.addEventListener('change',() => {{ state.thread=dom.mobile_thread.value; state.visibleLimit=140; renderAll(); }});
+    dom.search.addEventListener('input',() => {{ state.search=dom.search.value; state.visibleLimit=140; renderTimeline(); }});
+    dom.since.addEventListener('change',() => {{ state.since=dom.since.value; state.visibleLimit=140; renderTimeline(); }});
+    dom.until.addEventListener('change',() => {{ state.until=dom.until.value; state.visibleLimit=140; renderTimeline(); }});
+    dom.toggle_tray.addEventListener('click',()=>document.body.classList.toggle('tray-open'));
+    dom.print_page.addEventListener('click',()=>window.print());
+    dom.add_visible.addEventListener('click',() => {{ state.filtered.forEach(message => {{ if(!state.selection.includes(message.id)) state.selection.push(message.id); }}); saveSelection(); renderSelection(); }});
+    dom.clear_selection.addEventListener('click',() => {{ state.selection=[]; saveSelection(); renderSelection(); renderTimeline(); }});
+    dom.copy_md.addEventListener('click',()=>copyText(markdown(selectedMessages())));
+    document.querySelectorAll('[data-export]').forEach(button=>button.addEventListener('click',()=>exportSelection(button.dataset.export)));
+    window.addEventListener('hashchange',renderTimeline);
+    renderAll();
+  }})();
+  </script>
+</body>
+</html>
+"""

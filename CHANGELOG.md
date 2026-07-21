@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.0 - 2026-07-21
+
+- Add exact conversation-range reconstruction from canonical snapshot byte offsets, with Codex dual-write deduplication and per-event provenance.
+- Add thread/title/scope, turn-range, and timestamp selection with optional tool, goal, internal-context, raw-event, and embedded-image controls.
+- Add a self-contained Codex-style offline HTML evidence viewer with search, role and time filters, progressive rendering, evidence selection, drag ordering, and HTML/Markdown/JSON export.
+- Document original-conversation verification workflows in the read-only Skill and bilingual user guides.
+
 ## 0.5.2 - 2026-07-17
 
 - Add policy-gated absolute-path artifact discovery with WSL/Windows alias normalization, extension and size limits, automatic self-ingestion exclusions, and SHA-256 deduplication.

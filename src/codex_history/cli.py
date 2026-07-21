@@ -47,6 +47,7 @@ QUERY_COMMANDS = {
     "claims",
     "compare",
     "artifacts",
+    "conversation",
     "stats",
 }
 

@@ -1,6 +1,6 @@
 interface:
   display_name: "Codex History"
-  short_description: "Search and trace local Codex history with evidence"
-  default_prompt: "Use $codex-history to retrieve and trace relevant decisions from my local Codex history."
+  short_description: "Search, export, and trace Codex history with evidence"
+  default_prompt: "Use $codex-history to retrieve and trace relevant decisions, and export bounded original conversation evidence when useful."
 policy:
   allow_implicit_invocation: true

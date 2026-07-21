@@ -1388,6 +1388,66 @@ def command_artifacts(args: argparse.Namespace, connection: sqlite3.Connection) 
     return 0
 
 
+def command_conversation(args: argparse.Namespace, connection: sqlite3.Connection) -> int:
+    from .conversation import (
+        build_conversation_export,
+        list_threads,
+        parse_turn_range,
+        write_conversation_export,
+    )
+
+    selectors = [*args.selectors, *args.thread]
+    if args.list:
+        rows = list_threads(connection, selectors, limit=args.limit)
+        if args.json:
+            print(json.dumps({"threads": rows}, ensure_ascii=False, indent=2))
+        else:
+            for row in rows:
+                print(
+                    f"{row['thread_id']} | {row['last_activity_at'] or 'unknown'} | "
+                    f"turns={row['turn_count']} | {row['title']}"
+                )
+        return 0
+    if args.output is None:
+        raise SystemExit("conversation export requires --output PATH")
+    output_format = args.format or ("json" if args.output.suffix.lower() == ".json" else "html")
+    try:
+        payload = build_conversation_export(
+            connection,
+            SNAPSHOT_ROOT,
+            selectors=selectors,
+            scope_selectors=args.scope,
+            turn_range=parse_turn_range(args.turn_range),
+            since=args.since,
+            until=args.until,
+            include_tools=not args.no_tools,
+            include_goals=not args.no_goals,
+            include_internal=args.include_internal,
+            include_raw=args.include_raw,
+            embed_images=args.embed_images,
+            artifact_roots=ARTIFACT_ROOTS,
+            title=args.title,
+        )
+        report = write_conversation_export(
+            payload,
+            args.output,
+            output_format=output_format,
+            force=args.force,
+        )
+    except (FileExistsError, FileNotFoundError, ValueError, json.JSONDecodeError) as error:
+        raise SystemExit(str(error)) from error
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        print(f"Conversation export: {report['output']}")
+        print(
+            f"Format: {report['format']} | threads={report['threads']} | "
+            f"messages={report['messages']} | size={report['size_bytes']} bytes"
+        )
+        print(f"Roles: {compact_json(report['roles'])}")
+    return 0
+
+
 def command_stats(args: argparse.Namespace, connection: sqlite3.Connection) -> int:
     data = {
         "metadata": metadata(connection),
@@ -1594,6 +1654,52 @@ def build_parser() -> argparse.ArgumentParser:
     artifacts.add_argument("--limit", type=int, default=20)
     add_output_options(artifacts)
     artifacts.set_defaults(handler=command_artifacts)
+
+    conversation = subparsers.add_parser(
+        "conversation",
+        help="list or export original conversation ranges as portable evidence",
+    )
+    conversation.add_argument(
+        "selectors",
+        nargs="*",
+        help="thread ID, exact title, or title substring; multiple matches are combined",
+    )
+    conversation.add_argument(
+        "--thread", action="append", default=[],
+        help="additional thread ID or title selector; repeatable",
+    )
+    conversation.add_argument(
+        "--scope", action="append", default=[],
+        help="include every thread in this scope ID or title; repeatable",
+    )
+    conversation.add_argument("--list", action="store_true", help="list matching threads")
+    conversation.add_argument("--limit", type=int, default=100, help="maximum list results")
+    conversation.add_argument("-o", "--output", type=Path, default=None)
+    conversation.add_argument("--format", choices=("html", "json"), default="")
+    conversation.add_argument(
+        "--turn-range", default="",
+        help="inclusive 1-based range such as 4:12, 8, :20, or 30:",
+    )
+    conversation.add_argument("--since", default="", help="inclusive event timestamp lower bound")
+    conversation.add_argument("--until", default="", help="inclusive event timestamp upper bound")
+    conversation.add_argument("--no-tools", action="store_true", help="omit tool calls and outputs")
+    conversation.add_argument("--no-goals", action="store_true", help="omit goal state events")
+    conversation.add_argument(
+        "--include-internal", action="store_true",
+        help="include injected environment and plugin context messages",
+    )
+    conversation.add_argument(
+        "--include-raw", action="store_true",
+        help="embed complete normalized JSON events for source inspection",
+    )
+    conversation.add_argument(
+        "--embed-images", action="store_true",
+        help="embed referenced image artifacts into the portable HTML/JSON",
+    )
+    conversation.add_argument("--title", default="Codex conversation evidence")
+    conversation.add_argument("--force", action="store_true", help="replace an existing output")
+    conversation.add_argument("--json", action="store_true", help="emit a JSON operation report")
+    conversation.set_defaults(handler=command_conversation)
 
     stats = subparsers.add_parser("stats", help="show index health and counts")
     stats.add_argument("--json", action="store_true")
