@@ -105,6 +105,14 @@ Import `shared-history.zip` on both devices. Both now contain the same merged li
 
 This is symmetric offline convergence, not live file replication. Do not write directly into another machine's active SQLite or synchronize profile directories with a generic cloud drive while a build is running.
 
+## Native Session Restore
+
+An imported baseline or applied delta with canonical snapshot chunks can restore one source thread as a new native Codex session. Use `$restore-codex-session` and run `restore THREAD_ID --dry-run` before the stateful operation. Restoration reads the selected profile, materializes exact normalized events in temporary storage, rehydrates captured images under bounded deduplication rules, then asks the target Codex app-server to fork that path into its own session store.
+
+The receiver chooses a current `--cwd`; original paths remain provenance inside the historical transcript. The new session has a new native thread ID and never overwrites the imported profile, source snapshot, or an existing Codex thread. Bundles exported with `--artifacts none` retain the textual and tool trace but cannot restore image bytes. Legacy migrated authorities must first gain canonical snapshots through `hydrate-baseline` or a rebuild.
+
+Run the restore CLI in the same operating environment as the target Codex installation. Treat app-server path import as version-sensitive and keep the generated manifest under the target `CODEX_HOME/codex-history-restores` for provenance.
+
 ## Recovery
 
 - A failed verification installs nothing.

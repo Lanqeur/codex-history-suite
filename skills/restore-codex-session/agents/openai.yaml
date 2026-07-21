@@ -1,0 +1,6 @@
+interface:
+  display_name: "Restore Codex Session"
+  short_description: "Reopen an exact historical thread as native Codex"
+  default_prompt: "Use $restore-codex-session to dry-run and restore one historical thread as a new native Codex session."
+policy:
+  allow_implicit_invocation: false

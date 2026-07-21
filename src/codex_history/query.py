@@ -1456,6 +1456,61 @@ def command_conversation(args: argparse.Namespace, connection: sqlite3.Connectio
     return 0
 
 
+def command_restore(args: argparse.Namespace, connection: sqlite3.Connection) -> int:
+    from .session_restore import restore_native_thread
+
+    try:
+        report = restore_native_thread(
+            connection,
+            SNAPSHOT_ROOT,
+            selector=args.selector,
+            artifact_roots=ARTIFACT_ROOTS,
+            path_mappings=[
+                (item["original_prefix"], item["local_prefix"])
+                for item in PATH_MAPPINGS
+            ],
+            codex_home=args.codex_home,
+            codex_bin=args.codex_bin,
+            cwd=args.cwd,
+            title=args.title,
+            image_mode=args.image_mode,
+            max_image_bytes=int(args.max_image_mb * 1024 * 1024),
+            max_image_total_bytes=int(args.max_images_mb * 1024 * 1024),
+            max_transcript_bytes=int(args.max_transcript_mb * 1024 * 1024),
+            timeout=args.timeout,
+            dry_run=args.dry_run,
+        )
+    except (FileNotFoundError, RuntimeError, ValueError, json.JSONDecodeError) as error:
+        raise SystemExit(str(error)) from error
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+    if args.dry_run:
+        print(
+            f"Restore dry-run: {report['source']['thread_id']} | "
+            f"{report['source']['title']}"
+        )
+        print(
+            f"Materialized: {report['materialized']['size_human']} | "
+            f"lines={report['materialized']['line_count']} | "
+            f"images={compact_json(report['materialized']['images'])}"
+        )
+        print(
+            f"Target: {report['target']['codex_home']} | "
+            f"cwd={report['target']['cwd']} ({report['target']['cwd_basis']})"
+        )
+        print("Cost: CNY 0.00 (no model or embedding calls)")
+        return 0
+    restored = report["restored"]
+    print(f"Restored native Codex thread: {restored['thread_id']}")
+    print(f"Title: {restored['title']}")
+    print(f"Rollout: {restored['rollout_path']}")
+    print(f"Resume: {restored['cli_resume_command']}")
+    print(f"Open: {restored['desktop_deeplink']}")
+    print(f"Manifest: {report['restore_manifest']}")
+    return 0
+
+
 def command_stats(args: argparse.Namespace, connection: sqlite3.Connection) -> int:
     data = {
         "metadata": metadata(connection),
@@ -1720,6 +1775,78 @@ def build_parser() -> argparse.ArgumentParser:
     conversation.add_argument("--force", action="store_true", help="replace an existing output")
     conversation.add_argument("--json", action="store_true", help="emit a JSON operation report")
     conversation.set_defaults(handler=command_conversation)
+
+    restore = subparsers.add_parser(
+        "restore",
+        help="restore one historical thread as an independent native Codex session",
+    )
+    restore.add_argument(
+        "selector",
+        help="exact thread ID, exact title, or an unambiguous title substring",
+    )
+    restore.add_argument(
+        "--codex-home",
+        type=Path,
+        default=None,
+        help="target Codex home (default: CODEX_HOME or ~/.codex)",
+    )
+    restore.add_argument(
+        "--codex-bin",
+        type=Path,
+        default=None,
+        help="target Codex executable (default: codex on PATH)",
+    )
+    restore.add_argument(
+        "--cwd",
+        type=Path,
+        default=None,
+        help="working directory for the restored native thread",
+    )
+    restore.add_argument(
+        "--title",
+        default="",
+        help="native thread title (default: original title plus restored-history suffix)",
+    )
+    restore.add_argument(
+        "--image-mode",
+        choices=("deduplicated", "none", "all", "stored"),
+        default="deduplicated",
+        help="restore unique images once, omit them, inline all, or keep CAS URIs",
+    )
+    restore.add_argument(
+        "--max-image-mb",
+        type=float,
+        default=2.0,
+        metavar="MIB",
+        help="maximum decoded size per restored image (default: 2 MiB)",
+    )
+    restore.add_argument(
+        "--max-images-mb",
+        type=float,
+        default=25.0,
+        metavar="MIB",
+        help="maximum combined decoded image bytes (default: 25 MiB)",
+    )
+    restore.add_argument(
+        "--max-transcript-mb",
+        type=float,
+        default=256.0,
+        metavar="MIB",
+        help="maximum native transcript size (default: 256 MiB)",
+    )
+    restore.add_argument(
+        "--timeout",
+        type=float,
+        default=60.0,
+        help="app-server response timeout in seconds",
+    )
+    restore.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="materialize and inspect in temporary storage without creating a Codex thread",
+    )
+    restore.add_argument("--json", action="store_true", help="emit a JSON operation report")
+    restore.set_defaults(handler=command_restore)
 
     stats = subparsers.add_parser("stats", help="show index health and counts")
     stats.add_argument("--json", action="store_true")

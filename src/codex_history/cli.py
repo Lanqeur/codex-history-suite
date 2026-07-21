@@ -48,6 +48,7 @@ QUERY_COMMANDS = {
     "compare",
     "artifacts",
     "conversation",
+    "restore",
     "stats",
 }
 

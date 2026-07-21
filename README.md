@@ -2,10 +2,11 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-Codex History Suite turns local Codex transcripts into a portable, evidence-first knowledge base. One core engine powers two Codex Skills:
+Codex History Suite turns local Codex transcripts into a portable, evidence-first knowledge base. One core engine powers three Codex Skills:
 
 - `build-codex-history`: initialize, discover, plan, build, incrementally update, audit, migrate, repair, and back up.
 - `codex-history`: read-only progressive and federated search, context assembly, claim inspection, evidence trace, conversation-range export, comparison, and artifact lookup.
+- `restore-codex-session`: restore one canonical historical thread as a new native Codex session that can be resumed and continued.
 
 The builder never edits source transcripts. It snapshots them into fixed-size content-addressed chunks, externalizes inline images into an artifact CAS, preserves canonical raw events, derives turns and Evidence, builds SQLite FTS and optional Chroma embeddings, audits the staging database, and atomically promotes `active.json` only after success.
 
@@ -20,7 +21,7 @@ codex plugin marketplace add Lanqeur/codex-history-suite
 codex plugin add codex-history-suite@codex-history-suite
 ```
 
-Restart the ChatGPT desktop app and start a new Codex thread so the two bundled Skills are loaded.
+Restart the ChatGPT desktop app and start a new Codex thread so the three bundled Skills are loaded.
 
 ## Quick Start
 
@@ -46,7 +47,7 @@ codex-history doctor
 ## Original Conversation Evidence Viewer
 
 The knowledge layers are navigation aids, not a replacement for the original
-record. Version 0.8 can reconstruct selected conversations directly from the
+record. Version 0.9 can reconstruct selected conversations directly from the
 canonical snapshot and package them into a self-contained offline HTML viewer:
 
 ```bash
@@ -79,6 +80,44 @@ with defaults of 25 MiB per file and 100 MiB total; adjust those limits with
 `--max-attachment-mb` and `--max-embedded-mb`. No model call or knowledge-base
 rebuild is required, but a path-only reference can be packaged only after the
 file has been captured into the artifact CAS.
+
+## Continue A Historical Thread In Native Codex
+
+The HTML viewer is for review. When you want to continue the original work,
+version 0.9 can materialize one canonical transcript and ask the target Codex
+app-server to create an independent native fork:
+
+```bash
+# Locate one exact source thread, including a thread in an imported profile.
+python3 scripts/codex_history.py conversation 'payment callback' --list --json
+
+# Inspect size, images, working directory, Codex home, and warnings without writing.
+python3 scripts/codex_history.py --profile laptop-default restore THREAD_ID \
+  --cwd /current/project --dry-run --json
+
+# Create and verify the new native session.
+python3 scripts/codex_history.py --profile laptop-default restore THREAD_ID \
+  --cwd /current/project --json
+```
+
+The result includes a new native thread ID, `codex resume THREAD_ID`, a
+`codex://threads/THREAD_ID` desktop link, and an audit manifest under the target
+`CODEX_HOME`. The source knowledge base, source transcript, and existing Codex
+threads are never modified. Original timestamps, messages, tool calls and
+outputs, Goal events, and compact records are preserved in the materialized
+source. Codex owns the native fork and may rewrite session metadata or leave
+rolled-back, aborted, and unsupported records outside its active view. The
+audit manifest records source/native hashes, line counts, and turn counts; the
+knowledge base remains the complete evidence authority.
+
+The default image policy restores each captured image once and replaces later
+duplicate base64 occurrences with a SHA-256 placeholder. This preserves the
+evidence link without recreating transcript inflation. Dry-run and restore make
+no model or embedding calls. Run the command in the same operating environment
+as the target Codex installation, such as Windows Python for Windows Codex or
+WSL Python for WSL Codex. A query-only bundle exported with `--artifacts none`
+can restore text and tool history, but unavailable images become traceable
+placeholders.
 
 New profiles use a model-first two-stage preset: non-thinking `deepseek-v4-flash` reduces the token-heavy new evidence into append-only ledgers, then non-thinking `qwen3.7-max` updates the much smaller thread/family overviews. When `DASHSCOPE_API_KEY` is unavailable, deterministic evidence is still ingested, but the library is explicitly marked `pending_model_consolidation`. This is a searchable emergency fallback, not a finished summary layer; a later model-enabled `update` completes the backlog even when no transcript changed.
 
@@ -211,5 +250,6 @@ Set `CODEX_HISTORY_HOME` or use `--home` to override. WSL users should keep the 
 PYTHONPATH=src python3 -m pytest
 python3 /path/to/skill-creator/scripts/quick_validate.py skills/build-codex-history
 python3 /path/to/skill-creator/scripts/quick_validate.py skills/codex-history
+python3 /path/to/skill-creator/scripts/quick_validate.py skills/restore-codex-session
 python3 /path/to/plugin-creator/scripts/validate_plugin.py .
 ```
