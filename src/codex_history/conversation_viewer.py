@@ -22,7 +22,7 @@ def render_conversation_html(payload: dict[str, Any]) -> str:
     )
     data = _json_for_script(payload)
     return f"""<!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="light">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -30,6 +30,41 @@ def render_conversation_html(payload: dict[str, Any]) -> str:
   <title>{safe_title}</title>
   <style>
     :root {{
+      color-scheme: light;
+      --bg: #f7f8f7;
+      --panel: #f1f3f2;
+      --panel-2: #ffffff;
+      --line: #d4d9d6;
+      --line-soft: #e4e7e5;
+      --text: #202522;
+      --muted: #59635e;
+      --faint: #68716d;
+      --accent: #bd4d34;
+      --accent-soft: #f8e7e2;
+      --user: #eaf3f6;
+      --tool: #edf6ef;
+      --goal: #faf4e1;
+      --green: #1f6a3a;
+      --blue: #176485;
+      --amber: #765716;
+      --danger: #a63f3f;
+      --header: #ffffff;
+      --hover: #e6eae7;
+      --hover-strong: #dfe4e1;
+      --hover-border: #7d8882;
+      --input: #ffffff;
+      --surface-soft: #fafbfa;
+      --active-border: #d49482;
+      --section: #353b38;
+      --assistant: #353b38;
+      --raw: #4f5954;
+      --attachment: #ffffff;
+      --selection: #ffffff;
+      --shadow: rgba(27, 35, 31, .18);
+      --header-h: 58px;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }}
+    :root[data-theme="dark"] {{
       color-scheme: dark;
       --bg: #111315;
       --panel: #171a1d;
@@ -48,8 +83,19 @@ def render_conversation_html(payload: dict[str, Any]) -> str:
       --blue: #79a8c5;
       --amber: #d5aa5d;
       --danger: #d87373;
-      --header-h: 58px;
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --header: #151719;
+      --hover: #252a2d;
+      --hover-strong: #2b3033;
+      --hover-border: #596065;
+      --input: #101214;
+      --surface-soft: #15181a;
+      --active-border: #684035;
+      --section: #d8d7d5;
+      --assistant: #d8d7d5;
+      --raw: #b8bcbe;
+      --attachment: #0d0f10;
+      --selection: #141719;
+      --shadow: rgba(0, 0, 0, .53);
     }}
     * {{ box-sizing: border-box; }}
     html, body {{ margin: 0; min-height: 100%; background: var(--bg); color: var(--text); }}
@@ -59,7 +105,7 @@ def render_conversation_html(payload: dict[str, Any]) -> str:
     .icon {{ width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; pointer-events: none; }}
     .app-header {{
       height: var(--header-h); display: flex; align-items: center; gap: 14px; padding: 0 16px;
-      border-bottom: 1px solid var(--line); background: #151719;
+      border-bottom: 1px solid var(--line); background: var(--header);
     }}
     .brand {{ min-width: 0; flex: 1; }}
     .brand h1 {{ margin: 0; font-size: 15px; line-height: 1.25; font-weight: 650; letter-spacing: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
@@ -71,35 +117,35 @@ def render_conversation_html(payload: dict[str, Any]) -> str:
     }}
     .icon-btn {{ width: 34px; padding: 0; }}
     .command-btn {{ padding: 0 11px; font-size: 12px; }}
-    .icon-btn:hover, .command-btn:hover {{ border-color: #596065; background: #252a2d; }}
+    .icon-btn:hover, .command-btn:hover {{ border-color: var(--hover-border); background: var(--hover); }}
     .icon-btn:focus-visible, .command-btn:focus-visible, input:focus-visible, .thread-item:focus-visible {{ outline: 2px solid var(--accent); outline-offset: 2px; }}
     .workspace {{ height: calc(100vh - var(--header-h)); display: grid; grid-template-columns: 252px minmax(0, 1fr) 326px; }}
     .sidebar, .evidence-tray {{ min-height: 0; background: var(--panel); }}
     .sidebar {{ border-right: 1px solid var(--line); display: flex; flex-direction: column; }}
     .sidebar-head, .tray-head {{ height: 48px; padding: 0 12px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line-soft); }}
-    .section-title {{ margin: 0; font-size: 12px; font-weight: 650; letter-spacing: 0; color: #d8d7d5; }}
+    .section-title {{ margin: 0; font-size: 12px; font-weight: 650; letter-spacing: 0; color: var(--section); }}
     .count {{ color: var(--faint); font: 11px ui-monospace, SFMono-Regular, Consolas, monospace; }}
     .thread-list {{ overflow: auto; padding: 8px; }}
     .thread-item {{
       width: 100%; text-align: left; border: 1px solid transparent; border-radius: 6px; background: transparent;
       padding: 9px 10px; margin: 0 0 3px; cursor: pointer; display: block;
     }}
-    .thread-item:hover {{ background: #202427; }}
-    .thread-item.active {{ background: var(--accent-soft); border-color: #684035; }}
+    .thread-item:hover {{ background: var(--hover); }}
+    .thread-item.active {{ background: var(--accent-soft); border-color: var(--active-border); }}
     .thread-title {{ font-size: 12px; line-height: 1.45; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; }}
     .thread-meta {{ margin-top: 5px; color: var(--muted); font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; }}
     .main {{ min-width: 0; min-height: 0; display: grid; grid-template-rows: auto auto minmax(0, 1fr); }}
-    .filters {{ padding: 10px 14px; border-bottom: 1px solid var(--line-soft); background: #15181a; display: grid; grid-template-columns: minmax(180px, 1fr) auto; gap: 10px; align-items: center; }}
-    .mobile-thread-select {{ display: none; width: 100%; height: 35px; padding: 0 9px; border-radius: 6px; border: 1px solid var(--line); background: #101214; color: var(--text); }}
+    .filters {{ padding: 10px 14px; border-bottom: 1px solid var(--line-soft); background: var(--surface-soft); display: grid; grid-template-columns: minmax(180px, 1fr) auto; gap: 10px; align-items: center; }}
+    .mobile-thread-select {{ display: none; width: 100%; height: 35px; padding: 0 9px; border-radius: 6px; border: 1px solid var(--line); background: var(--input); color: var(--text); }}
     .search-wrap {{ position: relative; }}
     .search-wrap .icon {{ position: absolute; left: 10px; top: 9px; color: var(--muted); }}
-    .search {{ width: 100%; height: 35px; padding: 0 10px 0 34px; border-radius: 6px; border: 1px solid var(--line); background: #101214; color: var(--text); }}
+    .search {{ width: 100%; height: 35px; padding: 0 10px 0 34px; border-radius: 6px; border: 1px solid var(--line); background: var(--input); color: var(--text); }}
     .role-filters {{ display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }}
     .role-chip {{ position: relative; }}
     .role-chip input {{ position: absolute; opacity: 0; pointer-events: none; }}
     .role-chip span {{ display: block; padding: 7px 9px; border: 1px solid var(--line); border-radius: 5px; color: var(--muted); font-size: 11px; cursor: pointer; }}
-    .role-chip input:checked + span {{ color: var(--text); border-color: #63696d; background: var(--panel-2); }}
-    .range-row {{ min-height: 43px; display: flex; gap: 8px; align-items: center; padding: 7px 14px; border-bottom: 1px solid var(--line-soft); background: #131517; }}
+    .role-chip input:checked + span {{ color: var(--text); border-color: var(--hover-border); background: var(--panel-2); }}
+    .range-row {{ min-height: 43px; display: flex; gap: 8px; align-items: center; padding: 7px 14px; border-bottom: 1px solid var(--line-soft); background: var(--bg); }}
     .range-row input {{ height: 30px; min-width: 0; color: var(--muted); background: var(--panel); border: 1px solid var(--line); border-radius: 5px; padding: 0 7px; font-size: 11px; }}
     .range-label {{ color: var(--faint); font-size: 10px; }}
     .result-summary {{ margin-left: auto; color: var(--muted); font: 11px ui-monospace, SFMono-Regular, Consolas, monospace; white-space: nowrap; }}
@@ -117,13 +163,13 @@ def render_conversation_html(payload: dict[str, Any]) -> str:
     .message-head {{ min-width: 0; display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }}
     .role-name {{ font-size: 11px; font-weight: 700; text-transform: uppercase; color: var(--muted); }}
     .user .role-name {{ color: var(--blue); }}
-    .assistant .role-name {{ color: #d8d7d5; }}
+    .assistant .role-name {{ color: var(--assistant); }}
     .tool_call .role-name, .tool_output .role-name {{ color: var(--green); }}
     .goal .role-name {{ color: var(--amber); }}
     .message-time {{ color: var(--faint); font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; }}
     .message-tools {{ margin-left: auto; display: flex; gap: 3px; }}
     .mini-btn {{ width: 27px; height: 27px; border: 0; background: transparent; color: var(--muted); border-radius: 5px; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; }}
-    .mini-btn:hover {{ color: var(--text); background: #2b3033; }}
+    .mini-btn:hover {{ color: var(--text); background: var(--hover-strong); }}
     .message-body {{ position: relative; min-width: 0; }}
     .message-content {{ margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 13px/1.62 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; letter-spacing: 0; }}
     .message-content.clamped {{ max-height: 340px; overflow: hidden; }}
@@ -134,9 +180,9 @@ def render_conversation_html(payload: dict[str, Any]) -> str:
     .provenance {{ margin-top: 9px; color: var(--faint); font: 10px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap: anywhere; }}
     .raw {{ margin-top: 9px; border-top: 1px solid var(--line-soft); padding-top: 8px; }}
     .raw summary {{ color: var(--muted); font-size: 11px; cursor: pointer; }}
-    .raw pre {{ white-space: pre-wrap; overflow-wrap: anywhere; font: 10px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; color: #b8bcbe; }}
+    .raw pre {{ white-space: pre-wrap; overflow-wrap: anywhere; font: 10px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; color: var(--raw); }}
     .attachments {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 8px; margin-top: 10px; }}
-    .attachment {{ margin: 0; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; background: #0d0f10; }}
+    .attachment {{ margin: 0; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; background: var(--attachment); }}
     .attachment img {{ width: 100%; display: block; max-height: 360px; object-fit: contain; }}
     .attachment figcaption {{ padding: 6px 8px; color: var(--muted); font: 9px ui-monospace, SFMono-Regular, Consolas, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
     .load-more {{ width: 100%; height: 38px; margin-top: 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); cursor: pointer; }}
@@ -145,7 +191,7 @@ def render_conversation_html(payload: dict[str, Any]) -> str:
     .tray-actions {{ display: flex; gap: 5px; padding: 8px 10px; border-bottom: 1px solid var(--line-soft); }}
     .tray-actions .command-btn {{ flex: 1; padding: 0 7px; }}
     .selection-list {{ min-height: 0; overflow: auto; padding: 8px; }}
-    .selection-item {{ display: grid; grid-template-columns: 20px minmax(0, 1fr) auto; gap: 7px; align-items: start; padding: 8px; border: 1px solid var(--line-soft); border-radius: 6px; margin-bottom: 6px; background: #141719; }}
+    .selection-item {{ display: grid; grid-template-columns: 20px minmax(0, 1fr) auto; gap: 7px; align-items: start; padding: 8px; border: 1px solid var(--line-soft); border-radius: 6px; margin-bottom: 6px; background: var(--selection); }}
     .selection-item.dragging {{ opacity: .45; }}
     .drag-handle {{ color: var(--faint); cursor: grab; padding-top: 2px; }}
     .selection-copy {{ min-width: 0; }}
@@ -158,7 +204,7 @@ def render_conversation_html(payload: dict[str, Any]) -> str:
     .mobile-only {{ display: none; }}
     @media (max-width: 1080px) {{
       .workspace {{ grid-template-columns: 224px minmax(0, 1fr); }}
-      .evidence-tray {{ position: fixed; z-index: 20; right: 0; top: var(--header-h); bottom: 0; width: min(360px, 92vw); transform: translateX(100%); transition: transform .18s ease; box-shadow: -14px 0 32px #0008; }}
+      .evidence-tray {{ position: fixed; z-index: 20; right: 0; top: var(--header-h); bottom: 0; width: min(360px, 92vw); transform: translateX(100%); transition: transform .18s ease; box-shadow: -14px 0 32px var(--shadow); }}
       body.tray-open .evidence-tray {{ transform: translateX(0); }}
       .mobile-only {{ display: inline-flex; }}
     }}
@@ -199,6 +245,8 @@ def render_conversation_html(payload: dict[str, Any]) -> str:
     <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18"></path><path d="M8 6V4h8v2"></path><path d="m19 6-1 14H6L5 6"></path></symbol>
     <symbol id="i-grip" viewBox="0 0 24 24"><circle cx="9" cy="12" r="1"></circle><circle cx="9" cy="5" r="1"></circle><circle cx="9" cy="19" r="1"></circle><circle cx="15" cy="12" r="1"></circle><circle cx="15" cy="5" r="1"></circle><circle cx="15" cy="19" r="1"></circle></symbol>
     <symbol id="i-printer" viewBox="0 0 24 24"><path d="M6 9V2h12v7"></path><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"></path><rect width="12" height="8" x="6" y="14"></rect></symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2"></path><path d="M12 20v2"></path><path d="m4.93 4.93 1.42 1.42"></path><path d="m17.66 17.66 1.41 1.41"></path><path d="M2 12h2"></path><path d="M20 12h2"></path><path d="m6.34 17.66-1.41 1.41"></path><path d="m19.07 4.93-1.41 1.41"></path></symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9"></path></symbol>
     <symbol id="i-up" viewBox="0 0 24 24"><path d="m18 15-6-6-6 6"></path></symbol>
     <symbol id="i-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"></path></symbol>
   </defs></svg>
@@ -206,6 +254,7 @@ def render_conversation_html(payload: dict[str, Any]) -> str:
     <div class="brand"><h1 id="app-title"></h1><div class="brand-meta" id="brand-meta"></div></div>
     <div class="header-actions">
       <button class="icon-btn mobile-only" id="toggle-tray" title="证据集合" aria-label="证据集合"><svg class="icon"><use href="#i-panel"></use></svg></button>
+      <button class="icon-btn" id="toggle-theme" title="切换到深色模式" aria-label="切换到深色模式" aria-pressed="false"><svg class="icon"><use href="#i-moon"></use></svg></button>
       <button class="command-btn" id="print-page" title="打印当前视图"><svg class="icon"><use href="#i-printer"></use></svg><span class="command-label">打印</span></button>
     </div>
   </header>
@@ -255,13 +304,20 @@ def render_conversation_html(payload: dict[str, Any]) -> str:
       thread: 'all', search: '', roles: new Set(roleOrder), since: '', until: '',
       selection: loadSelection(), visibleLimit: 140, filtered: [], expanded: new Set()
     }};
-    const dom = Object.fromEntries(['app-title','brand-meta','thread-count','thread-list','mobile-thread','search','role-filters','since','until','result-summary','timeline','timeline-inner','selection-count','selection-list','toggle-tray','print-page','add-visible','copy-md','clear-selection'].map(id => [id.replaceAll('-','_'), document.getElementById(id)]));
+    const dom = Object.fromEntries(['app-title','brand-meta','thread-count','thread-list','mobile-thread','search','role-filters','since','until','result-summary','timeline','timeline-inner','selection-count','selection-list','toggle-tray','toggle-theme','print-page','add-visible','copy-md','clear-selection'].map(id => [id.replaceAll('-','_'), document.getElementById(id)]));
 
     function loadSelection() {{
       try {{ return JSON.parse(localStorage.getItem(storageKey) || '[]').filter(id => byId.has(id)); }}
       catch (_) {{ return []; }}
     }}
     function saveSelection() {{ try {{ localStorage.setItem(storageKey, JSON.stringify(state.selection)); }} catch (_) {{}} }}
+    function loadTheme() {{ try {{ const value=localStorage.getItem('codex-history-viewer-theme'); return value==='dark'?'dark':'light'; }} catch (_) {{ return 'light'; }} }}
+    function setTheme(theme, persist=false) {{
+      const dark=theme==='dark'; document.documentElement.dataset.theme=dark?'dark':'light';
+      const use=dom.toggle_theme.querySelector('use'); use.setAttribute('href',dark?'#i-sun':'#i-moon');
+      const label=dark?'切换到浅色模式':'切换到深色模式'; dom.toggle_theme.title=label; dom.toggle_theme.setAttribute('aria-label',label); dom.toggle_theme.setAttribute('aria-pressed',String(dark));
+      if (persist) {{ try {{ localStorage.setItem('codex-history-viewer-theme',dark?'dark':'light'); }} catch (_) {{}} }}
+    }}
     function el(tag, className, text) {{
       const node = document.createElement(tag); if (className) node.className = className;
       if (text !== undefined) node.textContent = text; return node;
@@ -380,7 +436,7 @@ def render_conversation_html(payload: dict[str, Any]) -> str:
     function escapeHtml(value) {{ return String(value).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;'); }}
     function selectionHtml(messages) {{
       const rows=messages.map(message=>{{ const thread=threadById.get(message.thread_id); const images=(message.attachments || []).filter(item=>item.available&&item.data_url).map(item=>`<figure><img src="${{escapeHtml(item.data_url)}}" alt="${{escapeHtml(item.sha256)}}"><figcaption>${{escapeHtml(item.uri)}}</figcaption></figure>`).join(''); const raw=message.raw_event?`<details><summary>Raw canonical event</summary><pre>${{escapeHtml(JSON.stringify(message.raw_event,null,2))}}</pre></details>`:''; return `<article><h2>${{escapeHtml(roleLabels[message.role])}} <small>${{escapeHtml(formatTime(message.timestamp))}}</small></h2><p class="thread">${{escapeHtml(thread?.title || message.thread_id)}}</p><pre>${{escapeHtml(message.content)}}</pre>${{images}}${{raw}}<footer>thread=${{escapeHtml(message.thread_id)}} · turn=${{message.turn_number ?? 'n/a'}} · line=${{message.line_no}} · event=${{escapeHtml(message.event_id)}} · sha256=${{escapeHtml(message.content_sha256)}}</footer></article>`; }}).join('');
-      return `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${{escapeHtml(dataset.title)}}</title><style>body{{max-width:920px;margin:auto;padding:24px;background:#111315;color:#ecebea;font-family:system-ui}}article{{padding:18px 0;border-bottom:1px solid #34393d}}h1{{font-size:20px}}h2{{font-size:13px}}small,footer,.thread,figcaption{{color:#9ca1a5;font:11px ui-monospace,monospace}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.6 ui-monospace,monospace}}img{{display:block;max-width:100%;max-height:720px;object-fit:contain}}figure{{margin:12px 0}}</style><body><h1>${{escapeHtml(dataset.title)}}</h1>${{rows}}</body></html>`;
+      return `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${{escapeHtml(dataset.title)}}</title><style>body{{max-width:920px;margin:auto;padding:24px;background:#fff;color:#202522;font-family:system-ui}}article{{padding:18px 0;border-bottom:1px solid #d4d9d6}}h1{{font-size:20px}}h2{{font-size:13px}}small,footer,.thread,figcaption{{color:#59635e;font:11px ui-monospace,monospace}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.6 ui-monospace,monospace}}img{{display:block;max-width:100%;max-height:720px;object-fit:contain}}figure{{margin:12px 0}}</style><body><h1>${{escapeHtml(dataset.title)}}</h1>${{rows}}</body></html>`;
     }}
     async function copyText(value) {{
       if (!value) return;
@@ -395,12 +451,14 @@ def render_conversation_html(payload: dict[str, Any]) -> str:
     }}
     function renderAll() {{ renderThreads(); renderRoles(); renderTimeline(); renderSelection(); }}
 
+    setTheme(loadTheme());
     dom.app_title.textContent=dataset.title; dom.brand_meta.textContent=`${{dataset.statistics.threads}} threads · ${{dataset.statistics.messages}} events · ${{dataset.export_id}}`;
     dom.mobile_thread.addEventListener('change',() => {{ state.thread=dom.mobile_thread.value; state.visibleLimit=140; renderAll(); }});
     dom.search.addEventListener('input',() => {{ state.search=dom.search.value; state.visibleLimit=140; renderTimeline(); }});
     dom.since.addEventListener('change',() => {{ state.since=dom.since.value; state.visibleLimit=140; renderTimeline(); }});
     dom.until.addEventListener('change',() => {{ state.until=dom.until.value; state.visibleLimit=140; renderTimeline(); }});
     dom.toggle_tray.addEventListener('click',()=>document.body.classList.toggle('tray-open'));
+    dom.toggle_theme.addEventListener('click',()=>setTheme(document.documentElement.dataset.theme==='dark'?'light':'dark',true));
     dom.print_page.addEventListener('click',()=>window.print());
     dom.add_visible.addEventListener('click',() => {{ state.filtered.forEach(message => {{ if(!state.selection.includes(message.id)) state.selection.push(message.id); }}); saveSelection(); renderSelection(); }});
     dom.clear_selection.addEventListener('click',() => {{ state.selection=[]; saveSelection(); renderSelection(); renderTimeline(); }});

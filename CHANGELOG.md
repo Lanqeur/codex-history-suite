@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.1 - 2026-07-21
+
+- Make the conversation evidence viewer and its selected-evidence HTML exports use a high-contrast light theme by default.
+- Add a persistent light/dark theme toggle without changing exported evidence or requiring a knowledge-base rebuild.
+
 ## 0.6.0 - 2026-07-21
 
 - Add exact conversation-range reconstruction from canonical snapshot byte offsets, with Codex dual-write deduplication and per-event provenance.

@@ -132,6 +132,9 @@ def test_conversation_export_restores_visible_messages_and_embeds_images(
     assert report["messages"] == 5
     assert "codex-history-data" in html
     assert "evidence-tray" in html
+    assert '<html lang="zh-CN" data-theme="light">' in html
+    assert 'id="toggle-theme"' in html
+    assert "codex-history-viewer-theme" in html
     assert "data:image/png;base64," in html
     assert "</script><script>alert(1)</script>" not in html
     assert "\\u003c/script\\u003e\\u003cscript\\u003ealert(1)" in html
