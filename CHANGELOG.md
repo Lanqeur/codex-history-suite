@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.0 - 2026-07-21
+
+- Bind captured absolute-path documents back to their exact conversation events through artifact observations, while retaining inline image URI recovery.
+- Add portable attachment cards with inline raster images, bounded text previews, in-browser PDF opening, and original-file downloads for Office, archive, and other document types.
+- Add `--embed-attachments`, per-file and aggregate size limits, explicit missing/skipped states, and attachment-aware search and evidence exports.
+- Store embedded binaries once per SHA-256 in conversation export v2 so repeated references do not duplicate base64 payloads.
+
 ## 0.7.0 - 2026-07-21
 
 - Render user and assistant Markdown with offline GFM table support while retaining a one-click source view.

@@ -1,6 +1,6 @@
 {
   "name": "codex-history-suite",
-  "version": "0.7.0+codex.20260721083633",
+  "version": "0.8.0+codex.20260721090826",
   "description": "Build, maintain, move, search, trace, and export portable evidence-first knowledge bases from local Codex transcripts.",
   "author": {
     "name": "Lanqeur",

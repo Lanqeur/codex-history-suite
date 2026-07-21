@@ -29,14 +29,14 @@ python3 ../../scripts/codex_history.py claims SCOPE_OR_OVERVIEW_ID
 python3 ../../scripts/codex_history.py trace RECORD_OR_EVIDENCE_ID
 python3 ../../scripts/codex_history.py artifacts test_agent_workflow_contracts.py
 python3 ../../scripts/codex_history.py conversation '会话标题关键词' --list
-python3 ../../scripts/codex_history.py conversation THREAD_ID --turn-range 4:12 --include-raw --embed-images -o evidence.html
+python3 ../../scripts/codex_history.py conversation THREAD_ID --turn-range 4:12 --include-raw --embed-attachments -o evidence.html
 python3 ../../scripts/codex_history.py conversation --scope FAMILY_ID --since 2026-06-01 --until 2026-06-30 -o family-evidence.html
 python3 ../../scripts/codex_history.py stats
 ```
 
 Add `--json` for programmatic filtering. If no active build exists, stop and direct the user to explicitly invoke `$build-codex-history`; do not initialize or update from this read-only Skill.
 
-Conversation export defaults to visible user/assistant messages plus tool and goal events. It suppresses duplicate Codex event representations and injected environment/plugin context. Add `--include-internal` only when internal context is material, `--include-raw` for the complete normalized source event, and `--embed-images` for a self-contained cross-device viewer. Prefer a bounded export over an entire large thread. The offline viewer safely renders user/assistant Markdown, GFM tables, and fenced Mermaid diagrams while preserving a literal source mode; tool, goal, internal, and raw events stay literal. A human can filter, select, reorder, and export an evidence sequence as HTML, Markdown, or JSON.
+Conversation export defaults to visible user/assistant messages plus tool and goal events. It suppresses duplicate Codex event representations and injected environment/plugin context. Add `--include-internal` only when internal context is material and `--include-raw` for the complete normalized source event. Attachment metadata is always included when an event has an artifact URI or Event-linked `artifact_observation`; use `--embed-images` for an image-only portable viewer or `--embed-attachments` for captured images and documents. Default binary limits are 25 MiB per file and 100 MiB total. Prefer a bounded export over an entire large thread. The offline viewer safely renders user/assistant Markdown, GFM tables, fenced Mermaid diagrams, images, bounded text previews, and attachment cards while preserving a literal source mode; tool, goal, internal, and raw events stay literal. PDFs can open in-browser and other embedded documents can be downloaded. A human can filter, select, reorder, and export an evidence sequence as HTML, Markdown, or JSON.
 
 For cross-device questions, start with the read-only federated command. Omit `--from` to search every enabled library, or repeat it to constrain the authorities:
 

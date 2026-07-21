@@ -18,7 +18,7 @@
 
 `conversation` reconstructs normalized source events from snapshot chunk byte
 offsets; it does not rebuild message text from FTS or summarized knowledge rows.
-The `codex-history-conversation-export-v1` payload records the source ID, line,
+The `codex-history-conversation-export-v2` payload records the source ID, line,
 byte interval, event ID, content SHA-256, thread, turn, timestamp, and source
 event type for each exported item.
 
@@ -31,9 +31,15 @@ Tool calls, tool outputs, and goal states are independent evidence and remain in
 source order by default.
 
 `--include-raw` embeds the complete normalized JSON event. Inline source images
-have already been replaced by content-addressed artifact URIs; `--embed-images`
-resolves available image objects and adds data URLs to make the export
-self-contained. These switches can substantially increase output size.
+have already been replaced by content-addressed artifact URIs. Event-linked
+`artifact_observations` restore captured absolute-path documents to the exact
+message that referenced them. Attachments always expose metadata and status;
+`--embed-images` embeds safe raster image types, while `--embed-attachments`
+embeds captured images and documents. Binary payloads live once in the top-level
+`artifacts` map and message attachments refer to them by SHA-256, avoiding
+duplicate base64 when the same object occurs repeatedly. Per-file and aggregate
+limits report explicit `skipped_*` states instead of silently dropping files.
+These switches can substantially increase output size.
 
 The offline HTML uses pinned local Marked and DOMPurify builds to render
 sanitized user/assistant Markdown and GFM tables. A pinned Mermaid runtime is

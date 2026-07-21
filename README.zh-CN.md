@@ -45,7 +45,7 @@ codex-history doctor
 
 ## 原始会话证据查看器
 
-知识层负责导航，不替代原始记录。v0.6 可以从规范快照中精确还原指定
+知识层负责导航，不替代原始记录。v0.8 可以从规范快照中精确还原指定
 会话范围，并打包成一个完全离线、可直接打开的类 Codex HTML 页面：
 
 ```bash
@@ -54,7 +54,7 @@ python3 scripts/codex_history.py conversation '支付回调' --list
 
 # 导出第 4 至 12 个用户 turn，保留可见消息、工具调用和 Goal。
 python3 scripts/codex_history.py conversation THREAD_ID --turn-range 4:12 \
-  --include-raw --embed-images -o payment-evidence.html
+  --include-raw --embed-attachments -o payment-evidence.html
 
 # 合并一个 scope 下的全部会话，并按事件发生时间裁剪。
 python3 scripts/codex_history.py conversation --scope FAMILY_ID \
@@ -64,9 +64,13 @@ python3 scripts/codex_history.py conversation --scope FAMILY_ID \
 页面不依赖服务端或网络，默认安全渲染用户/助手消息中的 Markdown、GFM 表格和
 Mermaid 代码块，也能一键切回逐字原文。它支持按会话、正文、角色和时间过滤，
 长记录渐进渲染，逐条查看来源位置，勾选证据后拖拽排序，并把选中的事实链另存为
-HTML、Markdown 或 JSON。默认隐藏环境/插件注入上下文，图片只保留内容寻址引用；确实需要完整
-审计或跨设备查看图片时，再使用 `--include-internal`、`--include-raw` 或
-`--embed-images`。整个过程不调用模型，也不需要重建知识库。
+HTML、Markdown 或 JSON。默认隐藏环境/插件注入上下文，附件只显示与具体消息绑定的
+文件名、类型、大小、原始路径、SHA-256 和可用状态，不复制二进制内容。轻量导出可用
+`--embed-images` 只打包图片；完整离线证据包可用 `--embed-attachments` 同时打包已经
+进入 artifact CAS 的图片和文档。常见图片会直接显示，文本文件提供限长预览，PDF 可在
+浏览器打开，Word、PPT、ZIP 等可下载原文件。内容按 SHA 只嵌入一份，默认限制为每个文件
+25 MiB、合计 100 MiB，可用 `--max-attachment-mb` 和 `--max-embedded-mb` 调整。
+整个过程不调用模型，也不需要重建知识库；仅有路径、尚未采集进 CAS 的旧文件无法打包实体。
 
 新建 profile 默认采用两阶段模型优先方案：非思考模式 `deepseek-v4-flash` 负责把 Token 量最大的新增证据归并为只追加 ledger，非思考模式 `qwen3.7-max` 再更新体量很小的 thread/family Overview。找不到 `DASHSCOPE_API_KEY` 时仍会完整收录确定性证据，但知识库会明确标记为 `pending_model_consolidation`。这只是可检索的应急保底，不是已经完成的高层知识；以后配置模型后，即使 transcript 没有再次变化，执行 `update` 也会补齐 backlog。
 

@@ -1425,7 +1425,10 @@ def command_conversation(args: argparse.Namespace, connection: sqlite3.Connectio
             include_internal=args.include_internal,
             include_raw=args.include_raw,
             embed_images=args.embed_images,
+            embed_attachments=args.embed_attachments,
             artifact_roots=ARTIFACT_ROOTS,
+            max_attachment_bytes=int(args.max_attachment_mb * 1024 * 1024),
+            max_embedded_bytes=int(args.max_embedded_mb * 1024 * 1024),
             title=args.title,
         )
         report = write_conversation_export(
@@ -1445,6 +1448,11 @@ def command_conversation(args: argparse.Namespace, connection: sqlite3.Connectio
             f"messages={report['messages']} | size={report['size_bytes']} bytes"
         )
         print(f"Roles: {compact_json(report['roles'])}")
+        print(
+            f"Attachments: referenced={report['referenced_attachments']} | "
+            f"embedded={report['embedded_attachments']} | "
+            f"missing={report['missing_attachments']}"
+        )
     return 0
 
 
@@ -1695,6 +1703,18 @@ def build_parser() -> argparse.ArgumentParser:
     conversation.add_argument(
         "--embed-images", action="store_true",
         help="embed referenced image artifacts into the portable HTML/JSON",
+    )
+    conversation.add_argument(
+        "--embed-attachments", action="store_true",
+        help="embed referenced images and documents for offline open/download",
+    )
+    conversation.add_argument(
+        "--max-attachment-mb", type=float, default=25.0, metavar="MIB",
+        help="maximum embedded size per attachment (default: 25 MiB)",
+    )
+    conversation.add_argument(
+        "--max-embedded-mb", type=float, default=100.0, metavar="MIB",
+        help="maximum combined embedded attachment size (default: 100 MiB)",
     )
     conversation.add_argument("--title", default="Codex conversation evidence")
     conversation.add_argument("--force", action="store_true", help="replace an existing output")

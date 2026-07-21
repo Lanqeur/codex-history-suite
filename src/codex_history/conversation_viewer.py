@@ -207,7 +207,7 @@ def render_conversation_html(payload: dict[str, Any]) -> str:
     .mini-btn:hover {{ color: var(--text); background: var(--hover-strong); }}
     .message-body {{ position: relative; min-width: 0; }}
     .message-content {{ margin: 0; overflow-wrap: anywhere; letter-spacing: 0; }}
-    .source-content {{ white-space: pre-wrap; font: 13px/1.62 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; }}
+    .source-content {{ min-width: 0; max-width: 100%; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-all; font: 13px/1.62 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; }}
     .markdown-body {{ font: 14px/1.65 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
     .markdown-body > :first-child {{ margin-top: 0; }}
     .markdown-body > :last-child {{ margin-bottom: 0; }}
@@ -240,10 +240,27 @@ def render_conversation_html(payload: dict[str, Any]) -> str:
     .raw {{ margin-top: 9px; border-top: 1px solid var(--line-soft); padding-top: 8px; }}
     .raw summary {{ color: var(--muted); font-size: 11px; cursor: pointer; }}
     .raw pre {{ white-space: pre-wrap; overflow-wrap: anywhere; font: 10px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; color: var(--raw); }}
-    .attachments {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 8px; margin-top: 10px; }}
-    .attachment {{ margin: 0; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; background: var(--attachment); }}
-    .attachment img {{ width: 100%; display: block; max-height: 360px; object-fit: contain; }}
-    .attachment figcaption {{ padding: 6px 8px; color: var(--muted); font: 9px ui-monospace, SFMono-Regular, Consolas, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    .attachments {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 8px; margin-top: 10px; }}
+    .attachment {{ min-width: 0; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; background: var(--attachment); }}
+    .attachment-image {{ width: 100%; display: block; max-height: 360px; object-fit: contain; border-bottom: 1px solid var(--line-soft); background: var(--surface-soft); }}
+    .attachment-file {{ min-height: 76px; padding: 12px; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid var(--line-soft); background: var(--surface-soft); }}
+    .attachment-file .icon {{ width: 28px; height: 28px; flex: 0 0 auto; color: var(--muted); }}
+    .attachment-file-copy {{ min-width: 0; }}
+    .attachment-file-copy strong {{ display: block; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    .attachment-file-copy span {{ display: block; margin-top: 4px; color: var(--muted); font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; }}
+    .attachment-info {{ padding: 8px 10px; }}
+    .attachment-name {{ margin: 0; font-size: 11px; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    .attachment-meta, .attachment-path {{ margin-top: 4px; color: var(--muted); font: 9px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: normal; overflow-wrap: anywhere; word-break: break-all; }}
+    .attachment-status {{ color: var(--green); }}
+    .attachment-status.skipped {{ color: var(--amber); }}
+    .attachment-status.missing {{ color: var(--danger); }}
+    .attachment-actions {{ display: flex; gap: 5px; margin-top: 8px; }}
+    .attachment-action {{ min-height: 29px; padding: 0 8px; border: 1px solid var(--line); border-radius: 5px; background: var(--panel-2); color: var(--text); display: inline-flex; align-items: center; gap: 5px; font-size: 10px; cursor: pointer; }}
+    .attachment-action:hover {{ border-color: var(--hover-border); background: var(--hover); }}
+    .attachment-action .icon {{ width: 14px; height: 14px; }}
+    .attachment-preview {{ margin-top: 7px; }}
+    .attachment-preview summary {{ color: var(--blue); font-size: 10px; cursor: pointer; }}
+    .attachment-preview pre {{ max-height: 220px; overflow: auto; margin: 6px 0 0; padding: 8px; border: 1px solid var(--line-soft); border-radius: 5px; background: var(--panel); white-space: pre-wrap; overflow-wrap: anywhere; font: 10px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; }}
     .load-more {{ width: 100%; height: 38px; margin-top: 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); cursor: pointer; }}
     .empty {{ padding: 60px 20px; text-align: center; color: var(--muted); font-size: 12px; }}
     .evidence-tray {{ border-left: 1px solid var(--line); display: grid; grid-template-rows: 48px auto minmax(0, 1fr) auto; }}
@@ -277,8 +294,14 @@ def render_conversation_html(payload: dict[str, Any]) -> str:
       .filter-controls {{ justify-content: flex-start; flex-wrap: wrap; }}
       .role-filters {{ justify-content: flex-start; overflow-x: auto; flex-wrap: nowrap; }}
       .range-row {{ flex-wrap: wrap; }}
+      .range-row input {{ flex: 1 1 112px; width: 112px; max-width: 120px; }}
       .result-summary {{ width: 100%; margin-left: 0; }}
       .timeline-inner {{ padding: 8px 10px 70px; }}
+      .message {{ width: 100%; grid-template-columns: 22px minmax(0, 1fr); gap: 7px; overflow: hidden; }}
+      .message-body, .message-content {{ width: 100%; min-width: 0; max-width: 100%; overflow: hidden; }}
+      .attachments {{ grid-template-columns: minmax(0, 1fr); }}
+      .attachment {{ width: 100%; max-width: 100%; }}
+      .attachment-meta, .attachment-path {{ word-break: break-all; }}
       .command-label {{ display: none; }}
       .command-btn {{ width: 34px; padding: 0; }}
     }}
@@ -311,6 +334,8 @@ def render_conversation_html(payload: dict[str, Any]) -> str:
     <symbol id="i-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"></path></symbol>
     <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2.1 12a10 10 0 0 1 19.8 0 10 10 0 0 1-19.8 0"></path><circle cx="12" cy="12" r="3"></circle></symbol>
     <symbol id="i-code" viewBox="0 0 24 24"><path d="m16 18 6-6-6-6"></path><path d="m8 6-6 6 6 6"></path></symbol>
+    <symbol id="i-file" viewBox="0 0 24 24"><path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"></path><polyline points="14 2 14 8 20 8"></polyline></symbol>
+    <symbol id="i-external" viewBox="0 0 24 24"><path d="M15 3h6v6"></path><path d="M10 14 21 3"></path><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path></symbol>
   </defs></svg>
   <header class="app-header">
     <div class="brand"><h1 id="app-title"></h1><div class="brand-meta" id="brand-meta"></div></div>
@@ -368,6 +393,7 @@ def render_conversation_html(payload: dict[str, Any]) -> str:
     const dataset = JSON.parse(document.getElementById('codex-history-data').textContent);
     const byId = new Map(dataset.messages.map(message => [message.id, message]));
     const threadById = new Map(dataset.threads.map(thread => [thread.thread_id, thread]));
+    const artifactByDigest = dataset.artifacts || {{}};
     const roleLabels = {{user:'USER',assistant:'ASSISTANT',tool_call:'TOOL CALL',tool_output:'TOOL OUTPUT',goal:'GOAL'}};
     const roleOrder = ['user','assistant','tool_call','tool_output','goal'];
     const storageKey = `codex-history-evidence:${{dataset.export_id}}`;
@@ -402,6 +428,53 @@ def render_conversation_html(payload: dict[str, Any]) -> str:
       return new Intl.DateTimeFormat('zh-CN',{{year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}}).format(date);
     }}
     function short(value, size=12) {{ return value ? value.slice(0,size) : 'none'; }}
+    function attachmentPayload(item) {{ return artifactByDigest[item.sha256] || item || {{}}; }}
+    function dataUrlBlob(dataUrl) {{
+      const comma=dataUrl.indexOf(','); if (comma<0) throw new Error('Invalid attachment data');
+      const header=dataUrl.slice(5,comma); const mime=(header.split(';')[0] || 'application/octet-stream'); const body=dataUrl.slice(comma+1);
+      if (!header.includes(';base64')) return new Blob([decodeURIComponent(body)],{{type:mime}});
+      const binary=atob(body); const chunks=[];
+      for (let offset=0; offset<binary.length; offset+=32768) {{
+        const part=binary.slice(offset,offset+32768); const bytes=new Uint8Array(part.length);
+        for (let index=0; index<part.length; index+=1) bytes[index]=part.charCodeAt(index);
+        chunks.push(bytes);
+      }}
+      return new Blob(chunks,{{type:mime}});
+    }}
+    function useAttachment(item, asDownload) {{
+      const dataUrl=attachmentPayload(item).data_url; if (!dataUrl) return;
+      const url=URL.createObjectURL(dataUrlBlob(dataUrl));
+      if (asDownload) {{
+        const link=document.createElement('a'); link.href=url; link.download=item.display_name || `${{item.sha256}}${{item.extension || ''}}`; link.click();
+      }} else {{
+        window.open(url,'_blank','noopener,noreferrer');
+      }}
+      setTimeout(()=>URL.revokeObjectURL(url),60000);
+    }}
+    function attachmentStatus(item) {{
+      const labels={{embedded:'已打包',available_not_embedded:'已定位，未打包',skipped_file_limit:'超过单文件限制',skipped_total_limit:'超过导出总量限制',missing_file:'CAS 文件缺失',missing_record:'附件记录缺失'}};
+      return labels[item.status] || item.status || '状态未知';
+    }}
+    function attachmentNode(item) {{
+      const payload=attachmentPayload(item); const dataUrl=payload.data_url || ''; const card=el('section','attachment');
+      if (item.kind==='image' && dataUrl) {{
+        const image=document.createElement('img'); image.className='attachment-image'; image.src=dataUrl; image.alt=item.display_name || `Image ${{short(item.sha256)}}`; card.append(image);
+      }} else {{
+        const file=el('div','attachment-file'); file.append(svg('file')); const copy=el('div','attachment-file-copy'); copy.append(el('strong','',item.extension?.replace('.','').toUpperCase() || item.kind?.toUpperCase() || 'FILE'),el('span','',item.size_human || 'size unknown')); file.append(copy); card.append(file);
+      }}
+      const info=el('div','attachment-info'); const name=el('p','attachment-name',item.display_name || item.uri); name.title=item.display_name || item.uri; info.append(name);
+      const stateClass=item.status?.startsWith('missing')?' missing':item.status?.startsWith('skipped')?' skipped':'';
+      const meta=el('div','attachment-meta'); meta.append(document.createTextNode(`${{item.kind || 'file'}} · ${{item.size_human || 'size unknown'}} · `),el('span',`attachment-status${{stateClass}}`,attachmentStatus(item)),document.createTextNode(` · sha256:${{short(item.sha256)}}`)); info.append(meta);
+      info.append(el('div','attachment-path',item.mime_type || 'application/octet-stream'));
+      if (item.source_paths?.length) {{ const paths=el('details','attachment-preview'); paths.append(el('summary','','原始路径'),el('pre','',item.source_paths.join('\\n'))); info.append(paths); }}
+      if (dataUrl) {{
+        const actions=el('div','attachment-actions');
+        if (item.can_open) {{ const open=el('button','attachment-action'); open.type='button'; open.title='在浏览器中打开附件'; open.append(svg('external'),document.createTextNode('打开')); open.addEventListener('click',()=>useAttachment(item,false)); actions.append(open); }}
+        const save=el('button','attachment-action'); save.type='button'; save.title='保存附件原文件'; save.append(svg('download'),document.createTextNode('下载')); save.addEventListener('click',()=>useAttachment(item,true)); actions.append(save); info.append(actions);
+      }}
+      if (payload.text_preview) {{ const details=el('details','attachment-preview'); details.append(el('summary','','文本预览'),el('pre','',payload.text_preview + (payload.text_preview_truncated?'\\n\\n[preview truncated]':''))); info.append(details); }}
+      card.append(info); return card;
+    }}
     function markdownNode(source) {{
       const node=el('div','message-content markdown-body');
       const rendered=marked.parse(source,{{gfm:true,breaks:false}});
@@ -430,7 +503,8 @@ def render_conversation_html(payload: dict[str, Any]) -> str:
         if (until !== null && (time === null || time > until)) return false;
         if (query) {{
           const thread = threadById.get(message.thread_id);
-          const haystack = `${{message.content}} ${{message.tool_name}} ${{message.event_id}} ${{thread?.title || ''}}`.toLocaleLowerCase();
+          const attachmentText=(message.attachments || []).flatMap(item=>[item.display_name,item.mime_type,...(item.source_paths || [])]).join(' ');
+          const haystack = `${{message.content}} ${{message.tool_name}} ${{message.event_id}} ${{thread?.title || ''}} ${{attachmentText}}`.toLocaleLowerCase();
           if (!haystack.includes(query)) return false;
         }}
         return true;
@@ -492,10 +566,7 @@ def render_conversation_html(payload: dict[str, Any]) -> str:
       body.append(head,content);
       if (long) {{ const expand=el('button','expand-btn',state.expanded.has(message.id)?'收起':'展开全文'); expand.type='button'; expand.addEventListener('click',() => {{ state.expanded.has(message.id)?state.expanded.delete(message.id):state.expanded.add(message.id); renderTimeline(); }}); body.append(expand); }}
       if (message.attachments?.length) {{
-        const attachments=el('div','attachments'); message.attachments.forEach(item => {{
-          const figure=el('figure','attachment'); if (item.available && item.data_url) {{ const image=document.createElement('img'); image.src=item.data_url; image.alt=`Image ${{short(item.sha256)}}`; figure.append(image); }}
-          figure.append(el('figcaption','',`${{item.available?'image':'missing'}} · ${{item.sha256}}`)); attachments.append(figure);
-        }}); body.append(attachments);
+        const attachments=el('div','attachments'); message.attachments.forEach(item => attachments.append(attachmentNode(item))); body.append(attachments);
       }}
       body.append(el('div','provenance',`thread=${{short(message.thread_id)}} · turn=${{message.turn_number ?? 'n/a'}} · line=${{message.line_no}} · event=${{message.event_id}} · sha256=${{message.content_sha256}}`));
       if (message.raw_event) {{ const details=el('details','raw'); const summary=el('summary','','Raw canonical event'); const pre=el('pre','',JSON.stringify(message.raw_event,null,2)); details.append(summary,pre); body.append(details); }}
@@ -522,10 +593,29 @@ def render_conversation_html(payload: dict[str, Any]) -> str:
       const lines=[`# ${{dataset.title}}`,'',`Export: ${{dataset.export_id}}`,''];
       messages.forEach(message => {{ const thread=threadById.get(message.thread_id); lines.push(`## ${{roleLabels[message.role]}} · ${{formatTime(message.timestamp)}}`,'',`Thread: ${{thread?.title || message.thread_id}}`,'',message.content); (message.attachments || []).forEach(item => lines.push('',`Attachment: ${{item.uri}} (${{item.available?'embedded':'not embedded'}})`)); lines.push('',`Evidence: thread=${{message.thread_id}} turn=${{message.turn_number ?? 'n/a'}} line=${{message.line_no}} event=${{message.event_id}} sha256=${{message.content_sha256}}`,''); }}); return lines.join('\\n');
     }}
+    function markdownV2(messages) {{
+      const lines=[`# ${{dataset.title}}`,'',`Export: ${{dataset.export_id}}`,''];
+      messages.forEach(message => {{
+        const thread=threadById.get(message.thread_id); lines.push(`## ${{roleLabels[message.role]}} · ${{formatTime(message.timestamp)}}`,'',`Thread: ${{thread?.title || message.thread_id}}`,'',message.content);
+        (message.attachments || []).forEach(item => {{
+          lines.push('',`Attachment: ${{item.display_name || item.uri}}`,'',`- Type: ${{item.kind}} (${{item.mime_type}})`,`- Size: ${{item.size_human}}`,`- Status: ${{attachmentStatus(item)}}`,`- SHA-256: ${{item.sha256}}`);
+          if(item.source_paths?.length) lines.push(`- Source: ${{item.source_paths.join(' | ')}}`);
+        }});
+        lines.push('',`Evidence: thread=${{message.thread_id}} turn=${{message.turn_number ?? 'n/a'}} line=${{message.line_no}} event=${{message.event_id}} sha256=${{message.content_sha256}}`,'');
+      }}); return lines.join('\\n');
+    }}
     function download(name,mime,content) {{ const blob=new Blob([content],{{type:mime}}); const url=URL.createObjectURL(blob); const link=document.createElement('a'); link.href=url; link.download=name; link.click(); setTimeout(()=>URL.revokeObjectURL(url),1000); }}
     function escapeHtml(value) {{ return String(value).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;'); }}
+    function selectionAttachmentHtml(item) {{
+      const payload=attachmentPayload(item); const dataUrl=payload.data_url || ''; const name=escapeHtml(item.display_name || item.uri); const source=(item.source_paths || []).map(escapeHtml).join('<br>');
+      const image=item.kind==='image'&&dataUrl?`<img style="display:block;max-width:100%;max-height:480px;object-fit:contain" src="${{escapeHtml(dataUrl)}}" alt="${{name}}">`:`<div class="file" style="padding:18px;background:#f1f3f2;font:12px ui-monospace,monospace">${{escapeHtml(item.extension?.replace('.','').toUpperCase() || item.kind || 'FILE')}} · ${{escapeHtml(item.size_human || '')}}</div>`;
+      const open=dataUrl&&item.can_open?`<a style="padding:4px 8px;border:1px solid #d4d9d6;border-radius:5px;color:#176485;text-decoration:none" href="${{escapeHtml(dataUrl)}}" target="_blank" rel="noopener noreferrer">打开</a>`:'';
+      const save=dataUrl?`<a style="padding:4px 8px;border:1px solid #d4d9d6;border-radius:5px;color:#176485;text-decoration:none" href="${{escapeHtml(dataUrl)}}" download="${{name}}">下载</a>`:'';
+      const preview=payload.text_preview?`<details><summary>文本预览</summary><pre>${{escapeHtml(payload.text_preview)}}${{payload.text_preview_truncated?'\\n\\n[preview truncated]':''}}</pre></details>`:'';
+      return `<section class="attachment" style="margin:12px 0;padding:10px;border:1px solid #d4d9d6;border-radius:6px"><div class="attachment-copy"><strong style="display:block;overflow-wrap:anywhere">${{name}}</strong><span style="display:block;margin-top:5px;color:#59635e;font:10px/1.45 ui-monospace,monospace">${{escapeHtml(item.kind)}} · ${{escapeHtml(item.mime_type)}} · ${{escapeHtml(attachmentStatus(item))}} · sha256:${{escapeHtml(short(item.sha256))}}</span>${{source?`<span style="display:block;margin-top:5px;color:#59635e;font:10px/1.45 ui-monospace,monospace">${{source}}</span>`:''}}<nav style="display:flex;gap:8px;margin:8px 0">${{open}}${{save}}</nav></div>${{image}}${{preview}}</section>`;
+    }}
     function selectionHtml(messages) {{
-      const rows=messages.map(message=>{{ const thread=threadById.get(message.thread_id); const canRender=!message.internal&&['user','assistant'].includes(message.role); const rendered=canRender?DOMPurify.sanitize(marked.parse(message.content,{{gfm:true}}),{{USE_PROFILES:{{html:true}},FORBID_TAGS:['style','form','input','button','textarea','select','option']}}):`<pre>${{escapeHtml(message.content)}}</pre>`; const source=canRender?`<details><summary>Markdown 原文</summary><pre>${{escapeHtml(message.content)}}</pre></details>`:''; const images=(message.attachments || []).filter(item=>item.available&&item.data_url).map(item=>`<figure><img src="${{escapeHtml(item.data_url)}}" alt="${{escapeHtml(item.sha256)}}"><figcaption>${{escapeHtml(item.uri)}}</figcaption></figure>`).join(''); const raw=message.raw_event?`<details><summary>Raw canonical event</summary><pre>${{escapeHtml(JSON.stringify(message.raw_event,null,2))}}</pre></details>`:''; return `<article><h2>${{escapeHtml(roleLabels[message.role])}} <small>${{escapeHtml(formatTime(message.timestamp))}}</small></h2><p class="thread">${{escapeHtml(thread?.title || message.thread_id)}}</p><div class="markdown">${{rendered}}</div>${{source}}${{images}}${{raw}}<footer>thread=${{escapeHtml(message.thread_id)}} · turn=${{message.turn_number ?? 'n/a'}} · line=${{message.line_no}} · event=${{escapeHtml(message.event_id)}} · sha256=${{escapeHtml(message.content_sha256)}}</footer></article>`; }}).join('');
+      const rows=messages.map(message=>{{ const thread=threadById.get(message.thread_id); const canRender=!message.internal&&['user','assistant'].includes(message.role); const rendered=canRender?DOMPurify.sanitize(marked.parse(message.content,{{gfm:true}}),{{USE_PROFILES:{{html:true}},FORBID_TAGS:['style','form','input','button','textarea','select','option']}}):`<pre>${{escapeHtml(message.content)}}</pre>`; const source=canRender?`<details><summary>Markdown 原文</summary><pre>${{escapeHtml(message.content)}}</pre></details>`:''; const attachments=(message.attachments || []).map(selectionAttachmentHtml).join(''); const raw=message.raw_event?`<details><summary>Raw canonical event</summary><pre>${{escapeHtml(JSON.stringify(message.raw_event,null,2))}}</pre></details>`:''; return `<article><h2>${{escapeHtml(roleLabels[message.role])}} <small>${{escapeHtml(formatTime(message.timestamp))}}</small></h2><p class="thread">${{escapeHtml(thread?.title || message.thread_id)}}</p><div class="markdown">${{rendered}}</div>${{source}}${{attachments}}${{raw}}<footer>thread=${{escapeHtml(message.thread_id)}} · turn=${{message.turn_number ?? 'n/a'}} · line=${{message.line_no}} · event=${{escapeHtml(message.event_id)}} · sha256=${{escapeHtml(message.content_sha256)}}</footer></article>`; }}).join('');
       const vendor=document.querySelector('script[data-vendor^="mermaid-"]'); const openScript='<scr'+'ipt>'; const closeScript='</scr'+'ipt>'; const mermaidRuntime=vendor?openScript+vendor.textContent+closeScript+openScript+`mermaid.initialize({{startOnLoad:false,securityLevel:'strict',theme:'neutral',flowchart:{{htmlLabels:false}}}});const nodes=[];document.querySelectorAll('pre code.language-mermaid').forEach(block=>{{const pre=block.closest('pre');const host=document.createElement('div');host.className='mermaid';host.textContent=block.textContent;pre.replaceWith(host);nodes.push(host)}});if(nodes.length)mermaid.run({{nodes,suppressErrors:true}});`+closeScript:'';
       return `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'"><title>${{escapeHtml(dataset.title)}}</title><style>body{{max-width:920px;margin:auto;padding:24px;background:#fff;color:#202522;font:14px/1.65 system-ui}}article{{padding:18px 0;border-bottom:1px solid #d4d9d6}}h1{{font-size:20px}}h2{{font-size:13px}}h3{{font-size:15px}}small,footer,.thread,figcaption,summary{{color:#59635e;font:11px ui-monospace,monospace}}pre{{max-width:100%;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;padding:10px;border:1px solid #e4e7e5;border-radius:6px;background:#f1f3f2;font:12px/1.6 ui-monospace,monospace}}code{{font-family:ui-monospace,monospace}}table{{display:block;max-width:100%;overflow:auto;border-collapse:collapse}}th,td{{min-width:90px;padding:7px 9px;border:1px solid #d4d9d6;text-align:left}}th{{background:#f1f3f2}}blockquote{{padding-left:12px;border-left:3px solid #d4d9d6;color:#59635e}}img{{display:block;max-width:100%;max-height:720px;object-fit:contain}}figure{{margin:12px 0}}details{{margin:10px 0}}.mermaid{{max-width:100%;overflow:auto;text-align:center}}</style><body><h1>${{escapeHtml(dataset.title)}}</h1>${{rows}}${{mermaidRuntime}}</body></html>`;
     }}
@@ -536,8 +626,8 @@ def render_conversation_html(payload: dict[str, Any]) -> str:
     }}
     function exportSelection(format) {{
       const messages=selectedMessages(); if (!messages.length) return; const base=`${{dataset.export_id}}-selection`;
-      if (format==='json') download(`${{base}}.json`,'application/json',JSON.stringify({{schema_version:'codex-history-evidence-selection-v1',source_export_id:dataset.export_id,messages}},null,2));
-      if (format==='md') download(`${{base}}.md`,'text/markdown;charset=utf-8',markdown(messages));
+      if (format==='json') {{ const digests=new Set(messages.flatMap(message=>(message.attachments || []).map(item=>item.sha256))); const artifacts=Object.fromEntries([...digests].filter(digest=>artifactByDigest[digest]).map(digest=>[digest,artifactByDigest[digest]])); download(`${{base}}.json`,'application/json',JSON.stringify({{schema_version:'codex-history-evidence-selection-v2',source_export_id:dataset.export_id,messages,artifacts}},null,2)); }}
+      if (format==='md') download(`${{base}}.md`,'text/markdown;charset=utf-8',markdownV2(messages));
       if (format==='html') download(`${{base}}.html`,'text/html;charset=utf-8',selectionHtml(messages));
     }}
     function renderAll() {{ renderThreads(); renderRoles(); renderViewModes(); renderTimeline(); renderSelection(); }}
@@ -554,7 +644,7 @@ def render_conversation_html(payload: dict[str, Any]) -> str:
     dom.print_page.addEventListener('click',()=>window.print());
     dom.add_visible.addEventListener('click',() => {{ state.filtered.forEach(message => {{ if(!state.selection.includes(message.id)) state.selection.push(message.id); }}); saveSelection(); renderSelection(); }});
     dom.clear_selection.addEventListener('click',() => {{ state.selection=[]; saveSelection(); renderSelection(); renderTimeline(); }});
-    dom.copy_md.addEventListener('click',()=>copyText(markdown(selectedMessages())));
+    dom.copy_md.addEventListener('click',()=>copyText(markdownV2(selectedMessages())));
     document.querySelectorAll('[data-export]').forEach(button=>button.addEventListener('click',()=>exportSelection(button.dataset.export)));
     window.addEventListener('hashchange',renderTimeline);
     renderAll();

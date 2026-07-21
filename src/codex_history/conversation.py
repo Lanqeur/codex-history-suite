@@ -4,20 +4,52 @@ import base64
 import bisect
 import hashlib
 import json
-import mimetypes
 import re
 import sqlite3
 from collections import Counter, OrderedDict, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Sequence
 
 from .util import atomic_write_json, atomic_write_text, utc_now
 
 
-CONVERSATION_EXPORT_SCHEMA = "codex-history-conversation-export-v1"
+CONVERSATION_EXPORT_SCHEMA = "codex-history-conversation-export-v2"
 ARTIFACT_URI_RE = re.compile(r"codex-history-artifact://sha256/([0-9a-f]{64})")
+SAFE_INLINE_IMAGE_MIMES = {
+    "image/avif",
+    "image/bmp",
+    "image/gif",
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+}
+TEXT_ATTACHMENT_MIMES = {
+    "application/json",
+    "application/toml",
+    "application/x-httpd-php",
+    "application/x-javascript",
+    "application/x-ndjson",
+    "application/x-sh",
+    "application/xhtml+xml",
+    "application/xml",
+    "application/yaml",
+}
+ARCHIVE_EXTENSIONS = {
+    ".7z",
+    ".bz2",
+    ".bundle",
+    ".gz",
+    ".rar",
+    ".tar",
+    ".tgz",
+    ".xz",
+    ".zip",
+}
+DEFAULT_MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
+DEFAULT_MAX_EMBEDDED_BYTES = 100 * 1024 * 1024
+TEXT_PREVIEW_BYTES = 32 * 1024
 INTERNAL_CONTEXT_PREFIXES = (
     "<environment_context>",
     "<permissions instructions>",
@@ -382,7 +414,8 @@ def _artifact_records(connection: sqlite3.Connection, digests: set[str]) -> dict
         batch = values[start : start + 500]
         placeholders = ",".join("?" for _ in batch)
         for row in connection.execute(
-            "SELECT sha256,size_bytes,cas_relative_path,artifact_uri,mime_type,extension "
+            "SELECT sha256,size_bytes,cas_relative_path,artifact_uri,mime_type,extension,"
+            "source_open_path "
             f"FROM artifact_files WHERE sha256 IN ({placeholders})",
             batch,
         ):
@@ -402,62 +435,267 @@ def _resolve_artifact(relative_path: str, roots: Sequence[Path]) -> Path | None:
     return None
 
 
-def _attach_embedded_images(
+def _artifact_observations(
+    connection: sqlite3.Connection, event_ids: Sequence[str]
+) -> dict[str, list[dict[str, str]]]:
+    if not event_ids or not _table_exists(connection, "artifact_observations"):
+        return {}
+    result: dict[str, list[dict[str, str]]] = defaultdict(list)
+    values = sorted(set(event_ids))
+    for start in range(0, len(values), 500):
+        batch = values[start : start + 500]
+        placeholders = ",".join("?" for _ in batch)
+        for row in connection.execute(
+            "SELECT event_id,artifact_sha256,original_path,capture_method "
+            f"FROM artifact_observations WHERE event_id IN ({placeholders}) "
+            "ORDER BY event_id,original_path,artifact_sha256",
+            batch,
+        ):
+            result[str(row["event_id"])].append(
+                {
+                    "sha256": str(row["artifact_sha256"]),
+                    "original_path": str(row["original_path"] or ""),
+                    "capture_method": str(row["capture_method"] or ""),
+                }
+            )
+    return result
+
+
+def _human_bytes(value: int) -> str:
+    size = float(value)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if size < 1024 or unit == "GiB":
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{value} B"
+
+
+def _attachment_kind(mime_type: str, extension: str) -> str:
+    mime = mime_type.casefold()
+    suffix = extension.casefold()
+    if mime in SAFE_INLINE_IMAGE_MIMES:
+        return "image"
+    if mime == "application/pdf" or suffix == ".pdf":
+        return "pdf"
+    if mime.startswith("text/") or mime in TEXT_ATTACHMENT_MIMES:
+        return "text"
+    if suffix in ARCHIVE_EXTENSIONS:
+        return "archive"
+    return "document"
+
+
+def _attachment_name(
+    source_paths: Sequence[str],
+    extension: str,
+    digest: str,
+    capture_methods: Sequence[str],
+) -> str:
+    if any(method.startswith("git_") for method in capture_methods):
+        return f"repository-checkpoint-{digest[:16]}{extension or '.bin'}"
+    for value in source_paths:
+        name = Path(value.replace("\\", "/")).name.strip()
+        if (
+            name
+            and not name.startswith("inline-image:")
+            and (not extension or name.casefold().endswith(extension.casefold()))
+        ):
+            return name
+    return f"artifact-{digest[:16]}{extension or '.bin'}"
+
+
+def _message_artifact_refs(
+    messages: Sequence[dict[str, Any]],
+    observations: dict[str, list[dict[str, str]]],
+) -> tuple[dict[str, list[dict[str, Any]]], set[str]]:
+    result: dict[str, list[dict[str, Any]]] = {}
+    digests: set[str] = set()
+    for message in messages:
+        refs: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        for match in ARTIFACT_URI_RE.finditer(str(message["content"])):
+            digest = match.group(1)
+            refs.setdefault(
+                digest,
+                {"sha256": digest, "uri": match.group(0), "source_paths": [], "capture_methods": []},
+            )
+        for observation in observations.get(str(message["event_id"]), []):
+            digest = observation["sha256"]
+            ref = refs.setdefault(
+                digest,
+                {
+                    "sha256": digest,
+                    "uri": f"codex-history-artifact://sha256/{digest}",
+                    "source_paths": [],
+                    "capture_methods": [],
+                },
+            )
+            path = observation["original_path"]
+            method = observation["capture_method"]
+            if path and path not in ref["source_paths"]:
+                ref["source_paths"].append(path)
+            if method and method not in ref["capture_methods"]:
+                ref["capture_methods"].append(method)
+        result[str(message["event_id"])] = list(refs.values())
+        digests.update(refs)
+    return result, digests
+
+
+def _attach_artifacts(
     connection: sqlite3.Connection,
     messages: list[dict[str, Any]],
     artifact_roots: Sequence[Path],
-) -> dict[str, Any]:
-    digests = {
-        match.group(1)
-        for message in messages
-        for match in ARTIFACT_URI_RE.finditer(str(message["content"]))
-    }
+    *,
+    embed_images: bool,
+    embed_attachments: bool,
+    max_attachment_bytes: int,
+    max_embedded_bytes: int,
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    observations = _artifact_observations(
+        connection, [str(message["event_id"]) for message in messages]
+    )
+    refs_by_event, digests = _message_artifact_refs(messages, observations)
     records = _artifact_records(connection, digests)
-    embedded = 0
+    payloads: dict[str, dict[str, Any]] = {}
+    base: dict[str, dict[str, Any]] = {}
+    embedded_images = 0
+    embedded_documents = 0
     embedded_bytes = 0
-    missing = 0
-    cache: dict[str, dict[str, Any]] = {}
+    missing: set[str] = set()
+    available: set[str] = set()
+    skipped: set[str] = set()
+
+    for digest in sorted(digests):
+        record = records.get(digest)
+        attachment: dict[str, Any] = {
+            "sha256": digest,
+            "uri": f"codex-history-artifact://sha256/{digest}",
+            "available": False,
+            "embedded": False,
+            "kind": "document",
+            "mime_type": "application/octet-stream",
+            "extension": "",
+            "size_bytes": 0,
+            "size_human": "unknown",
+            "status": "missing_record",
+            "can_open": False,
+        }
+        if not record:
+            missing.add(digest)
+            base[digest] = attachment
+            continue
+        mime = str(record.get("mime_type") or "application/octet-stream")
+        extension = str(record.get("extension") or "")
+        size = int(record.get("size_bytes") or 0)
+        kind = _attachment_kind(mime, extension)
+        attachment.update(
+            {
+                "mime_type": mime,
+                "extension": extension,
+                "size_bytes": size,
+                "size_human": _human_bytes(size),
+                "kind": kind,
+                "can_open": kind in {"image", "pdf", "text"},
+                "status": "missing_file",
+            }
+        )
+        path = _resolve_artifact(str(record.get("cas_relative_path") or ""), artifact_roots)
+        if not path:
+            missing.add(digest)
+            base[digest] = attachment
+            continue
+        attachment.update({"available": True, "status": "available_not_embedded"})
+        available.add(digest)
+        wants_embedding = embed_attachments or (embed_images and kind == "image")
+        if not wants_embedding:
+            base[digest] = attachment
+            continue
+        if size > max_attachment_bytes:
+            attachment["status"] = "skipped_file_limit"
+            skipped.add(digest)
+            base[digest] = attachment
+            continue
+        if embedded_bytes + size > max_embedded_bytes:
+            attachment["status"] = "skipped_total_limit"
+            skipped.add(digest)
+            base[digest] = attachment
+            continue
+        data = path.read_bytes()
+        if len(data) > max_attachment_bytes:
+            attachment["size_bytes"] = len(data)
+            attachment["size_human"] = _human_bytes(len(data))
+            attachment["status"] = "skipped_file_limit"
+            skipped.add(digest)
+            base[digest] = attachment
+            continue
+        data_mime = mime
+        if mime in {"image/svg+xml", "text/html", "application/xhtml+xml"}:
+            data_mime = "application/octet-stream"
+            attachment["can_open"] = False
+        payload: dict[str, Any] = {
+            "sha256": digest,
+            "mime_type": mime,
+            "data_url": f"data:{data_mime};base64,{base64.b64encode(data).decode('ascii')}",
+        }
+        if kind == "text":
+            payload["text_preview"] = data[:TEXT_PREVIEW_BYTES].decode("utf-8", errors="replace")
+            payload["text_preview_truncated"] = len(data) > TEXT_PREVIEW_BYTES
+        payloads[digest] = payload
+        attachment.update({"embedded": True, "status": "embedded"})
+        embedded_bytes += len(data)
+        if kind == "image":
+            embedded_images += 1
+        else:
+            embedded_documents += 1
+        base[digest] = attachment
+
+    attachment_occurrences = 0
     for message in messages:
         attachments: list[dict[str, Any]] = []
-        for match in ARTIFACT_URI_RE.finditer(str(message["content"])):
-            digest = match.group(1)
-            if digest in cache:
-                attachments.append(cache[digest])
-                continue
-            record = records.get(digest)
-            attachment: dict[str, Any] = {
-                "sha256": digest,
-                "uri": match.group(0),
-                "available": False,
-            }
-            if record:
-                mime = str(record.get("mime_type") or "")
-                path = _resolve_artifact(str(record.get("cas_relative_path") or ""), artifact_roots)
-                if path and mime.startswith("image/"):
-                    data = path.read_bytes()
-                    attachment.update(
-                        {
-                            "available": True,
-                            "mime_type": mime,
-                            "size_bytes": len(data),
-                            "data_url": f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}",
-                        }
-                    )
-                    embedded += 1
-                    embedded_bytes += len(data)
-                else:
-                    missing += 1
-            else:
-                missing += 1
-            cache[digest] = attachment
+        for ref in refs_by_event.get(str(message["event_id"]), []):
+            digest = str(ref["sha256"])
+            attachment = dict(base[digest])
+            source_paths = list(ref["source_paths"])
+            if not source_paths:
+                fallback = str(records.get(digest, {}).get("source_open_path") or "")
+                if fallback:
+                    source_paths.append(fallback)
+            attachment.update(
+                {
+                    "uri": ref["uri"],
+                    "source_paths": source_paths,
+                    "capture_methods": list(ref["capture_methods"]),
+                    "display_name": _attachment_name(
+                        source_paths,
+                        str(attachment["extension"]),
+                        digest,
+                        ref["capture_methods"],
+                    ),
+                }
+            )
             attachments.append(attachment)
+            attachment_occurrences += 1
         message["attachments"] = attachments
-    return {
-        "referenced_images": len(digests),
-        "embedded_images": embedded,
-        "embedded_image_bytes": embedded_bytes,
-        "missing_images": missing,
-    }
+    image_digests = {digest for digest, item in base.items() if item["kind"] == "image"}
+    return (
+        {
+            "referenced_attachments": len(digests),
+            "attachment_occurrences": attachment_occurrences,
+            "available_attachments": len(available),
+            "embedded_attachments": len(payloads),
+            "embedded_attachment_bytes": embedded_bytes,
+            "embedded_documents": embedded_documents,
+            "skipped_attachments": len(skipped),
+            "missing_attachments": len(missing),
+            "referenced_images": len(image_digests),
+            "embedded_images": embedded_images,
+            "embedded_image_bytes": sum(
+                int(base[digest]["size_bytes"])
+                for digest in image_digests
+                if base[digest]["embedded"]
+            ),
+            "missing_images": len(image_digests & missing),
+        },
+        payloads,
+    )
 
 
 def build_conversation_export(
@@ -474,9 +712,14 @@ def build_conversation_export(
     include_internal: bool = False,
     include_raw: bool = False,
     embed_images: bool = False,
+    embed_attachments: bool = False,
     artifact_roots: Sequence[Path] = (),
+    max_attachment_bytes: int = DEFAULT_MAX_ATTACHMENT_BYTES,
+    max_embedded_bytes: int = DEFAULT_MAX_EMBEDDED_BYTES,
     title: str = "Codex conversation evidence",
 ) -> dict[str, Any]:
+    if max_attachment_bytes <= 0 or max_embedded_bytes <= 0:
+        raise ValueError("attachment size limits must be positive")
     selected = resolve_threads(connection, selectors, scope_selectors)
     since_time = _parse_timestamp(since)
     until_time = _parse_timestamp(until, end_of_day=True)
@@ -617,22 +860,15 @@ def build_conversation_export(
             }
         )
 
-    artifact_report = {
-        "referenced_images": len(
-            {
-                match.group(1)
-                for message in all_messages
-                for match in ARTIFACT_URI_RE.finditer(str(message["content"]))
-            }
-        ),
-        "embedded_images": 0,
-        "embedded_image_bytes": 0,
-        "missing_images": 0,
-    }
-    if embed_images:
-        artifact_report = _attach_embedded_images(
-            connection, all_messages, artifact_roots
-        )
+    artifact_report, artifact_payloads = _attach_artifacts(
+        connection,
+        all_messages,
+        artifact_roots,
+        embed_images=embed_images,
+        embed_attachments=embed_attachments,
+        max_attachment_bytes=max_attachment_bytes,
+        max_embedded_bytes=max_embedded_bytes,
+    )
 
     digest = hashlib.sha256()
     for message in all_messages:
@@ -658,6 +894,9 @@ def build_conversation_export(
             "include_internal": include_internal,
             "include_raw": include_raw,
             "embed_images": embed_images,
+            "embed_attachments": embed_attachments,
+            "max_attachment_bytes": max_attachment_bytes,
+            "max_embedded_bytes": max_embedded_bytes,
         },
         "authority": {
             "knowledge_generated_at": metadata.get("generated_at", ""),
@@ -674,6 +913,7 @@ def build_conversation_export(
         },
         "threads": threads,
         "messages": all_messages,
+        "artifacts": artifact_payloads,
     }
 
 
@@ -705,4 +945,7 @@ def write_conversation_export(
         "messages": payload["statistics"]["messages"],
         "roles": payload["statistics"]["roles"],
         "embedded_images": payload["statistics"]["embedded_images"],
+        "referenced_attachments": payload["statistics"]["referenced_attachments"],
+        "embedded_attachments": payload["statistics"]["embedded_attachments"],
+        "missing_attachments": payload["statistics"]["missing_attachments"],
     }

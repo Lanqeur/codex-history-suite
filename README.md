@@ -46,7 +46,7 @@ codex-history doctor
 ## Original Conversation Evidence Viewer
 
 The knowledge layers are navigation aids, not a replacement for the original
-record. Version 0.6 can reconstruct selected conversations directly from the
+record. Version 0.8 can reconstruct selected conversations directly from the
 canonical snapshot and package them into a self-contained offline HTML viewer:
 
 ```bash
@@ -55,7 +55,7 @@ python3 scripts/codex_history.py conversation 'payment callback' --list
 
 # Export human turns 4 through 12 with visible messages, tool calls, and goals.
 python3 scripts/codex_history.py conversation THREAD_ID --turn-range 4:12 \
-  --include-raw --embed-images -o payment-evidence.html
+  --include-raw --embed-attachments -o payment-evidence.html
 
 # Combine every thread in a scope, constrained by event time.
 python3 scripts/codex_history.py conversation --scope FAMILY_ID \
@@ -69,9 +69,16 @@ time filtering; incremental rendering for long exports; exact event
 provenance; evidence selection and drag ordering; and exporting the chosen
 sequence as HTML, Markdown, or JSON. By default it omits injected
 environment/plugin context and leaves images as content-addressed references.
-Use `--include-internal`, `--include-raw`, or `--embed-images` only when that
-extra audit depth or portability is needed. No model call or knowledge-base
-rebuild is required.
+Attachment metadata linked to each exact event remains visible without copying
+binary content. Use `--embed-images` for a lighter image-only package, or
+`--embed-attachments` to include images and captured documents. Images render
+inline, text files have a bounded preview, PDFs can open in the browser, and
+Office/archive files can be downloaded with their filename, MIME type, size,
+original path, and SHA-256 intact. Embedded objects are content-addressed once,
+with defaults of 25 MiB per file and 100 MiB total; adjust those limits with
+`--max-attachment-mb` and `--max-embedded-mb`. No model call or knowledge-base
+rebuild is required, but a path-only reference can be packaged only after the
+file has been captured into the artifact CAS.
 
 New profiles use a model-first two-stage preset: non-thinking `deepseek-v4-flash` reduces the token-heavy new evidence into append-only ledgers, then non-thinking `qwen3.7-max` updates the much smaller thread/family overviews. When `DASHSCOPE_API_KEY` is unavailable, deterministic evidence is still ingested, but the library is explicitly marked `pending_model_consolidation`. This is a searchable emergency fallback, not a finished summary layer; a later model-enabled `update` completes the backlog even when no transcript changed.
 
