@@ -35,6 +35,13 @@ have already been replaced by content-addressed artifact URIs; `--embed-images`
 resolves available image objects and adds data URLs to make the export
 self-contained. These switches can substantially increase output size.
 
+The offline HTML uses pinned local Marked and DOMPurify builds to render
+sanitized user/assistant Markdown and GFM tables. A pinned Mermaid runtime is
+embedded only when the selected messages contain a fenced `mermaid` block, and
+runs with `securityLevel: strict`. The viewer always offers a literal source
+mode; tool, goal, internal-context, and raw canonical events are never passed
+through the Markdown renderer.
+
 ## Time
 
 - `occurred_start_at/end_at`: source-event time.

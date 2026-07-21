@@ -36,7 +36,7 @@ python3 ../../scripts/codex_history.py stats
 
 Add `--json` for programmatic filtering. If no active build exists, stop and direct the user to explicitly invoke `$build-codex-history`; do not initialize or update from this read-only Skill.
 
-Conversation export defaults to visible user/assistant messages plus tool and goal events. It suppresses duplicate Codex event representations and injected environment/plugin context. Add `--include-internal` only when internal context is material, `--include-raw` for the complete normalized source event, and `--embed-images` for a self-contained cross-device viewer. Prefer a bounded export over an entire large thread. The offline viewer lets a human filter, select, reorder, and export an evidence sequence as HTML, Markdown, or JSON.
+Conversation export defaults to visible user/assistant messages plus tool and goal events. It suppresses duplicate Codex event representations and injected environment/plugin context. Add `--include-internal` only when internal context is material, `--include-raw` for the complete normalized source event, and `--embed-images` for a self-contained cross-device viewer. Prefer a bounded export over an entire large thread. The offline viewer safely renders user/assistant Markdown, GFM tables, and fenced Mermaid diagrams while preserving a literal source mode; tool, goal, internal, and raw events stay literal. A human can filter, select, reorder, and export an evidence sequence as HTML, Markdown, or JSON.
 
 For cross-device questions, start with the read-only federated command. Omit `--from` to search every enabled library, or repeat it to constrain the authorities:
 

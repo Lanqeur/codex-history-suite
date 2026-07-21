@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.0 - 2026-07-21
+
+- Render user and assistant Markdown with offline GFM table support while retaining a one-click source view.
+- Render fenced Mermaid diagrams offline in strict security mode, embedding the pinned runtime only when a selected range contains Mermaid.
+- Sanitize rendered historical content with DOMPurify and keep tool, goal, internal-context, and raw evidence in literal source form.
+- Bundle pinned Marked, DOMPurify, and Mermaid browser builds plus their licenses in plugin and Python package distributions.
+
 ## 0.6.1 - 2026-07-21
 
 - Make the conversation evidence viewer and its selected-evidence HTML exports use a high-contrast light theme by default.

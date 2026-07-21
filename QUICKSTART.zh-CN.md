@@ -108,8 +108,9 @@ python3 scripts/codex_history.py conversation THREAD_ID --turn-range 4:12 \
   --include-raw --embed-images -o evidence.html
 ```
 
-打开 `evidence.html` 后，可以继续按正文、角色和时间筛选，勾选任意消息，拖拽
-调整顺序，再导出为 HTML、Markdown 或 JSON。这样既能人工复核知识库结论，也能
+打开 `evidence.html` 后，用户/助手消息中的 Markdown 表格和 Mermaid 图会离线
+渲染，并可随时切回原文；工具调用和原始事件始终按字面显示。页面还能继续按正文、
+角色和时间筛选，勾选任意消息，拖拽调整顺序，再导出为 HTML、Markdown 或 JSON。这样既能人工复核知识库结论，也能
 为某个具体问题整理一份带原始来源的证据链。默认不包含内部环境注入和图片实体；
 完整审计可增加 `--include-internal`，跨设备查看图片可增加 `--embed-images`。
 这项导出不调用模型，也不修改现有知识库。

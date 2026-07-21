@@ -8,6 +8,7 @@ from codex_history.conversation import (
     parse_turn_range,
     write_conversation_export,
 )
+from codex_history.conversation_viewer import render_conversation_html
 from codex_history.pipeline import build_full
 from codex_history.schema import connect
 
@@ -20,6 +21,21 @@ def test_turn_range_parser_uses_human_one_based_ranges():
     assert parse_turn_range("4:12").contains(12)
     assert parse_turn_range(":5").contains(1)
     assert parse_turn_range("8:").contains(99)
+
+
+def test_conversation_html_only_embeds_mermaid_runtime_when_needed():
+    html = render_conversation_html(
+        {
+            "title": "Plain evidence",
+            "export_id": "conversation-plain",
+            "statistics": {"threads": 0, "messages": 0},
+            "threads": [],
+            "messages": [],
+        }
+    )
+    assert 'data-vendor="marked-18.0.7"' in html
+    assert 'data-vendor="dompurify-3.4.12"' in html
+    assert 'data-vendor="mermaid-11.16.0"' not in html
 
 
 def test_conversation_export_restores_visible_messages_and_embeds_images(
@@ -36,7 +52,17 @@ def test_conversation_export_restores_visible_messages_and_embeds_images(
     )
     rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
     user_text = "Inspect </script><script>alert(1)</script>\nand preserve the image."
-    assistant_text = "Verified output.\nThe original line break remains."
+    assistant_text = """Verified output.
+The original line break remains.
+
+| Check | Result |
+| --- | --- |
+| Exact text | Pass |
+
+```mermaid
+flowchart LR
+  Source --> Evidence --> Review
+```"""
     rows.insert(
         2,
         {
@@ -135,6 +161,12 @@ def test_conversation_export_restores_visible_messages_and_embeds_images(
     assert '<html lang="zh-CN" data-theme="light">' in html
     assert 'id="toggle-theme"' in html
     assert "codex-history-viewer-theme" in html
+    assert 'data-vendor="dompurify-3.4.12"' in html
+    assert 'data-vendor="marked-18.0.7"' in html
+    assert 'data-vendor="mermaid-11.16.0"' in html
+    assert 'data-view-mode="rendered"' in html
+    assert 'data-view-mode="source"' in html
+    assert "securityLevel:'strict'" in html
     assert "data:image/png;base64," in html
     assert "</script><script>alert(1)</script>" not in html
     assert "\\u003c/script\\u003e\\u003cscript\\u003ealert(1)" in html

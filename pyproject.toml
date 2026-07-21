@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codex-history-suite"
-version = "0.6.1"
+version = "0.7.0"
 description = "Portable, evidence-first knowledge base for local Codex transcripts"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -20,6 +20,9 @@ codex-history = "codex_history.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+codex_history = ["vendor/*.js", "vendor/*.txt", "vendor/README.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

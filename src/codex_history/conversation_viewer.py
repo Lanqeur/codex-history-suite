@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import re
+from functools import lru_cache
+from importlib.resources import files
 from typing import Any
 
 
@@ -15,12 +18,39 @@ def _json_for_script(value: Any) -> str:
     )
 
 
+@lru_cache(maxsize=3)
+def _browser_asset(filename: str) -> str:
+    value = (
+        files("codex_history")
+        .joinpath("vendor")
+        .joinpath(filename)
+        .read_text(encoding="utf-8")
+    )
+    return value.replace("</script", "<\\/script")
+
+
+def _contains_mermaid(payload: dict[str, Any]) -> bool:
+    return any(
+        re.search(r"(?im)^\s*(?:```|~~~)\s*mermaid\b", str(message.get("content") or ""))
+        for message in payload.get("messages", [])
+        if isinstance(message, dict)
+    )
+
+
 def render_conversation_html(payload: dict[str, Any]) -> str:
     title = str(payload.get("title") or "Codex conversation evidence")
     safe_title = (
         title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     )
     data = _json_for_script(payload)
+    dompurify_js = _browser_asset("dompurify-3.4.12.min.js")
+    marked_js = _browser_asset("marked-18.0.7.umd.js")
+    mermaid_script = ""
+    if _contains_mermaid(payload):
+        mermaid_script = (
+            '<script data-vendor="mermaid-11.16.0">'
+            f'{_browser_asset("mermaid-11.16.0.min.js")}</script>'
+        )
     return f"""<!doctype html>
 <html lang="zh-CN" data-theme="light">
 <head>
@@ -140,6 +170,11 @@ def render_conversation_html(payload: dict[str, Any]) -> str:
     .search-wrap {{ position: relative; }}
     .search-wrap .icon {{ position: absolute; left: 10px; top: 9px; color: var(--muted); }}
     .search {{ width: 100%; height: 35px; padding: 0 10px 0 34px; border-radius: 6px; border: 1px solid var(--line); background: var(--input); color: var(--text); }}
+    .filter-controls {{ display: flex; gap: 8px; align-items: center; justify-content: flex-end; }}
+    .view-modes {{ flex: 0 0 auto; display: flex; padding: 2px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); }}
+    .mode-btn {{ height: 27px; padding: 0 7px; border: 0; border-radius: 4px; background: transparent; color: var(--muted); display: inline-flex; align-items: center; gap: 5px; font-size: 10px; cursor: pointer; }}
+    .mode-btn .icon {{ width: 14px; height: 14px; }}
+    .mode-btn.active {{ color: var(--text); background: var(--panel-2); box-shadow: 0 1px 2px var(--shadow); }}
     .role-filters {{ display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }}
     .role-chip {{ position: relative; }}
     .role-chip input {{ position: absolute; opacity: 0; pointer-events: none; }}
@@ -171,7 +206,31 @@ def render_conversation_html(payload: dict[str, Any]) -> str:
     .mini-btn {{ width: 27px; height: 27px; border: 0; background: transparent; color: var(--muted); border-radius: 5px; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; }}
     .mini-btn:hover {{ color: var(--text); background: var(--hover-strong); }}
     .message-body {{ position: relative; min-width: 0; }}
-    .message-content {{ margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 13px/1.62 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; letter-spacing: 0; }}
+    .message-content {{ margin: 0; overflow-wrap: anywhere; letter-spacing: 0; }}
+    .source-content {{ white-space: pre-wrap; font: 13px/1.62 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; }}
+    .markdown-body {{ font: 14px/1.65 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+    .markdown-body > :first-child {{ margin-top: 0; }}
+    .markdown-body > :last-child {{ margin-bottom: 0; }}
+    .markdown-body h1, .markdown-body h2, .markdown-body h3, .markdown-body h4 {{ margin: 1.15em 0 .5em; line-height: 1.3; font-weight: 680; letter-spacing: 0; }}
+    .markdown-body h1 {{ font-size: 20px; }}
+    .markdown-body h2 {{ font-size: 17px; padding-bottom: 5px; border-bottom: 1px solid var(--line-soft); }}
+    .markdown-body h3 {{ font-size: 15px; }}
+    .markdown-body h4 {{ font-size: 14px; }}
+    .markdown-body p, .markdown-body ul, .markdown-body ol, .markdown-body blockquote, .markdown-body pre, .markdown-body table {{ margin: .7em 0; }}
+    .markdown-body ul, .markdown-body ol {{ padding-left: 1.7em; }}
+    .markdown-body li + li {{ margin-top: .2em; }}
+    .markdown-body blockquote {{ padding: 2px 0 2px 12px; border-left: 3px solid var(--line); color: var(--muted); }}
+    .markdown-body code {{ padding: 2px 4px; border-radius: 4px; background: var(--panel); font: .9em ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; }}
+    .markdown-body pre {{ max-width: 100%; overflow: auto; padding: 11px 12px; border: 1px solid var(--line-soft); border-radius: 6px; background: var(--panel); }}
+    .markdown-body pre code {{ padding: 0; background: transparent; font-size: 12px; line-height: 1.55; }}
+    .markdown-body table {{ display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; font-size: 12px; }}
+    .markdown-body th, .markdown-body td {{ min-width: 90px; padding: 7px 9px; border: 1px solid var(--line); text-align: left; vertical-align: top; }}
+    .markdown-body th {{ background: var(--panel); font-weight: 680; }}
+    .markdown-body a {{ color: var(--blue); text-decoration-thickness: 1px; text-underline-offset: 2px; }}
+    .markdown-body hr {{ border: 0; border-top: 1px solid var(--line); margin: 1.2em 0; }}
+    .mermaid-host {{ max-width: 100%; overflow: auto; padding: 10px; border: 1px solid var(--line-soft); border-radius: 6px; background: var(--panel-2); text-align: center; }}
+    .mermaid-host svg {{ display: inline-block; max-width: 100%; height: auto; }}
+    .mermaid-error {{ text-align: left; color: var(--danger); }}
     .message-content.clamped {{ max-height: 340px; overflow: hidden; }}
     .message-content.clamped::after {{ content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 56px; background: linear-gradient(transparent, var(--bg)); pointer-events: none; }}
     .user .message-content.clamped::after {{ background: linear-gradient(transparent, var(--user)); }}
@@ -215,6 +274,7 @@ def render_conversation_html(payload: dict[str, Any]) -> str:
       .sidebar {{ display: none; }}
       .filters {{ grid-template-columns: 1fr; }}
       .mobile-thread-select {{ display: block; }}
+      .filter-controls {{ justify-content: flex-start; flex-wrap: wrap; }}
       .role-filters {{ justify-content: flex-start; overflow-x: auto; flex-wrap: nowrap; }}
       .range-row {{ flex-wrap: wrap; }}
       .result-summary {{ width: 100%; margin-left: 0; }}
@@ -249,6 +309,8 @@ def render_conversation_html(payload: dict[str, Any]) -> str:
     <symbol id="i-moon" viewBox="0 0 24 24"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9"></path></symbol>
     <symbol id="i-up" viewBox="0 0 24 24"><path d="m18 15-6-6-6 6"></path></symbol>
     <symbol id="i-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"></path></symbol>
+    <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2.1 12a10 10 0 0 1 19.8 0 10 10 0 0 1-19.8 0"></path><circle cx="12" cy="12" r="3"></circle></symbol>
+    <symbol id="i-code" viewBox="0 0 24 24"><path d="m16 18 6-6-6-6"></path><path d="m8 6-6 6 6 6"></path></symbol>
   </defs></svg>
   <header class="app-header">
     <div class="brand"><h1 id="app-title"></h1><div class="brand-meta" id="brand-meta"></div></div>
@@ -267,7 +329,13 @@ def render_conversation_html(payload: dict[str, Any]) -> str:
       <div class="filters">
         <select class="mobile-thread-select" id="mobile-thread" aria-label="选择会话"></select>
         <label class="search-wrap"><svg class="icon"><use href="#i-search"></use></svg><input class="search" id="search" type="search" placeholder="搜索消息、工具或事件 ID" autocomplete="off"></label>
-        <div class="role-filters" id="role-filters"></div>
+        <div class="filter-controls">
+          <div class="view-modes" role="group" aria-label="消息显示模式">
+            <button class="mode-btn active" type="button" data-view-mode="rendered" title="渲染 Markdown"><svg class="icon"><use href="#i-eye"></use></svg><span>渲染</span></button>
+            <button class="mode-btn" type="button" data-view-mode="source" title="显示 Markdown 原文"><svg class="icon"><use href="#i-code"></use></svg><span>原文</span></button>
+          </div>
+          <div class="role-filters" id="role-filters"></div>
+        </div>
       </div>
       <div class="range-row">
         <span class="range-label">时间</span><input id="since" type="datetime-local" title="开始时间"><span class="range-label">至</span><input id="until" type="datetime-local" title="结束时间">
@@ -290,6 +358,9 @@ def render_conversation_html(payload: dict[str, Any]) -> str:
       </div>
     </aside>
   </div>
+  <script data-vendor="dompurify-3.4.12">{dompurify_js}</script>
+  <script data-vendor="marked-18.0.7">{marked_js}</script>
+  {mermaid_script}
   <script id="codex-history-data" type="application/json">{data}</script>
   <script>
   (() => {{
@@ -302,7 +373,7 @@ def render_conversation_html(payload: dict[str, Any]) -> str:
     const storageKey = `codex-history-evidence:${{dataset.export_id}}`;
     const state = {{
       thread: 'all', search: '', roles: new Set(roleOrder), since: '', until: '',
-      selection: loadSelection(), visibleLimit: 140, filtered: [], expanded: new Set()
+      viewMode: 'rendered', selection: loadSelection(), visibleLimit: 140, filtered: [], expanded: new Set()
     }};
     const dom = Object.fromEntries(['app-title','brand-meta','thread-count','thread-list','mobile-thread','search','role-filters','since','until','result-summary','timeline','timeline-inner','selection-count','selection-list','toggle-tray','toggle-theme','print-page','add-visible','copy-md','clear-selection'].map(id => [id.replaceAll('-','_'), document.getElementById(id)]));
 
@@ -331,6 +402,22 @@ def render_conversation_html(payload: dict[str, Any]) -> str:
       return new Intl.DateTimeFormat('zh-CN',{{year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}}).format(date);
     }}
     function short(value, size=12) {{ return value ? value.slice(0,size) : 'none'; }}
+    function markdownNode(source) {{
+      const node=el('div','message-content markdown-body');
+      const rendered=marked.parse(source,{{gfm:true,breaks:false}});
+      node.innerHTML=DOMPurify.sanitize(rendered,{{USE_PROFILES:{{html:true}},FORBID_TAGS:['style','form','input','button','textarea','select','option']}});
+      return node;
+    }}
+    async function renderMermaid(root) {{
+      if (!window.mermaid) return;
+      const blocks=[...root.querySelectorAll('pre code.language-mermaid')]; if (!blocks.length) return;
+      mermaid.initialize({{startOnLoad:false,securityLevel:'strict',theme:document.documentElement.dataset.theme==='dark'?'dark':'neutral',flowchart:{{htmlLabels:false}}}});
+      for (const block of blocks) {{
+        const pre=block.closest('pre'); if (!pre) continue; const source=block.textContent; const host=el('div','mermaid mermaid-host',source); pre.replaceWith(host);
+        try {{ await mermaid.run({{nodes:[host],suppressErrors:true}}); }}
+        catch (_) {{ const fallback=el('pre','mermaid-error'); const code=el('code','language-mermaid',source); fallback.append(code); host.replaceWith(fallback); }}
+      }}
+    }}
     function activeMessages() {{
       const query = state.search.trim().toLocaleLowerCase();
       const since = state.since ? new Date(state.since).valueOf() : null;
@@ -373,6 +460,7 @@ def render_conversation_html(payload: dict[str, Any]) -> str:
         label.append(input,el('span','',roleLabels[role])); dom.role_filters.append(label);
       }});
     }}
+    function renderViewModes() {{ document.querySelectorAll('[data-view-mode]').forEach(button => button.classList.toggle('active',button.dataset.viewMode===state.viewMode)); }}
     function renderTimeline() {{
       const messages=activeMessages(); state.filtered=messages; dom.timeline_inner.replaceChildren();
       const current=state.thread==='all'?null:threadById.get(state.thread);
@@ -386,6 +474,7 @@ def render_conversation_html(payload: dict[str, Any]) -> str:
         const more=el('button','load-more',`继续加载 ${{Math.min(140,messages.length-state.visibleLimit)}} 条`); more.type='button';
         more.addEventListener('click',() => {{ state.visibleLimit+=140; renderTimeline(); }}); dom.timeline_inner.append(more);
       }}
+      if (state.viewMode==='rendered') void renderMermaid(dom.timeline_inner);
       const anchor=decodeURIComponent(location.hash.slice(1)); if (anchor && byId.has(anchor)) requestAnimationFrame(() => document.getElementById(anchor)?.scrollIntoView({{block:'center'}}));
     }}
     function messageNode(message) {{
@@ -397,7 +486,8 @@ def render_conversation_html(payload: dict[str, Any]) -> str:
       head.append(el('span','message-time',formatTime(message.timestamp)));
       const tools=el('div','message-tools'); const link=el('button','mini-btn'); link.type='button'; link.title='复制证据链接'; link.append(svg('link'));
       link.addEventListener('click',async() => {{ location.hash=message.id; await navigator.clipboard?.writeText(location.href); }}); tools.append(link); head.append(tools);
-      const content=el('pre','message-content',message.content); const long=message.content.length>2400 || message.content.split('\\n').length>28;
+      const renderMarkdown=state.viewMode==='rendered' && !message.internal && ['user','assistant'].includes(message.role);
+      const content=renderMarkdown?markdownNode(message.content):el('pre','message-content source-content',message.content); const long=message.content.length>2400 || message.content.split('\\n').length>28;
       if (long && !state.expanded.has(message.id)) content.classList.add('clamped');
       body.append(head,content);
       if (long) {{ const expand=el('button','expand-btn',state.expanded.has(message.id)?'收起':'展开全文'); expand.type='button'; expand.addEventListener('click',() => {{ state.expanded.has(message.id)?state.expanded.delete(message.id):state.expanded.add(message.id); renderTimeline(); }}); body.append(expand); }}
@@ -435,8 +525,9 @@ def render_conversation_html(payload: dict[str, Any]) -> str:
     function download(name,mime,content) {{ const blob=new Blob([content],{{type:mime}}); const url=URL.createObjectURL(blob); const link=document.createElement('a'); link.href=url; link.download=name; link.click(); setTimeout(()=>URL.revokeObjectURL(url),1000); }}
     function escapeHtml(value) {{ return String(value).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;'); }}
     function selectionHtml(messages) {{
-      const rows=messages.map(message=>{{ const thread=threadById.get(message.thread_id); const images=(message.attachments || []).filter(item=>item.available&&item.data_url).map(item=>`<figure><img src="${{escapeHtml(item.data_url)}}" alt="${{escapeHtml(item.sha256)}}"><figcaption>${{escapeHtml(item.uri)}}</figcaption></figure>`).join(''); const raw=message.raw_event?`<details><summary>Raw canonical event</summary><pre>${{escapeHtml(JSON.stringify(message.raw_event,null,2))}}</pre></details>`:''; return `<article><h2>${{escapeHtml(roleLabels[message.role])}} <small>${{escapeHtml(formatTime(message.timestamp))}}</small></h2><p class="thread">${{escapeHtml(thread?.title || message.thread_id)}}</p><pre>${{escapeHtml(message.content)}}</pre>${{images}}${{raw}}<footer>thread=${{escapeHtml(message.thread_id)}} · turn=${{message.turn_number ?? 'n/a'}} · line=${{message.line_no}} · event=${{escapeHtml(message.event_id)}} · sha256=${{escapeHtml(message.content_sha256)}}</footer></article>`; }}).join('');
-      return `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${{escapeHtml(dataset.title)}}</title><style>body{{max-width:920px;margin:auto;padding:24px;background:#fff;color:#202522;font-family:system-ui}}article{{padding:18px 0;border-bottom:1px solid #d4d9d6}}h1{{font-size:20px}}h2{{font-size:13px}}small,footer,.thread,figcaption{{color:#59635e;font:11px ui-monospace,monospace}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.6 ui-monospace,monospace}}img{{display:block;max-width:100%;max-height:720px;object-fit:contain}}figure{{margin:12px 0}}</style><body><h1>${{escapeHtml(dataset.title)}}</h1>${{rows}}</body></html>`;
+      const rows=messages.map(message=>{{ const thread=threadById.get(message.thread_id); const canRender=!message.internal&&['user','assistant'].includes(message.role); const rendered=canRender?DOMPurify.sanitize(marked.parse(message.content,{{gfm:true}}),{{USE_PROFILES:{{html:true}},FORBID_TAGS:['style','form','input','button','textarea','select','option']}}):`<pre>${{escapeHtml(message.content)}}</pre>`; const source=canRender?`<details><summary>Markdown 原文</summary><pre>${{escapeHtml(message.content)}}</pre></details>`:''; const images=(message.attachments || []).filter(item=>item.available&&item.data_url).map(item=>`<figure><img src="${{escapeHtml(item.data_url)}}" alt="${{escapeHtml(item.sha256)}}"><figcaption>${{escapeHtml(item.uri)}}</figcaption></figure>`).join(''); const raw=message.raw_event?`<details><summary>Raw canonical event</summary><pre>${{escapeHtml(JSON.stringify(message.raw_event,null,2))}}</pre></details>`:''; return `<article><h2>${{escapeHtml(roleLabels[message.role])}} <small>${{escapeHtml(formatTime(message.timestamp))}}</small></h2><p class="thread">${{escapeHtml(thread?.title || message.thread_id)}}</p><div class="markdown">${{rendered}}</div>${{source}}${{images}}${{raw}}<footer>thread=${{escapeHtml(message.thread_id)}} · turn=${{message.turn_number ?? 'n/a'}} · line=${{message.line_no}} · event=${{escapeHtml(message.event_id)}} · sha256=${{escapeHtml(message.content_sha256)}}</footer></article>`; }}).join('');
+      const vendor=document.querySelector('script[data-vendor^="mermaid-"]'); const openScript='<scr'+'ipt>'; const closeScript='</scr'+'ipt>'; const mermaidRuntime=vendor?openScript+vendor.textContent+closeScript+openScript+`mermaid.initialize({{startOnLoad:false,securityLevel:'strict',theme:'neutral',flowchart:{{htmlLabels:false}}}});const nodes=[];document.querySelectorAll('pre code.language-mermaid').forEach(block=>{{const pre=block.closest('pre');const host=document.createElement('div');host.className='mermaid';host.textContent=block.textContent;pre.replaceWith(host);nodes.push(host)}});if(nodes.length)mermaid.run({{nodes,suppressErrors:true}});`+closeScript:'';
+      return `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'"><title>${{escapeHtml(dataset.title)}}</title><style>body{{max-width:920px;margin:auto;padding:24px;background:#fff;color:#202522;font:14px/1.65 system-ui}}article{{padding:18px 0;border-bottom:1px solid #d4d9d6}}h1{{font-size:20px}}h2{{font-size:13px}}h3{{font-size:15px}}small,footer,.thread,figcaption,summary{{color:#59635e;font:11px ui-monospace,monospace}}pre{{max-width:100%;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;padding:10px;border:1px solid #e4e7e5;border-radius:6px;background:#f1f3f2;font:12px/1.6 ui-monospace,monospace}}code{{font-family:ui-monospace,monospace}}table{{display:block;max-width:100%;overflow:auto;border-collapse:collapse}}th,td{{min-width:90px;padding:7px 9px;border:1px solid #d4d9d6;text-align:left}}th{{background:#f1f3f2}}blockquote{{padding-left:12px;border-left:3px solid #d4d9d6;color:#59635e}}img{{display:block;max-width:100%;max-height:720px;object-fit:contain}}figure{{margin:12px 0}}details{{margin:10px 0}}.mermaid{{max-width:100%;overflow:auto;text-align:center}}</style><body><h1>${{escapeHtml(dataset.title)}}</h1>${{rows}}${{mermaidRuntime}}</body></html>`;
     }}
     async function copyText(value) {{
       if (!value) return;
@@ -449,16 +540,17 @@ def render_conversation_html(payload: dict[str, Any]) -> str:
       if (format==='md') download(`${{base}}.md`,'text/markdown;charset=utf-8',markdown(messages));
       if (format==='html') download(`${{base}}.html`,'text/html;charset=utf-8',selectionHtml(messages));
     }}
-    function renderAll() {{ renderThreads(); renderRoles(); renderTimeline(); renderSelection(); }}
+    function renderAll() {{ renderThreads(); renderRoles(); renderViewModes(); renderTimeline(); renderSelection(); }}
 
     setTheme(loadTheme());
     dom.app_title.textContent=dataset.title; dom.brand_meta.textContent=`${{dataset.statistics.threads}} threads · ${{dataset.statistics.messages}} events · ${{dataset.export_id}}`;
     dom.mobile_thread.addEventListener('change',() => {{ state.thread=dom.mobile_thread.value; state.visibleLimit=140; renderAll(); }});
     dom.search.addEventListener('input',() => {{ state.search=dom.search.value; state.visibleLimit=140; renderTimeline(); }});
+    document.querySelectorAll('[data-view-mode]').forEach(button=>button.addEventListener('click',()=>{{ state.viewMode=button.dataset.viewMode; renderViewModes(); renderTimeline(); }}));
     dom.since.addEventListener('change',() => {{ state.since=dom.since.value; state.visibleLimit=140; renderTimeline(); }});
     dom.until.addEventListener('change',() => {{ state.until=dom.until.value; state.visibleLimit=140; renderTimeline(); }});
     dom.toggle_tray.addEventListener('click',()=>document.body.classList.toggle('tray-open'));
-    dom.toggle_theme.addEventListener('click',()=>setTheme(document.documentElement.dataset.theme==='dark'?'light':'dark',true));
+    dom.toggle_theme.addEventListener('click',()=>{{ setTheme(document.documentElement.dataset.theme==='dark'?'light':'dark',true); renderTimeline(); }});
     dom.print_page.addEventListener('click',()=>window.print());
     dom.add_visible.addEventListener('click',() => {{ state.filtered.forEach(message => {{ if(!state.selection.includes(message.id)) state.selection.push(message.id); }}); saveSelection(); renderSelection(); }});
     dom.clear_selection.addEventListener('click',() => {{ state.selection=[]; saveSelection(); renderSelection(); renderTimeline(); }});

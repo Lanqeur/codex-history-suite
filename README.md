@@ -62,10 +62,12 @@ python3 scripts/codex_history.py conversation --scope FAMILY_ID \
   --since 2026-06-01 --until 2026-06-30 -o family-evidence.html
 ```
 
-The viewer works without a server or network connection. It supports thread,
-text, role, and time filtering; incremental rendering for long exports; exact
-event provenance; evidence selection and drag ordering; and exporting the
-chosen sequence as HTML, Markdown, or JSON. By default it omits injected
+The viewer works without a server or network connection. It renders sanitized
+user and assistant Markdown, including GFM tables and fenced Mermaid diagrams,
+with a one-click literal source view. It also supports thread, text, role, and
+time filtering; incremental rendering for long exports; exact event
+provenance; evidence selection and drag ordering; and exporting the chosen
+sequence as HTML, Markdown, or JSON. By default it omits injected
 environment/plugin context and leaves images as content-addressed references.
 Use `--include-internal`, `--include-raw`, or `--embed-images` only when that
 extra audit depth or portability is needed. No model call or knowledge-base

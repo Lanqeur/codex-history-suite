@@ -61,9 +61,10 @@ python3 scripts/codex_history.py conversation --scope FAMILY_ID \
   --since 2026-06-01 --until 2026-06-30 -o family-evidence.html
 ```
 
-页面不依赖服务端或网络，支持按会话、正文、角色和时间过滤，长记录渐进渲染，
-逐条查看来源位置，勾选证据后拖拽排序，并把选中的事实链另存为 HTML、Markdown
-或 JSON。默认隐藏环境/插件注入上下文，图片只保留内容寻址引用；确实需要完整
+页面不依赖服务端或网络，默认安全渲染用户/助手消息中的 Markdown、GFM 表格和
+Mermaid 代码块，也能一键切回逐字原文。它支持按会话、正文、角色和时间过滤，
+长记录渐进渲染，逐条查看来源位置，勾选证据后拖拽排序，并把选中的事实链另存为
+HTML、Markdown 或 JSON。默认隐藏环境/插件注入上下文，图片只保留内容寻址引用；确实需要完整
 审计或跨设备查看图片时，再使用 `--include-internal`、`--include-raw` 或
 `--embed-images`。整个过程不调用模型，也不需要重建知识库。
 
