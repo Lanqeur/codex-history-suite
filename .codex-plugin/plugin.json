@@ -1,6 +1,6 @@
 {
   "name": "codex-history-suite",
-  "version": "0.10.1+codex.20260722094652",
+  "version": "0.10.1+codex.20260722104153",
   "description": "Build, move, search, trace, export, and natively restore portable evidence-first Codex history.",
   "author": {
     "name": "Lanqeur",
