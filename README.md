@@ -130,9 +130,9 @@ python3 scripts/codex_history.py plan --mode full --json
 
 The generated prices are editable planning inputs. The preset records CNY 1/2 per million input/output tokens for `deepseek-v4-flash`, CNY 6/1.2/18 for Qwen writer uncached-input/cached-input/output, and CNY 0.5 per million input tokens for `text-embedding-v4`. Always verify the [current Model Studio pricing](https://help.aliyun.com/zh/model-studio/model-pricing) for the selected region and deployment.
 
-`plan` and `update --dry-run` report transcript bytes, new/reprocessed bytes, pending fact blocks, separate reducer/writer tokens and prices, expected cached input, embedding tokens, expected and conservative CNY cost, and a low/expected/upper disk estimate. Inline data-URI base64 is excluded from model-token estimates while remaining in snapshot storage. A key is not required just to budget a build.
+`plan` and `update --dry-run` report transcript bytes, new/reprocessed bytes, pending fact blocks, separate reducer/writer tokens and prices, expected cached input, embedding tokens, expected and conservative CNY cost, a low/expected/upper disk estimate, and a transient `resource_preflight`. The preflight includes real filesystem free space, candidate SQLite/semantic copy size, configured headroom, and the required peak; a failing check stops before a multi-gigabyte candidate is created. Inline data-URI base64 is excluded from model-token estimates while remaining in snapshot storage. A key is not required just to budget a build.
 
-Completed builds return an actual `usage` summary for model input, provider-cached input, output, embedding tokens, response-cache hits, and CNY cost, plus `storage` totals for the active core components and the whole retained profile.
+Completed builds return an actual `usage` summary for model input, provider-cached input, output, embedding tokens, response-cache hits, and CNY cost, plus `storage` totals for the active core components and the whole retained profile. Every provider attempt, including failed retries, is also appended to `usage/api-usage.jsonl`; later plans expose its cumulative `usage_ledger`. Successful promotion keeps the active build plus one rollback build by default and reports reclaimed bytes.
 
 ## Referenced Files And Git Checkpoints
 
@@ -185,7 +185,7 @@ python3 scripts/codex_history.py library list --json
 python3 scripts/codex_history.py library search 'release decision' --deep --json
 ```
 
-The next delta can use the previous delta as `--base`. Each delta contains the complete target source inventory and artifact mappings but packages only blobs absent from its base generation. Stable evidence-based model cache keys are included by default, so the receiver can reproduce source-side consolidation without duplicate model charges. `apply-delta` requires the exact `library_id` and a compatible source generation, and rejects missing, out-of-order, cross-library, or tampered deltas before promotion. An artifact-only delta remains actionable when its transcript generation is unchanged; it merges mappings and verifies CAS closure with zero model calls.
+The next delta can use the previous delta as `--base`. Delta v2 is the default: its bounded manifest contains source and file inventories while large artifact mappings live in a gzip JSONL row stream that is hashed and verified one row at a time. It packages only blobs absent from the base plus producer-computed authority rows, semantic-index file differences, and stable model-cache entries. A receiver normally reports `apply_mode: precomputed` and installs the already consolidated knowledge/semantic state with zero model calls. If a patch is absent, unsafe for a deletion, or fails an invariant, it reports `rebuild_fallback` with `fast_apply_error` and runs the canonical incremental pipeline instead. `apply-delta` still requires the exact `library_id` and compatible source generation and rejects missing, out-of-order, cross-library, or tampered deltas before promotion. Legacy v1 deltas with bounded manifests remain readable and applicable; manifests above the 16 MiB safety limit are rejected before parsing and must be rebuilt as v2.
 
 Imported profiles are named from the source device and profile, with collision suffixes added automatically. A stable `library_id` recognizes later generations of the same library; a newer import updates that profile while preserving the prior generation under `backups/imports`. Every bundle entry is verified with SHA-256, unsafe archive paths are rejected, and immutable transcript chunks, artifacts, semantic files, and model-cache entries share a global content-addressed blob store through hard links when the filesystem permits it.
 
@@ -222,13 +222,26 @@ the value empty for the current interpreter or lexical-only operation.
 discover -> snapshot -> ingest -> lineage -> summarize -> index -> audit -> promote
 ```
 
-Every stage is checkpointed in the staging SQLite database and in `runs/<build-id>/run.json`. The prior active build remains available after any failure.
+Every stage is checkpointed in the staging SQLite database and in `runs/<build-id>/run.json`. The prior active build remains available after any failure. After fixing the cause, `repair --resume-latest --max-cost-cny N` retries in a clean candidate while reusing immutable snapshot/artifact CAS and successful model-response cache entries.
 
 Paid builds require an explicit `--max-cost-cny` after reviewing the dry-run. Every reducer input Record ID must be represented in a ledger fact or an explicit no-new-fact list; one failed repair, provider error, malformed writer response, or exhausted budget fails the candidate build and leaves the prior active library untouched. Exact model-response cache hits cost zero.
 
+## Retrieval-Pollution Guard
+
+History-query commands and outputs remain traceable Core/Evidence but cannot feed their own retrieved synthesis back into ledger, Asset, or Overview promotion. Pure History research is quarantined from promotion; a long first-party user statement is retained as user context, and a mixed turn that continues into real edits/tests keeps those execution facts. Assistant and tool payloads never become deterministic Assets, and exact same-tier search duplicates are collapsed at display time while preserving every Record ID.
+
+Audit and repair an older or repeatedly incremented library with a dry-run first:
+
+```bash
+python3 scripts/codex_history.py repair --audit-pollution --json
+python3 scripts/codex_history.py repair --repair-pollution --max-cost-cny N --json
+```
+
+Repair clones the active SQLite database, suspends drift-prone external-content FTS triggers only inside the candidate, removes legacy recursive Assets/ledgers and their derived references, rebuilds affected summaries, restores FTS from the authoritative table, normalizes imported Overview lifecycles, audits the result, and promotes atomically. Raw transcripts, canonical events, Evidence, and artifacts are preserved. A lifecycle-only repair reports zero model cost.
+
 ## Incremental Invariant
 
-`codex-history audit --equivalence` creates a clean extractive reference build and requires exact equality for canonical sources, parsed events/turns, Evidence occurrences, deterministic core/fact records, and artifacts. Model ledgers, overviews, claims, and semantic documents are generation-specific; their differences are reported separately instead of being misclassified as source-authority failures.
+`codex-history audit --equivalence --confirm-full-reference` creates a clean extractive reference build and requires exact equality for canonical sources, parsed events/turns, Evidence occurrences, deterministic core/fact records, and artifacts. The explicit confirmation exists because this audit needs roughly one additional database footprint. Model ledgers, overviews, claims, and semantic documents are generation-specific; their differences are reported separately instead of being misclassified as source-authority failures.
 
 Fresh builds generate only conservative, evidence-exact fact relations. Verified tool outputs can validate the matching call, and completed goals can validate the same earlier objective. Ambiguous contradiction, invalidation, and reopening labels are never inferred automatically.
 

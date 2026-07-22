@@ -1,6 +1,6 @@
 {
   "name": "codex-history-suite",
-  "version": "0.9.0+codex.20260721101909",
+  "version": "0.10.1+codex.20260722094652",
   "description": "Build, move, search, trace, export, and natively restore portable evidence-first Codex history.",
   "author": {
     "name": "Lanqeur",
@@ -20,7 +20,7 @@
   "interface": {
     "displayName": "Codex History Suite",
     "shortDescription": "Portable, evidence-first memory for Codex history.",
-    "longDescription": "Codex History Suite provides a checkpointed cross-platform builder, verified multi-device bundles, non-destructive synchronization, progressive retrieval, a portable offline evidence viewer, and native session restoration over local Codex transcripts, claims, tool traces, and artifact CAS.",
+    "longDescription": "Codex History Suite provides a resource-guarded cross-platform builder, streaming multi-device deltas with precomputed knowledge and semantic state, progressive retrieval, a portable offline evidence viewer, and native session restoration over local Codex transcripts, claims, tool traces, and artifact CAS.",
     "developerName": "Lanqeur",
     "category": "Productivity",
     "capabilities": [],

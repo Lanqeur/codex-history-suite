@@ -20,6 +20,13 @@ from .artifact_capture import (
     ARTIFACT_METADATA_SCHEMA,
     export_artifact_metadata,
 )
+from .artifact_transfer import (
+    apply_artifact_stream,
+    artifact_metadata_summary,
+    read_artifact_stream,
+    write_artifact_stream,
+)
+from .authority_transfer import inspect_authority_stream, write_authority_stream
 from .artifacts import (
     artifact_export_entries,
     artifact_records,
@@ -37,6 +44,7 @@ from .coverage import knowledge_coverage, source_inventory
 from .pipeline import (
     active_database,
     active_info,
+    apply_precomputed_delta_build,
     apply_artifact_metadata_build,
     build_full,
     plan,
@@ -57,8 +65,10 @@ from .util import (
 CATALOG_SCHEMA = "codex-history-library-catalog-v1"
 BUNDLE_SCHEMA = "codex-history-library-bundle-v1"
 DELTA_SCHEMA = "codex-history-library-delta-v1"
+DELTA_V2_SCHEMA = "codex-history-library-delta-v2"
 PROFILE_SCHEMA = "codex-history-library-profile-v1"
 MERGE_SCHEMA = "codex-history-library-merge-v1"
+MAX_DELTA_MANIFEST_BYTES = 16 * 1024 * 1024
 
 
 def _slug(value: str, fallback: str = "device") -> str:
@@ -162,7 +172,12 @@ def _settings_from_config(config: ProfileConfig) -> dict[str, Any]:
             "git_max_bytes": config.artifact_git_max_bytes,
             "git_command_timeout_seconds": config.artifact_git_command_timeout_seconds,
         },
-        "runtime": {"python": ""},
+        "runtime": {
+            "python": "",
+            "retained_builds": config.runtime_retained_builds,
+            "min_free_bytes": config.runtime_min_free_bytes,
+            "peak_headroom_ratio": config.runtime_peak_headroom_ratio,
+        },
     }
 
 
@@ -668,7 +683,11 @@ def _verify_source_inventory(
     return inventory, errors
 
 
-def verify_bundle(path: Path) -> dict[str, Any]:
+def verify_bundle(
+    path: Path,
+    *,
+    verify_artifact_closure: bool = True,
+) -> dict[str, Any]:
     path = path.expanduser().resolve()
     errors: list[str] = []
     warnings: list[str] = []
@@ -696,15 +715,22 @@ def verify_bundle(path: Path) -> dict[str, Any]:
             records=manifest.get("files", []),
         )
         errors.extend(source_errors)
-        try:
-            artifact_closure, closure_errors, closure_warnings = (
-                _verify_bundle_artifact_closure(archive, manifest)
+        if verify_artifact_closure:
+            try:
+                artifact_closure, closure_errors, closure_warnings = (
+                    _verify_bundle_artifact_closure(archive, manifest)
+                )
+                errors.extend(closure_errors)
+                warnings.extend(closure_warnings)
+            except (OSError, ValueError, sqlite3.DatabaseError) as error:
+                artifact_closure = {}
+                errors.append(f"artifact closure verification failed: {error}")
+        else:
+            artifact_closure = dict(manifest.get("artifact_closure") or {})
+            warnings.append(
+                "deep artifact closure replay was skipped for delta-base verification; "
+                "all packaged file hashes and source inventory were still verified"
             )
-            errors.extend(closure_errors)
-            warnings.extend(closure_warnings)
-        except (OSError, ValueError, sqlite3.DatabaseError) as error:
-            artifact_closure = {}
-            errors.append(f"artifact closure verification failed: {error}")
     return {
         "schema_version": BUNDLE_SCHEMA,
         "bundle": str(path),
@@ -734,7 +760,13 @@ def _transfer_manifest(path: Path) -> tuple[str, dict[str, Any]]:
     with zipfile.ZipFile(path.expanduser().resolve(), "r") as archive:
         names = set(archive.namelist())
         if "delta.json" in names:
-            return DELTA_SCHEMA, json.loads(archive.read("delta.json"))
+            if archive.getinfo("delta.json").file_size > MAX_DELTA_MANIFEST_BYTES:
+                raise ValueError(
+                    "Delta manifest exceeds the 16 MiB safety limit; rebuild it as "
+                    "a streaming v2 delta"
+                )
+            manifest = json.loads(archive.read("delta.json"))
+            return str(manifest.get("schema_version") or ""), manifest
         if "bundle.json" in names:
             return BUNDLE_SCHEMA, _bundle_manifest(archive)
     raise ValueError("Archive contains neither bundle.json nor delta.json")
@@ -746,7 +778,11 @@ def _inventory_generation(inventory: Mapping[str, Any]) -> str:
 
 def _base_transfer(path: Path) -> dict[str, Any]:
     schema, manifest = _transfer_manifest(path)
-    verification = verify_delta(path) if schema == DELTA_SCHEMA else verify_bundle(path)
+    verification = (
+        verify_delta(path)
+        if schema in {DELTA_SCHEMA, DELTA_V2_SCHEMA}
+        else verify_bundle(path, verify_artifact_closure=False)
+    )
     if not verification["passed"]:
         raise ValueError(
             "Base transfer failed verification: " + "; ".join(verification["errors"])
@@ -775,7 +811,7 @@ def _source_change_kind(
     return "rewritten"
 
 
-def export_delta(
+def _export_delta_v1(
     config: ProfileConfig,
     destination: Path,
     *,
@@ -999,7 +1035,358 @@ def export_delta(
     }
 
 
-def verify_delta(path: Path) -> dict[str, Any]:
+def _stored_logical_digest(connection: sqlite3.Connection, active: Mapping[str, Any]) -> str:
+    build_id = str(active.get("build_id") or "")
+    row = connection.execute(
+        "SELECT logical_digest FROM builds WHERE build_id=?", (build_id,)
+    ).fetchone()
+    return str(row[0] or "") if row else ""
+
+
+def _base_file_pairs(manifest: Mapping[str, Any], role: str) -> set[tuple[str, str]]:
+    return {
+        (str(item.get("path") or ""), str(item.get("sha256") or ""))
+        for item in manifest.get("files", [])
+        if item.get("role") == role
+    }
+
+
+def export_delta(
+    config: ProfileConfig,
+    destination: Path,
+    *,
+    base: Path,
+    artifact_mode: str = "referenced",
+    include_model_cache: bool = True,
+    format_version: int = 2,
+) -> dict[str, Any]:
+    if format_version == 1:
+        return _export_delta_v1(
+            config,
+            destination,
+            base=base,
+            artifact_mode=artifact_mode,
+            include_model_cache=include_model_cache,
+        )
+    if format_version != 2:
+        raise ValueError("Delta format version must be 1 or 2")
+    database = active_database(config)
+    if not database:
+        raise RuntimeError(f"Profile {config.name!r} has no active build")
+    identity = _profile_identity(config)
+    base_manifest = _base_transfer(base)
+    if str(base_manifest.get("library_id")) != str(identity["library_id"]):
+        raise ValueError("Base transfer belongs to a different library lineage")
+    active = active_info(config) or {}
+    destination = destination.expanduser().resolve()
+    if destination.suffix.lower() != ".zip":
+        destination = destination.with_suffix(".zip")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix="codex-history-delta-v2-") as temporary_dir:
+        temporary_root = Path(temporary_dir)
+        artifact_stream_path = temporary_root / "artifact-metadata.jsonl.gz"
+        connection = connect(database, readonly=True)
+        try:
+            current_inventory = source_inventory(connection)
+            artifact_metadata = write_artifact_stream(connection, artifact_stream_path)
+            logical_digest = _stored_logical_digest(connection, active)
+        finally:
+            connection.close()
+        if not logical_digest:
+            logical_digest = audit_database(database)["logical_digest"]["sha256"]
+        if not current_inventory["snapshot_complete"]:
+            raise RuntimeError(
+                "The active profile has no complete canonical transcript snapshots; "
+                "create or hydrate a canonical baseline first"
+            )
+        base_inventory = dict(base_manifest["source_inventory"])
+        base_by_id = {
+            str(item["source_id"]): item for item in base_inventory.get("sources", [])
+        }
+        current_by_id = {
+            str(item["source_id"]): item for item in current_inventory.get("sources", [])
+        }
+        changes: list[dict[str, Any]] = []
+        for source_id in sorted(set(base_by_id) | set(current_by_id)):
+            current = current_by_id.get(source_id)
+            previous = base_by_id.get(source_id)
+            kind = "deleted" if current is None else _source_change_kind(config, current, previous)
+            if kind == "unchanged":
+                continue
+            changes.append(
+                {
+                    "kind": kind,
+                    "source_id": source_id,
+                    "thread_id": str((current or previous or {}).get("thread_id") or ""),
+                    "previous_content_sha256": (previous or {}).get("content_sha256"),
+                    "content_sha256": (current or {}).get("content_sha256"),
+                    "previous_size_bytes": int((previous or {}).get("size_bytes") or 0),
+                    "size_bytes": int((current or {}).get("size_bytes") or 0),
+                }
+            )
+
+        authority_stream_path = temporary_root / "authority-patch.jsonl.gz"
+        connection = connect(database, readonly=True)
+        try:
+            authority_patch = write_authority_stream(
+                connection,
+                authority_stream_path,
+                changes=changes,
+            )
+        finally:
+            connection.close()
+
+        base_chunks = {
+            str(chunk["sha256"])
+            for item in base_inventory.get("sources", [])
+            for chunk in item.get("chunks", [])
+        }
+        entries: dict[str, tuple[Path, str, str]] = {}
+        changed_ids = {
+            item["source_id"] for item in changes if item["kind"] != "deleted"
+        }
+        for source_id in changed_ids:
+            source = current_by_id[source_id]
+            for chunk in source.get("chunks", []):
+                if str(chunk["sha256"]) in base_chunks:
+                    continue
+                relative = str(chunk["cas_relative_path"])
+                path = config.snapshots_dir / relative
+                if not path.is_file():
+                    raise FileNotFoundError(f"Missing transcript snapshot chunk: {path}")
+                archive_path = f"data/snapshots/{Path(relative).as_posix()}"
+                entries[archive_path] = (path, archive_path, "transcript_chunk")
+
+        artifact_closure, artifact_entries = artifact_export_entries(
+            config,
+            database,
+            mode=artifact_mode,
+            verify_hashes=False,
+        )
+        current_artifacts = _artifact_inventory(database)
+        base_artifact_inventory = dict(base_manifest.get("artifact_inventory") or {})
+        base_artifacts = {
+            str(item["sha256"]) for item in base_artifact_inventory.get("files", [])
+        }
+        artifact_sha_by_path = {
+            f"data/cas/{item['cas_relative_path']}": str(item["sha256"])
+            for item in current_artifacts.get("files", [])
+        }
+        for path, archive_path, role in artifact_entries:
+            digest = artifact_sha_by_path.get(archive_path)
+            if not digest:
+                raise ValueError(
+                    f"Artifact export entry is absent from the database: {archive_path}"
+                )
+            if digest not in base_artifacts:
+                if sha256_file(path) != digest:
+                    raise ValueError(f"Artifact content hash mismatch: {path}")
+                entries[archive_path] = (path, archive_path, role)
+
+        current_cache = _tree_inventory(config.cache_dir / "model", "data/cache/model")
+        base_cache = _base_file_pairs(base_manifest, "model_cache") or {
+            (str(item["path"]), str(item["sha256"]))
+            for item in (base_manifest.get("cache_inventory") or {}).get("files", [])
+        }
+        if include_model_cache:
+            for item in current_cache["files"]:
+                key = (str(item["path"]), str(item["sha256"]))
+                if key in base_cache:
+                    continue
+                relative = str(item["path"]).removeprefix("data/cache/model/")
+                path = config.cache_dir / "model" / relative
+                entries[str(item["path"])] = (path, str(item["path"]), "model_cache")
+
+        current_semantic = _tree_inventory(config.root / "semantic", "data/semantic")
+        base_semantic_pairs = _base_file_pairs(base_manifest, "semantic_index") or {
+            (str(item["path"]), str(item["sha256"]))
+            for item in (base_manifest.get("semantic_inventory") or {}).get("files", [])
+        }
+        current_semantic_pairs = {
+            (str(item["path"]), str(item["sha256"]))
+            for item in current_semantic["files"]
+        }
+        for item in current_semantic["files"]:
+            key = (str(item["path"]), str(item["sha256"]))
+            if key in base_semantic_pairs:
+                continue
+            relative = str(item["path"]).removeprefix("data/semantic/")
+            entries[str(item["path"])] = (
+                config.root / "semantic" / relative,
+                str(item["path"]),
+                "semantic_index",
+            )
+        semantic_deleted = sorted(
+            path
+            for path, _digest in base_semantic_pairs
+            if path not in {item[0] for item in current_semantic_pairs}
+        )
+
+        metadata_archive_path = "data/metadata/artifact-metadata.jsonl.gz"
+        entries[metadata_archive_path] = (
+            artifact_stream_path,
+            metadata_archive_path,
+            "artifact_metadata_stream",
+        )
+        authority_archive_path = "data/authority/authority-patch.jsonl.gz"
+        entries[authority_archive_path] = (
+            authority_stream_path,
+            authority_archive_path,
+            "authority_patch",
+        )
+        records = [_file_record(*entry) for entry in entries.values()]
+        base_generation = _inventory_generation(base_inventory)
+        target_generation = _inventory_generation(current_inventory)
+        delta_id = stable_id(
+            "delta-v2",
+            identity["library_id"],
+            base_generation,
+            target_generation,
+            logical_digest,
+            current_artifacts["digest"],
+            artifact_metadata["digest"],
+            artifact_mode,
+            length=32,
+        )
+        history_coverage = knowledge_coverage(config, database, active=active)
+        manifest = {
+            "schema_version": DELTA_V2_SCHEMA,
+            "delta_id": delta_id,
+            "created_at": utc_now(),
+            "library_id": identity["library_id"],
+            "source_device": load_catalog(config.home, create=True)["device"],
+            "source_profile": config.name,
+            "base_bundle_id": base_manifest.get("bundle_id"),
+            "base_delta_id": base_manifest.get("delta_id"),
+            "base_source_generation_id": base_generation,
+            "target_source_generation_id": target_generation,
+            "source_build": active,
+            "logical_digest": logical_digest,
+            "history_coverage": history_coverage,
+            "source_inventory": current_inventory,
+            "artifact_inventory": current_artifacts,
+            "artifact_metadata": artifact_metadata,
+            "cache_inventory": current_cache,
+            "semantic_inventory": current_semantic,
+            "semantic_delta": {
+                "deleted_paths": semantic_deleted,
+                "changed_files": sum(
+                    record["role"] == "semantic_index" for record in records
+                ),
+            },
+            "authority_patch": {
+                key: authority_patch[key]
+                for key in (
+                    "schema_version",
+                    "digest",
+                    "counts",
+                    "rows",
+                    "safe_for_fast_apply",
+                    "changed_source_ids",
+                    "changed_thread_ids",
+                    "affected_scope_ids",
+                    "target_table_counts",
+                )
+            }
+            | {"path": authority_archive_path},
+            "target_artifact_closure": {
+                key: artifact_closure.get(key)
+                for key in (
+                    "complete",
+                    "hashes_verified",
+                    "indexed_files",
+                    "indexed_bytes",
+                    "indexed_digest",
+                    "available_files",
+                    "available_bytes",
+                    "missing_files",
+                    "registered_external_roots",
+                )
+            },
+            "artifact_delta": {
+                "mode": artifact_mode,
+                "new_files": sum(record["role"] == "artifact_cas" for record in records),
+                "new_bytes": sum(
+                    int(record["size_bytes"])
+                    for record in records
+                    if record["role"] == "artifact_cas"
+                ),
+                "metadata_digest": artifact_metadata["digest"],
+                "metadata_path": metadata_archive_path,
+                "new_sha256": sorted(
+                    str(record["sha256"])
+                    for record in records
+                    if record["role"] == "artifact_cas"
+                ),
+            },
+            "required_chunk_sha256": sorted(
+                str(record["sha256"])
+                for record in records
+                if record["role"] == "transcript_chunk"
+            ),
+            "changes": changes,
+            "compatibility": {
+                "minimum_reader_version": "0.10.0",
+                "fallback": "canonical source rebuild",
+            },
+            "capabilities": {
+                "incremental_sources": True,
+                "streaming_manifest": True,
+                "streaming_artifact_metadata": True,
+                "semantic_rebuild_required": False,
+                "model_cache_delta": include_model_cache,
+                "artifact_delta": artifact_mode != "none",
+                "precomputed_authority_patch": bool(authority_patch["safe_for_fast_apply"]),
+                "precomputed_semantic_delta": True,
+            },
+            "files": records,
+            "totals": {
+                "file_count": len(records),
+                "payload_uncompressed_bytes": sum(item["size_bytes"] for item in records),
+            },
+        }
+        manifest_bytes = (canonical_json(manifest) + "\n").encode("utf-8")
+        manifest["totals"]["manifest_bytes"] = len(manifest_bytes)
+        manifest_bytes = (canonical_json(manifest) + "\n").encode("utf-8")
+        temporary_zip = destination.with_name(
+            f".{destination.name}.{uuid.uuid4().hex}.tmp"
+        )
+        try:
+            with zipfile.ZipFile(
+                temporary_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6
+            ) as archive:
+                archive.writestr("delta.json", manifest_bytes)
+                for path, archive_path, _role in entries.values():
+                    archive.write(path, _zip_safe_name(archive_path))
+            os.replace(temporary_zip, destination)
+        finally:
+            temporary_zip.unlink(missing_ok=True)
+
+    verified = verify_delta(destination)
+    return {
+        "status": "exported",
+        "format": DELTA_V2_SCHEMA,
+        "delta": str(destination),
+        "delta_id": delta_id,
+        "library_id": identity["library_id"],
+        "base_source_generation_id": base_generation,
+        "target_source_generation_id": target_generation,
+        "change_count": len(changes),
+        "change_counts": {
+            kind: sum(item["kind"] == kind for item in changes)
+            for kind in ("added", "appended", "rewritten", "deleted")
+        },
+        "delta_bytes": destination.stat().st_size,
+        "payload_uncompressed_bytes": manifest["totals"]["payload_uncompressed_bytes"],
+        "manifest_bytes": manifest["totals"]["manifest_bytes"],
+        "file_count": len(records),
+        "verified": verified["passed"],
+        "history_coverage": history_coverage,
+    }
+
+
+def _verify_delta_v1(path: Path) -> dict[str, Any]:
     path = path.expanduser().resolve()
     errors: list[str] = []
     checked = 0
@@ -1015,6 +1402,11 @@ def verify_delta(path: Path) -> dict[str, Any]:
                 errors.append(str(error))
         if "delta.json" not in names:
             errors.append("delta is missing delta.json")
+        elif archive.getinfo("delta.json").file_size > MAX_DELTA_MANIFEST_BYTES:
+            errors.append(
+                "legacy delta manifest exceeds the 16 MiB safety limit; rebuild it "
+                "as a streaming v2 delta"
+            )
         else:
             manifest = json.loads(archive.read("delta.json"))
         if manifest.get("schema_version") != DELTA_SCHEMA:
@@ -1145,6 +1537,194 @@ def verify_delta(path: Path) -> dict[str, Any]:
         "passed": not errors,
         "checked_files": checked,
         "errors": errors,
+    }
+
+
+def _verify_delta_v2(path: Path) -> dict[str, Any]:
+    path = path.expanduser().resolve()
+    errors: list[str] = []
+    checked = 0
+    manifest: dict[str, Any] = {}
+    with zipfile.ZipFile(path, "r") as archive:
+        names = archive.namelist()
+        if len(names) != len(set(names)):
+            errors.append("delta contains duplicate archive paths")
+        for name in names:
+            try:
+                _zip_safe_name(name)
+            except ValueError as error:
+                errors.append(str(error))
+        if "delta.json" not in names:
+            errors.append("delta is missing delta.json")
+        elif archive.getinfo("delta.json").file_size > MAX_DELTA_MANIFEST_BYTES:
+            errors.append("delta v2 manifest exceeds the 16 MiB safety limit")
+        else:
+            manifest = json.loads(archive.read("delta.json"))
+        if manifest.get("schema_version") != DELTA_V2_SCHEMA:
+            errors.append(f"unsupported delta schema: {manifest.get('schema_version')}")
+        records = manifest.get("files") or []
+        record_paths = [str(item.get("path") or "") for item in records]
+        if len(record_paths) != len(set(record_paths)):
+            errors.append("delta manifest contains duplicate file records")
+        available = set(names)
+        for record in records:
+            name = str(record.get("path") or "")
+            if name not in available:
+                errors.append(f"missing: {name}")
+                continue
+            with archive.open(name) as handle:
+                digest, size = _hash_stream(handle)
+            if digest != record.get("sha256") or size != int(record.get("size_bytes", -1)):
+                errors.append(f"sha256 mismatch: {name}")
+                continue
+            checked += 1
+
+        inventory = manifest.get("source_inventory") or {}
+        if not inventory.get("snapshot_complete"):
+            errors.append("delta target source inventory is incomplete")
+        if not manifest.get("base_source_generation_id"):
+            errors.append("delta has no base source generation")
+        if _inventory_generation(inventory) != manifest.get("target_source_generation_id"):
+            errors.append("delta target generation disagrees with source inventory")
+        packaged_chunks = {
+            str(record.get("sha256") or "")
+            for record in records
+            if record.get("role") == "transcript_chunk"
+        }
+        if packaged_chunks != set(manifest.get("required_chunk_sha256") or []):
+            errors.append("delta transcript chunk set disagrees with manifest")
+
+        artifact_delta = dict(manifest.get("artifact_delta") or {})
+        artifact_mode = str(artifact_delta.get("mode") or "")
+        if artifact_mode not in {"none", "referenced", "all"}:
+            errors.append(f"unsupported delta artifact mode: {artifact_mode or 'missing'}")
+        packaged_artifacts = {
+            str(record.get("sha256") or "")
+            for record in records
+            if record.get("role") == "artifact_cas"
+        }
+        if packaged_artifacts != set(artifact_delta.get("new_sha256") or []):
+            errors.append("delta artifact CAS set disagrees with manifest")
+        if artifact_mode == "none" and packaged_artifacts:
+            errors.append("artifact mode none contains artifact CAS files")
+        if int(artifact_delta.get("new_files") or 0) != len(packaged_artifacts):
+            errors.append("delta artifact file count disagrees with manifest")
+
+        metadata_path = str(artifact_delta.get("metadata_path") or "")
+        metadata_records = [
+            record
+            for record in records
+            if record.get("role") == "artifact_metadata_stream"
+        ]
+        if len(metadata_records) != 1 or metadata_records[0].get("path") != metadata_path:
+            errors.append("delta has no unique artifact metadata stream")
+        elif metadata_path in available:
+            try:
+                with archive.open(metadata_path) as stream:
+                    observed = read_artifact_stream(stream)
+                expected = dict(manifest.get("artifact_metadata") or {})
+                if observed["digest"] != expected.get("digest"):
+                    errors.append("artifact metadata stream digest disagrees with manifest")
+                if observed["counts"] != expected.get("counts"):
+                    errors.append("artifact metadata stream counts disagree with manifest")
+                if observed["digest"] != artifact_delta.get("metadata_digest"):
+                    errors.append("artifact metadata digest disagrees with artifact delta")
+                target_artifacts = {
+                    str(item.get("sha256") or "")
+                    for item in (manifest.get("artifact_inventory") or {}).get("files", [])
+                }
+                if set(observed["artifact_sha256"]) != target_artifacts:
+                    errors.append("artifact metadata stream disagrees with target inventory")
+            except (OSError, ValueError, json.JSONDecodeError) as error:
+                errors.append(f"artifact metadata stream failed verification: {error}")
+
+        authority = dict(manifest.get("authority_patch") or {})
+        authority_path = str(authority.get("path") or "")
+        authority_records = [
+            record for record in records if record.get("role") == "authority_patch"
+        ]
+        if len(authority_records) != 1 or authority_records[0].get("path") != authority_path:
+            errors.append("delta has no unique authority patch")
+        elif authority_path in available:
+            try:
+                with archive.open(authority_path) as stream:
+                    observed = inspect_authority_stream(stream)
+                for key in (
+                    "digest",
+                    "counts",
+                    "rows",
+                    "safe_for_fast_apply",
+                    "changed_source_ids",
+                    "changed_thread_ids",
+                    "affected_scope_ids",
+                    "target_table_counts",
+                ):
+                    if observed.get(key) != authority.get(key):
+                        errors.append(f"authority patch disagrees with manifest for {key}")
+            except (OSError, ValueError, json.JSONDecodeError) as error:
+                errors.append(f"authority patch failed verification: {error}")
+
+        semantic_inventory = dict(manifest.get("semantic_inventory") or {})
+        semantic_by_path = {
+            str(item.get("path") or ""): str(item.get("sha256") or "")
+            for item in semantic_inventory.get("files", [])
+        }
+        for record in records:
+            if record.get("role") != "semantic_index":
+                continue
+            if semantic_by_path.get(str(record.get("path") or "")) != str(
+                record.get("sha256") or ""
+            ):
+                errors.append(
+                    f"semantic delta file disagrees with target inventory: {record.get('path')}"
+                )
+    return {
+        "schema_version": DELTA_V2_SCHEMA,
+        "delta": str(path),
+        "delta_id": manifest.get("delta_id"),
+        "library_id": manifest.get("library_id"),
+        "base_source_generation_id": manifest.get("base_source_generation_id"),
+        "target_source_generation_id": manifest.get("target_source_generation_id"),
+        "passed": not errors,
+        "checked_files": checked,
+        "errors": errors,
+    }
+
+
+def verify_delta(path: Path) -> dict[str, Any]:
+    path = path.expanduser().resolve()
+    with zipfile.ZipFile(path, "r") as archive:
+        if "delta.json" not in archive.namelist():
+            return {
+                "schema_version": "",
+                "delta": str(path),
+                "passed": False,
+                "checked_files": 0,
+                "errors": ["delta is missing delta.json"],
+            }
+        if archive.getinfo("delta.json").file_size > MAX_DELTA_MANIFEST_BYTES:
+            return {
+                "schema_version": "",
+                "delta": str(path),
+                "passed": False,
+                "checked_files": 0,
+                "errors": [
+                    "delta manifest exceeds the 16 MiB safety limit; rebuild it as "
+                    "a streaming v2 delta"
+                ],
+            }
+        manifest = json.loads(archive.read("delta.json"))
+    schema = manifest.get("schema_version")
+    if schema == DELTA_SCHEMA:
+        return _verify_delta_v1(path)
+    if schema == DELTA_V2_SCHEMA:
+        return _verify_delta_v2(path)
+    return {
+        "schema_version": str(schema or ""),
+        "delta": str(path),
+        "passed": False,
+        "checked_files": 0,
+        "errors": [f"unsupported delta schema: {schema}"],
     }
 
 
@@ -1621,6 +2201,10 @@ def import_library(
                 ),
                 "history_coverage": manifest.get("history_coverage"),
                 "source_generation_id": manifest.get("source_generation_id"),
+                "artifact_inventory_digest": (
+                    manifest.get("artifact_inventory") or {}
+                ).get("digest"),
+                "artifact_metadata_digest": manifest.get("artifact_metadata_digest"),
             }
             source_slug = _slug(str(source_device.get("slug") or "device"))
             staging_source_root = staging_root / "imported_sources" / source_slug
@@ -1888,6 +2472,12 @@ def _delta_target(config: ProfileConfig, archive_path: str) -> Path:
         return (
             config.cache_dir / "model" / archive_path.removeprefix("data/cache/model/")
         )
+    if archive_path.startswith("data/metadata/"):
+        return config.cache_dir / "transfer" / archive_path.removeprefix("data/metadata/")
+    if archive_path.startswith("data/authority/"):
+        return config.cache_dir / "transfer" / archive_path.removeprefix("data/authority/")
+    if archive_path.startswith("data/semantic/"):
+        return config.cache_dir / "transfer/semantic" / archive_path.removeprefix("data/semantic/")
     raise ValueError(f"Unsupported delta data path: {archive_path}")
 
 
@@ -1907,6 +2497,8 @@ def apply_delta(
         )
     with zipfile.ZipFile(delta, "r") as archive:
         manifest = json.loads(archive.read("delta.json"))
+        delta_schema = str(manifest.get("schema_version") or "")
+        is_v2 = delta_schema == DELTA_V2_SCHEMA
         library_id = str(manifest["library_id"])
         catalog = load_catalog(home, create=True)
         candidates = [
@@ -1940,7 +2532,11 @@ def apply_delta(
         connection = connect(database, readonly=True)
         try:
             current_inventory = source_inventory(connection)
-            current_artifact_metadata = export_artifact_metadata(connection)
+            current_artifact_metadata = (
+                artifact_metadata_summary(connection)
+                if is_v2
+                else export_artifact_metadata(connection)
+            )
         finally:
             connection.close()
         current_artifact_inventory = _artifact_inventory(database)
@@ -1993,6 +2589,83 @@ def apply_delta(
 
     source_build: dict[str, Any] | None = None
     artifact_build: dict[str, Any] | None = None
+    fast_apply_error = ""
+    fast_capable = bool(
+        is_v2
+        and (manifest.get("capabilities") or {}).get("precomputed_authority_patch")
+        and (manifest.get("authority_patch") or {}).get("safe_for_fast_apply")
+        and current_generation == required_generation
+    )
+    if fast_capable:
+        authority_path = _delta_target(
+            config, str((manifest.get("authority_patch") or {}).get("path") or "")
+        )
+        metadata_path = _delta_target(
+            config, str((manifest.get("artifact_delta") or {}).get("metadata_path") or "")
+        )
+        semantic_files = [
+            (_delta_target(config, str(record["path"])), str(record["path"]))
+            for record in manifest.get("files", [])
+            if record.get("role") == "semantic_index"
+        ]
+        try:
+            _write_inventory_sources(
+                config, manifest["source_inventory"], manifest.get("changes", [])
+            )
+            source_build = apply_precomputed_delta_build(
+                config,
+                authority_stream=authority_path,
+                artifact_stream=metadata_path if artifacts_required else None,
+                target_source_generation_id=target_generation,
+                target_artifact_metadata_digest=target_artifact_metadata_digest,
+                target_logical_digest=str(manifest.get("logical_digest") or ""),
+                semantic_files=semantic_files,
+                semantic_deleted_paths=list(
+                    (manifest.get("semantic_delta") or {}).get("deleted_paths") or []
+                ),
+            )
+        except (OSError, ValueError, RuntimeError, sqlite3.DatabaseError) as error:
+            fast_apply_error = f"{type(error).__name__}: {error}"
+            source_build = None
+        else:
+            updated_database = active_database(config)
+            if not updated_database:
+                raise RuntimeError("Fast delta application did not leave an active database")
+            active_payload = active_info(config) or {}
+            active_payload.update(
+                {
+                    "incremental_ready": True,
+                    "source_generation_id": target_generation,
+                    "last_delta_id": manifest["delta_id"],
+                    "artifact_inventory_digest": target_artifact_digest,
+                    "artifact_metadata_digest": target_artifact_metadata_digest,
+                    "history_coverage": knowledge_coverage(
+                        config, updated_database, active=active_payload
+                    ),
+                    "last_delta_apply_mode": "precomputed",
+                }
+            )
+            atomic_write_json(config.active_path, active_payload)
+            catalog["profiles"][selected]["source_generation_id"] = target_generation
+            catalog["profiles"][selected]["last_delta_id"] = manifest["delta_id"]
+            catalog["profiles"][selected]["artifact_inventory_digest"] = target_artifact_digest
+            catalog["profiles"][selected]["artifact_metadata_digest"] = target_artifact_metadata_digest
+            save_catalog(home, catalog)
+            return {
+                "status": "applied",
+                "apply_mode": "precomputed",
+                "profile": selected,
+                "library_id": library_id,
+                "delta_id": manifest["delta_id"],
+                "base_source_generation_id": required_generation,
+                "target_source_generation_id": target_generation,
+                "changes": len(manifest.get("changes", [])),
+                "content_install": dict(install_stats),
+                "build": source_build,
+                "source_build": source_build if manifest.get("changes") else None,
+                "artifact_build": source_build if not manifest.get("changes") else None,
+                "history_coverage": active_payload["history_coverage"],
+            }
     if not source_up_to_date:
         source_root = config.source_roots[0].resolve()
         backup_root = config.root / "backups/deltas" / str(manifest["delta_id"])
@@ -2044,7 +2717,11 @@ def apply_delta(
         raise RuntimeError("Delta application did not leave an active database")
     connection = connect(updated_database, readonly=True)
     try:
-        metadata_after_source = export_artifact_metadata(connection)
+        metadata_after_source = (
+            artifact_metadata_summary(connection)
+            if is_v2
+            else export_artifact_metadata(connection)
+        )
     finally:
         connection.close()
     artifacts_after_source = _artifact_inventory(updated_database)
@@ -2052,9 +2729,38 @@ def apply_delta(
         metadata_after_source["digest"] != target_artifact_metadata_digest
         or artifacts_after_source["digest"] != target_artifact_digest
     ):
-        artifact_build = apply_artifact_metadata_build(
-            config, target_artifact_metadata
-        )
+        if is_v2:
+            metadata_path = str(
+                (manifest.get("artifact_delta") or {}).get("metadata_path") or ""
+            )
+            local_stream = _delta_target(config, metadata_path)
+            connection = connect(updated_database)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                with local_stream.open("rb") as stream:
+                    stream_result = apply_artifact_stream(connection, stream)
+                violations = list(connection.execute("PRAGMA foreign_key_check"))
+                if violations:
+                    raise RuntimeError(
+                        f"Artifact metadata stream introduced {len(violations)} foreign-key violations"
+                    )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+            artifact_build = {
+                "status": "applied_in_place",
+                "mode": "streaming-artifact-metadata-v1",
+                "database": str(updated_database),
+                "stream": stream_result,
+                "usage": {"total_api_tokens": 0, "total_cost_cny": 0.0},
+            }
+        else:
+            artifact_build = apply_artifact_metadata_build(
+                config, target_artifact_metadata
+            )
         updated_database = active_database(config)
         if not updated_database:
             raise RuntimeError("Artifact metadata update did not promote a database")
@@ -2062,7 +2768,11 @@ def apply_delta(
     connection = connect(updated_database, readonly=True)
     try:
         updated_inventory = source_inventory(connection)
-        updated_artifact_metadata = export_artifact_metadata(connection)
+        updated_artifact_metadata = (
+            artifact_metadata_summary(connection)
+            if is_v2
+            else export_artifact_metadata(connection)
+        )
     finally:
         connection.close()
     updated_artifact_inventory = _artifact_inventory(updated_database)
@@ -2115,6 +2825,8 @@ def apply_delta(
     save_catalog(home, catalog)
     return {
         "status": "applied",
+        "apply_mode": "rebuild_fallback",
+        "fast_apply_error": fast_apply_error,
         "profile": selected,
         "library_id": library_id,
         "delta_id": manifest["delta_id"],

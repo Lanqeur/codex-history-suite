@@ -46,6 +46,11 @@ STATUS_STRENGTH = {
     "failed": 2,
     "uncertain": 1,
 }
+RETRIEVAL_ELIGIBILITY_SQL = (
+    "COALESCE(json_extract(k.metadata_json,'$.retrieval_eligible'),1)!=0 "
+    "AND NOT (k.tier='asset' AND "
+    "json_extract(k.metadata_json,'$.derived_by')='deterministic-asset-classifier-v1')"
+)
 QUERY_TOKEN_RE = re.compile(r'-?"[^"]+"|-?\S+')
 _QUERY_VECTOR_CACHE: dict[str, list[float]] = {}
 _SEMANTIC_COLLECTION_CACHE: dict[str, Any] = {}
@@ -318,7 +323,7 @@ def sql_filters(
     exclude_scope_range: bool,
     include_history: bool,
 ) -> tuple[list[str], list[Any]]:
-    filters: list[str] = []
+    filters: list[str] = [RETRIEVAL_ELIGIBILITY_SQL]
     params: list[Any] = []
     if as_of:
         point = parse_time(as_of, end_of_day=re.fullmatch(r"\d{4}-\d{2}-\d{2}", as_of.strip()) is not None)
@@ -642,7 +647,6 @@ def search_records(
         )
 
     results: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
     for row in rows:
         decoded = decode_knowledge(row)
         rowid = int(row["_rowid"])
@@ -660,10 +664,6 @@ def search_records(
             accepted = bool(matched) or semantic_score is not None
         if not accepted:
             continue
-        key = (decoded["scope_id"], re.sub(r"\s+", " ", decoded["text"]).strip())
-        if key in seen:
-            continue
-        seen.add(key)
         decoded["matched_terms"] = matched
         decoded["body_matched_terms"] = body_matched
         decoded["scope_title_matched_terms"] = title_matched
@@ -711,7 +711,29 @@ def search_records(
             row["record_id"],
         )
     )
-    return results[:limit]
+    deduplicated: list[dict[str, Any]] = []
+    by_content: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in results:
+        key = (
+            str(row["tier"]),
+            re.sub(r"\s+", " ", str(row["text"])).strip(),
+        )
+        existing = by_content.get(key)
+        if existing is None:
+            row["duplicate_record_ids"] = []
+            row["duplicate_scope_ids"] = []
+            by_content[key] = row
+            deduplicated.append(row)
+            continue
+        existing["duplicate_record_ids"].append(row["record_id"])
+        if (
+            row["scope_id"] != existing["scope_id"]
+            and row["scope_id"] not in existing["duplicate_scope_ids"]
+        ):
+            existing["duplicate_scope_ids"].append(row["scope_id"])
+    for row in deduplicated:
+        row["duplicate_count"] = len(row["duplicate_record_ids"])
+    return deduplicated[:limit]
 
 
 def print_records(rows: list[dict[str, Any]], *, text_limit: int = 700) -> None:
@@ -806,22 +828,22 @@ def command_asset(args: argparse.Namespace, connection: sqlite3.Connection) -> i
             **retrieval_options(args),
         )
     else:
-        filters = ["asset_type=?"]
+        filters = ["k.asset_type=?", RETRIEVAL_ELIGIBILITY_SQL]
         params: list[Any] = [args.asset_type]
         if not args.history:
-            filters.append("valid_to IS NULL")
+            filters.append("k.valid_to IS NULL")
         if args.scope:
-            filters.append(f"scope_id IN ({','.join('?' for _ in args.scope)})")
+            filters.append(f"k.scope_id IN ({','.join('?' for _ in args.scope)})")
             params.extend(args.scope)
         if args.status:
-            filters.append("status_group=?")
+            filters.append("k.status_group=?")
             params.append(args.status)
         params.append(args.limit)
         rows = [
             decode_knowledge(row)
             for row in connection.execute(
-                f"SELECT * FROM knowledge WHERE {' AND '.join(filters)} "
-                "ORDER BY scope_id,status_group,evidence_count DESC,record_id LIMIT ?",
+                f"SELECT k.* FROM knowledge k WHERE {' AND '.join(filters)} "
+                "ORDER BY k.scope_id,k.status_group,k.evidence_count DESC,k.record_id LIMIT ?",
                 params,
             )
         ]

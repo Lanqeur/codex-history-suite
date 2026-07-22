@@ -237,18 +237,30 @@ def _deduplicated_join(values: Iterable[str]) -> str:
     return "\n\n".join(result)
 
 
-def parse_snapshot(snapshot: SnapshotFile, config: ProfileConfig) -> ParsedThread:
+def parse_snapshot(
+    snapshot: SnapshotFile,
+    config: ProfileConfig,
+    *,
+    start_line: int = 0,
+    start_byte: int = 0,
+    next_turn_seq: int = 0,
+    prior_content_occurrences: dict[str, int] | None = None,
+) -> ParsedThread:
     events: list[ParsedEvent] = []
     artifacts: list[dict[str, Any]] = [dict(item) for item in snapshot.artifacts]
     errors: list[dict[str, Any]] = []
-    content_occurrences: Counter[str] = Counter()
+    content_occurrences: Counter[str] = Counter(prior_content_occurrences or {})
     current_turn_seq: int | None = None
     current_source_turn = ""
-    next_turn_seq = 0
     meta = dict(snapshot.source.session_meta)
     first_activity: str | None = None
     last_activity: str | None = None
-    for line_no, byte_start, byte_end, raw in iter_snapshot_lines(snapshot, config):
+    for line_no, byte_start, byte_end, raw in iter_snapshot_lines(
+        snapshot,
+        config,
+        start_line=start_line,
+        start_byte=start_byte,
+    ):
         if not raw.strip():
             continue
         compact_raw = _externalize_raw_data_uris(raw, config, artifacts)

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator
 
 from .config import ProfileConfig
-from .util import atomic_write_bytes, atomic_write_json, sha256_file, stable_id, utc_now
+from .util import atomic_write_bytes, atomic_write_json, read_json, sha256_file, stable_id, utc_now
 
 
 SOURCE_IDENTITY_FILE = "source_identity.jsonl"
@@ -439,15 +439,164 @@ def snapshot_source(config: ProfileConfig, source: SourceCandidate) -> SnapshotF
     )
 
 
-def iter_snapshot_lines(snapshot: SnapshotFile, config: ProfileConfig) -> Iterator[tuple[int, int, int, bytes]]:
-    line_no = 0
+def snapshot_appended_source(
+    config: ProfileConfig,
+    source: SourceCandidate,
+    previous: dict[str, Any],
+    previous_chunks: Iterable[dict[str, Any]],
+) -> SnapshotFile:
+    """Reuse normalized prefix chunks and normalize only a local raw append suffix."""
+    if source.declared_size_bytes is not None:
+        raise ValueError("Portable normalized sources use the full snapshot compatibility path")
+    old_source_size = int(previous.get("size_bytes") or 0)
+    old_snapshot_size = int(previous.get("snapshot_size_bytes") or 0)
+    if old_source_size <= 0 or old_snapshot_size <= 0:
+        raise ValueError("Append snapshot has no reusable prefix")
+    chunks = [dict(item) for item in previous_chunks]
+    if not chunks:
+        raise ValueError("Append snapshot has no reusable chunks")
+    with source.path.open("rb") as handle:
+        handle.seek(old_source_size - 1)
+        if handle.read(1) != b"\n":
+            raise ValueError("Append prefix does not end at a JSONL line boundary")
+
+    previous_manifest = read_json(Path(str(previous.get("snapshot_manifest_path") or "")), {}) or {}
+    artifacts: dict[str, dict[str, Any]] = {
+        str(item["sha256"]): dict(item)
+        for item in previous_manifest.get("artifacts", [])
+        if item.get("sha256")
+    }
+    output_chunks: list[dict[str, Any]] = []
+    pending = bytearray()
+    snapshot_digest = hashlib.sha256()
+    for chunk in chunks:
+        path = config.snapshots_dir / str(chunk["cas_relative_path"])
+        data = path.read_bytes()
+        snapshot_digest.update(data)
+    if int(chunks[-1]["size_bytes"]) < config.snapshot_chunk_bytes:
+        last = chunks.pop()
+        pending.extend(
+            (config.snapshots_dir / str(last["cas_relative_path"])).read_bytes()
+        )
+    for index, chunk in enumerate(chunks):
+        output_chunks.append(
+            {
+                "index": index,
+                "sha256": str(chunk.get("chunk_sha256") or chunk.get("sha256")),
+                "size_bytes": int(chunk["size_bytes"]),
+                "cas_relative_path": str(chunk["cas_relative_path"]),
+            }
+        )
+
+    def emit(block: bytes) -> None:
+        digest = hashlib.sha256(block).hexdigest()
+        relative = Path("chunks") / digest[:2] / f"{digest}.bin"
+        target = config.snapshots_dir / relative
+        if not target.exists():
+            atomic_write_bytes(target, block)
+        output_chunks.append(
+            {
+                "index": len(output_chunks),
+                "sha256": digest,
+                "size_bytes": len(block),
+                "cas_relative_path": relative.as_posix(),
+            }
+        )
+
+    source_digest = hashlib.sha256()
+    suffix_lines = 0
+    suffix_snapshot_bytes = 0
+    suffix_last_byte = b""
+    with source.path.open("rb") as handle:
+        remaining_prefix = old_source_size
+        while remaining_prefix:
+            block = handle.read(min(1024 * 1024, remaining_prefix))
+            if not block:
+                raise ValueError("Append source became shorter while snapshotting")
+            source_digest.update(block)
+            remaining_prefix -= len(block)
+        while True:
+            raw = handle.readline()
+            if not raw:
+                break
+            source_digest.update(raw)
+            suffix_lines += raw.count(b"\n")
+            suffix_last_byte = raw[-1:]
+            normalized = _normalize_snapshot_line(raw, config, artifacts)
+            snapshot_digest.update(normalized)
+            suffix_snapshot_bytes += len(normalized)
+            pending.extend(normalized)
+            while len(pending) >= config.snapshot_chunk_bytes:
+                emit(bytes(pending[: config.snapshot_chunk_bytes]))
+                del pending[: config.snapshot_chunk_bytes]
+    if pending:
+        emit(bytes(pending))
+    if suffix_snapshot_bytes and suffix_last_byte != b"\n":
+        suffix_lines += 1
+    content_sha256 = source_digest.hexdigest()
+    snapshot_content_sha256 = snapshot_digest.hexdigest()
+    snapshot_size = old_snapshot_size + suffix_snapshot_bytes
+    line_count = int(previous.get("line_count") or 0) + suffix_lines
+    manifest = {
+        "schema_version": "chunked-transcript-snapshot-v1",
+        "created_at": utc_now(),
+        "source_id": source.source_id,
+        "adapter": source.adapter,
+        "source_path": str(source.path),
+        "relative_path": source.relative_path,
+        "thread_id": source.thread_id,
+        "size_bytes": source.size_bytes,
+        "mtime_ns": source.mtime_ns,
+        "content_sha256": content_sha256,
+        "snapshot_format": "normalized-jsonl-v1",
+        "snapshot_size_bytes": snapshot_size,
+        "snapshot_content_sha256": snapshot_content_sha256,
+        "line_count": line_count,
+        "chunks": output_chunks,
+        "artifacts": list(artifacts.values()),
+        "append_reused_prefix": True,
+        "reused_prefix_chunks": len(chunks),
+    }
+    manifest_relative = (
+        Path("manifests")
+        / source.source_id
+        / f"{content_sha256}-{snapshot_content_sha256}.json"
+    )
+    manifest_path = config.snapshots_dir / manifest_relative
+    if not manifest_path.exists():
+        atomic_write_json(manifest_path, manifest)
+    return SnapshotFile(
+        source=source,
+        content_sha256=content_sha256,
+        prefix_sha256=content_sha256,
+        snapshot_content_sha256=snapshot_content_sha256,
+        snapshot_size_bytes=snapshot_size,
+        line_count=line_count,
+        manifest_path=manifest_path,
+        chunks=tuple(output_chunks),
+        artifacts=tuple(artifacts.values()),
+    )
+
+
+def iter_snapshot_lines(
+    snapshot: SnapshotFile,
+    config: ProfileConfig,
+    *,
+    start_line: int = 0,
+    start_byte: int = 0,
+) -> Iterator[tuple[int, int, int, bytes]]:
+    line_no = start_line
     byte_offset = 0
     pending: list[bytes] = []
     pending_start = 0
     for chunk in snapshot.chunks:
         path = config.snapshots_dir / chunk["cas_relative_path"]
+        chunk_size = int(chunk["size_bytes"])
+        if byte_offset + chunk_size <= start_byte:
+            byte_offset += chunk_size
+            continue
         data = path.read_bytes()
-        cursor = 0
+        cursor = max(0, start_byte - byte_offset)
         while True:
             newline = data.find(b"\n", cursor)
             if newline < 0:

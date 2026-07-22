@@ -16,6 +16,18 @@ The default data home is `%LOCALAPPDATA%\codex-history` on Windows, `~/Library/A
 
 Each profile owns immutable chunked snapshots, artifact CAS, builds, model cache, reports, and `active.json`. On WSL, keep active SQLite, Chroma, and caches on the Linux filesystem. Mounted Windows drives are appropriate for exported backups.
 
+Before a candidate build, the engine compares real free space with the active SQLite/semantic copy plus configured headroom. Successful promotion automatically retains the active build and one rollback build by default:
+
+```toml
+[profiles.default.runtime]
+python = ""
+retained_builds = 2
+min_free_bytes = 536870912
+peak_headroom_ratio = 0.15
+```
+
+`retained_builds` includes the active build. Increase it only when the extra complete SQLite copies are intentional. Shared content-addressed snapshots, artifact CAS, model cache, and exported packages are not deleted by build retention.
+
 ## Source Discovery
 
 `source_roots` normally contains one or more Codex homes. The adapter scans `sessions/**/*.jsonl`, optional `archived_sessions/*.jsonl`, `session_index.jsonl`, and compatible state databases. WSL discovery considers both Linux and Windows Codex homes, but explicit source roots win.
@@ -117,7 +129,7 @@ semantic_to_source_ratio = 0.05
 
 The first plan uses these transparent defaults. Once an active database exists, the estimator calibrates summary-density, SQLite, artifact, and semantic ratios from that profile. `cached_input_ratio` is an expected provider-prefix cache ratio between 0 and 1; keep it at zero for a conservative first build. Exact Codex History model-response cache hits cost zero and are reported separately from provider cache hits.
 
-The storage range covers current-state content-addressed transcript snapshots, the active SQLite build, artifact CAS, optional Chroma data, and model responses. It excludes the original transcripts and old retained builds. Capturing existing absolute-path files can exceed the range because those files are not bounded by transcript size.
+The storage range covers current-state content-addressed transcript snapshots, the active SQLite build, artifact CAS, optional Chroma data, and model responses. It excludes the original transcripts and old retained builds. `resource_preflight` separately estimates transient peak space for the candidate copy and configured safety margin. Capturing existing absolute-path files can exceed the range because those files are not bounded by transcript size.
 
 ## Semantic Retrieval
 
@@ -133,6 +145,8 @@ that interpreter when embeddings are enabled. This keeps the base plugin
 zero-dependency while avoiding machine-specific virtual-environment commands in
 the Skills. Leave it empty when the current interpreter already has ChromaDB.
 
+The same runtime section controls `retained_builds`, `min_free_bytes`, and `peak_headroom_ratio` as shown under Storage And Profiles.
+
 ## Cost Controls
 
-Always run `plan` or `update --dry-run`. Paid commands require a user-selected `--max-cost-cny`. The engine checks the conservative upper estimate before the run and reserves budget before each uncached model batch. Exact response-cache hits cost zero; provider cached-input tokens use `cached_input_price_cny_per_million`.
+Always run `plan` or `update --dry-run`. Paid commands require a user-selected `--max-cost-cny`. The engine checks the conservative upper estimate before the run and reserves budget before each uncached model batch. Exact response-cache hits cost zero; provider cached-input tokens use `cached_input_price_cny_per_million`. Every successful, failed, and cache-hit attempt is appended to `usage/api-usage.jsonl`; plans return its cumulative `usage_ledger`, so retries cannot disappear from cost accounting.

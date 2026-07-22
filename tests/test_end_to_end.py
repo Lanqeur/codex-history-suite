@@ -116,6 +116,25 @@ def test_artifact_scope_uses_thread_mapping_instead_of_thread_id(tmp_path: Path)
         connection.close()
 
 
+def test_artifact_capture_lookup_indexes_are_initialized(tmp_path: Path):
+    connection = connect(tmp_path / "indexes.sqlite3")
+    try:
+        initialize(connection)
+        indexes = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            )
+        }
+        assert {
+            "artifact_paths_sha256_idx",
+            "scope_threads_thread_idx",
+            "evidence_item_idx",
+        } <= indexes
+    finally:
+        connection.close()
+
+
 def test_model_first_build_requires_an_explicit_cost_limit(portable_profile, monkeypatch):
     config, codex_home = portable_profile
     add_transcript(
@@ -189,6 +208,8 @@ def test_full_build_incremental_update_and_equivalence(portable_profile):
     )
 
     initial_plan = plan(config, mode="full")
+    assert initial_plan["resource_preflight"]["passed"] is True
+    assert initial_plan["resource_preflight"]["required_free_bytes"] > 0
     source_estimate = initial_plan["estimate"]["source"]
     assert source_estimate["inline_base64_payload_bytes_excluded_from_model_estimate"] > 0
     assert source_estimate["model_relevant_bytes"] < source_estimate["new_or_reprocessed_bytes"]
@@ -306,8 +327,9 @@ def test_full_build_incremental_update_and_equivalence(portable_profile):
         assert connection.execute("SELECT COUNT(*) FROM threads").fetchone()[0] == 3
     finally:
         connection.close()
+    assert len([path for path in config.builds_dir.iterdir() if path.is_dir()]) <= 2
 
-    equivalence = equivalence_audit(config)
+    equivalence = equivalence_audit(config, confirm_full_reference=True)
     assert equivalence["passed"] is True, json.dumps(equivalence["differences"], indent=2)
     assert audit_database(Path(third["database"]))["passed"] is True
 
@@ -359,7 +381,7 @@ def test_append_rebuilds_only_affected_thread(portable_profile):
     updated = update_incremental(config)
     ingest_report = updated["run"]["stages"]["ingest"]["report"]
     assert ingest_report["threads"] == 1
-    assert equivalence_audit(config)["passed"] is True
+    assert equivalence_audit(config, confirm_full_reference=True)["passed"] is True
 
 
 def test_snapshot_is_bounded_when_active_transcript_grows(portable_profile):
@@ -453,7 +475,16 @@ def test_fresh_machine_cli_acceptance(tmp_path: Path, capsys):
     assert cli_main(["--home", str(data_home), "update", "--max-cost-cny", "0", "--json"]) == 0
     updated = json.loads(capsys.readouterr().out)
     assert updated["run"]["stages"]["ingest"]["report"]["threads"] == 1
-    assert cli_main(["--home", str(data_home), "audit", "--equivalence", "--json"]) == 0
+    assert cli_main(
+        [
+            "--home",
+            str(data_home),
+            "audit",
+            "--equivalence",
+            "--confirm-full-reference",
+            "--json",
+        ]
+    ) == 0
     assert json.loads(capsys.readouterr().out)["passed"] is True
 
 
@@ -553,7 +584,7 @@ def test_optional_absolute_path_capture_uses_artifact_cas(portable_profile, tmp_
         assert connection.execute("SELECT COUNT(*) FROM ledger_artifacts").fetchone()[0] == 1
     finally:
         connection.close()
-    assert equivalence_audit(capture_config)["passed"] is True
+    assert equivalence_audit(capture_config, confirm_full_reference=True)["passed"] is True
 
 
 def test_artifact_only_build_captures_document_and_git_checkpoint(

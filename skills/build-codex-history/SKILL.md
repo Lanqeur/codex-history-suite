@@ -14,11 +14,11 @@ Resolve `../../scripts/codex_history.py` relative to this Skill directory. Run i
 1. Run `doctor --json`. Explain failed checks and storage warnings before proceeding.
 2. If uninitialized, run `init`. Use discovered Codex homes only when unambiguous; otherwise pass one or more explicit `--source` paths.
 3. Run `discover --json`, then `plan --mode full --json` for an initial build or `update --dry-run --json` for later changes.
-4. Report source/change counts, total and new/reprocessed bytes, pending model fact blocks, requested and effective summarization modes, reducer/writer models, fallback reason, expected/upper model tokens, cached input assumptions, expected/upper CNY cost, and low/expected/upper managed storage. When `auto` lacks either model key, explain that deterministic evidence can be staged but remains `pending_model_consolidation`, not a finished knowledge layer.
+4. Report source/change counts, total and new/reprocessed bytes, pending model fact blocks, requested and effective summarization modes, reducer/writer models, fallback reason, expected/upper model tokens, cached input assumptions, expected/upper CNY cost, low/expected/upper managed storage, and `resource_preflight` free/required peak bytes. Stop before creating a candidate when that preflight fails. When `auto` lacks either model key, explain that deterministic evidence can be staged but remains `pending_model_consolidation`, not a finished knowledge layer.
 5. Never start paid work without a user-approved `--max-cost-cny` value. Use the conservative `estimated_cost_cny` from the plan as the minimum safe limit unless the user intentionally changes configuration and reruns the plan.
 6. Run `build --max-cost-cny N --json` or `update --max-cost-cny N --json`. Keep promotion enabled unless the user explicitly requests a staging-only build.
 7. Confirm every state-machine stage completed, the evidence coverage gate passed, and the build audit passed. Report the completed build's actual `usage`, `storage`, and `knowledge_completion_status`, and compare actual cost with the plan. A failed build must leave the prior `active.json` untouched.
-8. After the first incremental update, after pipeline changes, or when correctness is disputed, run `audit --equivalence --json`. Treat authority-layer differences as a release failure; inspect generation-specific `derived_layer_differences` separately.
+8. After the first incremental update, after pipeline changes, or when correctness is disputed, explain the extra full-database footprint, then run `audit --equivalence --confirm-full-reference --json`. Treat authority-layer differences as a release failure; inspect generation-specific `derived_layer_differences` separately.
 
 The fixed state machine is `discover -> snapshot -> ingest -> lineage -> summarize -> index -> audit -> promote`. Chunked snapshots and artifact CAS are immutable and content addressed. SQLite is authoritative; Chroma supplies semantic candidates only.
 
@@ -32,7 +32,9 @@ python3 ../../scripts/codex_history.py plan --mode full --json
 python3 ../../scripts/codex_history.py build --max-cost-cny 30 --json
 python3 ../../scripts/codex_history.py update --dry-run --json
 python3 ../../scripts/codex_history.py update --max-cost-cny 5 --json
-python3 ../../scripts/codex_history.py audit --equivalence --json
+python3 ../../scripts/codex_history.py repair --audit-pollution --json
+python3 ../../scripts/codex_history.py repair --repair-pollution --max-cost-cny 5 --json
+python3 ../../scripts/codex_history.py audit --equivalence --confirm-full-reference --json
 python3 ../../scripts/codex_history.py status --json
 python3 ../../scripts/codex_history.py coverage --json
 python3 ../../scripts/codex_history.py library artifact-plan --since TIMESTAMP --json
@@ -66,7 +68,9 @@ checkpoint when its refs and worktree fingerprints are unchanged.
 
 Use `migrate --from-db PATH` for an existing v2.1/v2.1.1 SQLite authority. Add `--from-artifacts PATH --artifact-mode reference|copy|hardlink|auto` when the legacy database indexes an external artifact pack. Migration uses SQLite backup, adds portable metadata and lifecycle tables, rebuilds FTS, verifies artifact closure when requested, audits, and only then promotes it. It does not silently discard legacy evidence or knowledge. The imported authority is query-compatible, not yet a canonical incremental baseline. Run `hydrate-baseline` to attach normalized source snapshots while preserving curated knowledge and the existing semantic index, then optionally run `compact-storage` to remove duplicate canonical payloads. Both operations cost zero model tokens. Keep the migrated build for comparison and rollback until the hydrated baseline passes audit.
 
-Use `status` to inspect failed stages. Use `repair` only after reading [references/recovery.md](references/recovery.md). Never delete the last passing build or clear a lock while a process is alive.
+Use `status` to inspect failed stages. After correcting the cause, `repair --resume-latest --max-cost-cny N --json` starts a clean candidate while reusing immutable snapshot/artifact CAS and successful paid-response cache entries. Use other `repair` operations only after reading [references/recovery.md](references/recovery.md). Never delete the last passing build or clear a lock while a process is alive.
+
+When high-tier retrieval becomes dominated by recent tool output, repeated History-query synthesis, or multiple current Overviews, run `repair --audit-pollution --json`. Report legacy Asset/ledger counts, current Overview duplicates, pending model blocks, combined reducer/writer/embedding cost, and peak disk requirements. Run `--repair-pollution` only with an approved cost ceiling when model work is pending. A lifecycle-only repair may cost zero. Confirm the post-repair pollution audit is clean and that raw Evidence/artifact closure is unchanged.
 
 Read [references/configuration.md](references/configuration.md) when configuring model providers, embeddings, WSL storage, or multiple profiles. Read [references/lifecycle.md](references/lifecycle.md) when diagnosing change classification, checkpoints, promotion, or equivalence.
 
@@ -74,7 +78,7 @@ Read [references/configuration.md](references/configuration.md) when configuring
 
 Use `library device`, `library export`, `library import`, and `library verify` for the one-time canonical device baseline. Run `coverage --json` and explain both the represented `latest_activity_at` and source observation watermark before migration; do not call bundle creation time a content cutoff. Run `library artifact-audit --verify-hashes` before an archival export. Select `library export --artifacts none` for an explicitly query-only bundle, `referenced` for the default database-closed portable bundle, or `all` to retain unreferenced CAS objects too. Never describe `none` or the old `backup` command as a complete artifact backup.
 
-After the baseline is imported, use `library export-delta DEST --base PREVIOUS_TRANSFER` on the source and `library apply-delta DELTA` on the receiver. The previous transfer may be the baseline or the immediately preceding delta. Keep model cache deltas enabled unless the user explicitly accepts possible repeated model calls. Report base and target source generations, changed-source counts, payload size, and coverage watermarks. Never advise retransferring a full multi-gigabyte bundle for an ordinary append. Do not bypass a generation mismatch: missing, out-of-order, cross-lineage, and tampered deltas must fail before promotion.
+After the baseline is imported, use the default streaming v2 `library export-delta DEST --base PREVIOUS_TRANSFER` on the source and `library apply-delta DELTA` on the receiver. The previous transfer may be the baseline or the immediately preceding delta. V2 carries a thin manifest, streaming artifact rows, producer-computed authority rows, semantic file differences, and model-cache differences. Report `apply_mode`: `precomputed` means zero receiver-side model calls, while `rebuild_fallback` must include `fast_apply_error` and the ordinary cost result. Keep model cache deltas enabled unless the user explicitly accepts possible repeated model calls. Report base and target generations, changed-source counts, payload and manifest sizes, and coverage watermarks. Never advise retransferring a full multi-gigabyte bundle for an ordinary append. Do not bypass a generation mismatch: missing, out-of-order, cross-lineage, and tampered deltas must fail before promotion.
 
 Use `library search` when the user wants immediate cross-device retrieval without rebuilding. It preserves independent authorities and collapses exact duplicate knowledge while returning every source profile and Record ID.
 

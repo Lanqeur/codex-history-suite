@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.10.1 - 2026-07-22
+
+- Fence Codex History query commands, outputs, and pure retrieval synthesis from the model-promotion path while preserving first-party user statements and mixed turns with real execution evidence.
+- Stop promoting assistant/tool payloads into deterministic Assets, cap user-signal Assets, and collapse exact same-tier search duplicates without deleting their source records or evidence.
+- Add rollback-safe pollution audit/repair commands that remove legacy recursive Assets and dirty ledgers, rebuild affected summaries with explicit cost limits, recover from external-content FTS drift, and retain raw events, Evidence, and artifacts.
+- Supersede imported noncanonical Overviews when a canonical model Overview advances so repeated incremental updates cannot leave multiple current top-level summaries.
+- Estimate reducer, writer, and embedding repair costs together; preserve paid response-cache hits and require full SQLite, foreign-key, FTS, Evidence, artifact-closure, and pollution audits before promotion.
+- Reject oversized legacy delta manifests before JSON parsing so malformed or pre-v2 packages cannot trigger multi-gigabyte memory allocation during verification.
+
+## 0.10.0 - 2026-07-22
+
+- Add disk-peak preflight, automatic active-plus-rollback build retention, explicit full-reference audit confirmation, checkpoint-assisted retry, and a durable per-attempt API usage ledger.
+- Introduce streaming Delta v2 manifests with gzip JSONL artifact metadata, bounded-memory verification, honest manifest/payload sizes, and v1 read/apply compatibility.
+- Parse safe append-only transcript suffixes from the previous byte/line/turn checkpoint while falling back to full thread hydration for incomplete turns, rewrites, or invariant failures.
+- Package producer-computed authority rows and semantic index file deltas so receiving devices can apply high-quality knowledge with zero model calls; retain audited canonical rebuild fallback.
+- Add chained v2 delta, semantic transfer, artifact-only, usage-ledger, retention, resource-preflight, and append-equivalence coverage.
+
 ## 0.8.0 - 2026-07-21
 
 - Bind captured absolute-path documents back to their exact conversation events through artifact observations, while retaining inline image URI recovery.

@@ -8,11 +8,13 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
 from .config import ProfileConfig
+from .operations import append_usage_event
 from .util import canonical_json, utc_now
 
 
@@ -122,14 +124,52 @@ def embed_with_retry(
     client: EmbeddingClient,
     texts: list[str],
     attempts: int = 3,
+    *,
+    config: ProfileConfig | None = None,
+    run_id: str = "",
+    batch_number: int = 0,
 ) -> tuple[list[list[float]], int, int]:
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
             vectors, tokens = client.embed(texts)
+            if config is not None:
+                append_usage_event(
+                    config,
+                    {
+                        "kind": "embedding",
+                        "stage": "semantic-index",
+                        "provider": config.embedding_provider,
+                        "model": client.settings.model,
+                        "run_id": run_id,
+                        "batch_number": batch_number,
+                        "status": "complete",
+                        "attempt": attempt,
+                        "documents": len(texts),
+                        "input_tokens": tokens,
+                        "cost_cny": tokens / 1_000_000 * client.settings.input_price_cny,
+                    },
+                )
             return vectors, tokens, attempt
         except Exception as error:
             last_error = error
+            if config is not None:
+                append_usage_event(
+                    config,
+                    {
+                        "kind": "embedding",
+                        "stage": "semantic-index",
+                        "provider": config.embedding_provider,
+                        "model": client.settings.model,
+                        "run_id": run_id,
+                        "batch_number": batch_number,
+                        "status": "failed",
+                        "attempt": attempt,
+                        "documents": len(texts),
+                        "estimated_input_tokens": sum(max(1, len(text) // 2) for text in texts),
+                        "error": f"{type(error).__name__}: {error}",
+                    },
+                )
             if attempt < attempts:
                 time.sleep(min(8.0, 0.5 * (2 ** (attempt - 1))) + random.random() * 0.2)
     assert last_error is not None
@@ -185,8 +225,13 @@ def refresh_embeddings(
     *,
     max_cost_cny: float | None,
     batch_size: int = 8,
+    concurrency: int = 4,
     chroma_path: Path | None = None,
 ) -> dict[str, Any]:
+    if batch_size < 1:
+        raise ValueError("Embedding batch_size must be positive")
+    if concurrency < 1:
+        raise ValueError("Embedding concurrency must be positive")
     settings = EmbeddingSettings.from_config(config)
     client = EmbeddingClient(settings)
     _chroma_client, collection = chroma_collection(
@@ -223,30 +268,82 @@ def refresh_embeddings(
             len(pending),
             estimated_cost,
             max_cost_cny,
-            canonical_json({"collection": collection.name}),
+            canonical_json(
+                {
+                    "collection": collection.name,
+                    "batch_size": batch_size,
+                    "concurrency": concurrency,
+                }
+            ),
         ),
     )
     total_tokens = 0
     embedded = 0
-    for batch_number, batch in enumerate(_batches(pending, batch_size), 1):
+    numbered_batches = iter(enumerate(_batches(pending, batch_size), 1))
+
+    def submit_next(
+        executor: ThreadPoolExecutor,
+        in_flight: dict[Future[tuple[list[list[float]], int, int]], tuple[int, list[dict[str, Any]]]],
+    ) -> bool:
+        try:
+            batch_number, batch = next(numbered_batches)
+        except StopIteration:
+            return False
         ids = [str(row["document_id"]) for row in batch]
         texts = [str(row["document_text"]) for row in batch]
         connection.execute(
             "INSERT INTO embedding_batches(run_id,batch_number,document_ids_json,status) VALUES(?,?,?,'running')",
             (run_id, batch_number, canonical_json(ids)),
         )
-        vectors, tokens, attempts = embed_with_retry(client, texts)
-        collection.add(ids=ids, documents=texts, embeddings=vectors)
-        batch_cost = tokens / 1_000_000 * settings.input_price_cny
-        connection.execute(
-            "UPDATE embedding_batches SET status='complete',attempt_count=?,input_tokens=?,cost_cny=?,completed_at=? WHERE run_id=? AND batch_number=?",
-            (attempts, tokens, batch_cost, utc_now(), run_id, batch_number),
+        in_flight[
+            executor.submit(
+                embed_with_retry,
+                client,
+                texts,
+                config=config,
+                run_id=run_id,
+                batch_number=batch_number,
+            )
+        ] = (
+            batch_number,
+            batch,
         )
-        total_tokens += tokens
-        embedded += len(batch)
-        actual_cost = total_tokens / 1_000_000 * settings.input_price_cny
-        if max_cost_cny is not None and actual_cost > max_cost_cny:
-            raise RuntimeError("Embedding actual cost exceeded the configured limit")
+        return True
+
+    in_flight: dict[
+        Future[tuple[list[list[float]], int, int]], tuple[int, list[dict[str, Any]]]
+    ] = {}
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        for _ in range(concurrency):
+            if not submit_next(executor, in_flight):
+                break
+        while in_flight:
+            completed, _pending = wait(in_flight, return_when=FIRST_COMPLETED)
+            for future in completed:
+                batch_number, batch = in_flight.pop(future)
+                ids = [str(row["document_id"]) for row in batch]
+                texts = [str(row["document_text"]) for row in batch]
+                try:
+                    vectors, tokens, attempts = future.result()
+                except Exception as error:
+                    connection.execute(
+                        "UPDATE embedding_batches SET status='failed',error_text=?,completed_at=? "
+                        "WHERE run_id=? AND batch_number=?",
+                        (str(error), utc_now(), run_id, batch_number),
+                    )
+                    raise
+                collection.add(ids=ids, documents=texts, embeddings=vectors)
+                batch_cost = tokens / 1_000_000 * settings.input_price_cny
+                connection.execute(
+                    "UPDATE embedding_batches SET status='complete',attempt_count=?,input_tokens=?,cost_cny=?,completed_at=? WHERE run_id=? AND batch_number=?",
+                    (attempts, tokens, batch_cost, utc_now(), run_id, batch_number),
+                )
+                total_tokens += tokens
+                embedded += len(batch)
+                actual_cost = total_tokens / 1_000_000 * settings.input_price_cny
+                if max_cost_cny is not None and actual_cost > max_cost_cny:
+                    raise RuntimeError("Embedding actual cost exceeded the configured limit")
+                submit_next(executor, in_flight)
     actual_cost = total_tokens / 1_000_000 * settings.input_price_cny
     connection.execute(
         "UPDATE embedding_runs SET status='complete',completed_at=?,embedded_documents=?,input_tokens=?,actual_cost_cny=? WHERE run_id=?",

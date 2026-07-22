@@ -235,6 +235,9 @@ def test_canonical_baseline_and_delta_avoid_full_retransfer(
         "Source Device",
         [("thread-delta", "Delta thread", "baseline-generation")],
     )
+    semantic_state = config.root / "semantic/chroma/state.bin"
+    semantic_state.parent.mkdir(parents=True, exist_ok=True)
+    semantic_state.write_bytes(b"baseline-vector-state")
     baseline = tmp_path / "baseline.zip"
     baseline_export = export_library(
         config, baseline, artifact_mode="referenced"
@@ -267,7 +270,16 @@ def test_canonical_baseline_and_delta_avoid_full_retransfer(
                 for row in rows
             )
         )
-    update_incremental(config)
+    producer_update = update_incremental(config)
+    assert (
+        producer_update["run"]["stages"]["ingest"]["report"]["append_fast_path"]
+        == 1
+    )
+    assert (
+        producer_update["run"]["stages"]["snapshot"]["report"]["append_reused_prefix"]
+        == 1
+    )
+    semantic_state.write_bytes(b"target-vector-state")
 
     delta = tmp_path / "generation-2.delta.zip"
     delta_export = export_delta(config, delta, base=baseline)
@@ -278,11 +290,21 @@ def test_canonical_baseline_and_delta_avoid_full_retransfer(
     assert delta_verification["passed"] is True
     with zipfile.ZipFile(delta) as archive:
         delta_manifest = json.loads(archive.read("delta.json"))
+    assert delta_manifest["schema_version"] == "codex-history-library-delta-v2"
+    assert "tables" not in delta_manifest["artifact_metadata"]
+    assert delta_manifest["capabilities"]["streaming_artifact_metadata"] is True
+    assert delta_manifest["capabilities"]["precomputed_authority_patch"] is True
+    assert delta_manifest["totals"]["manifest_bytes"] < 16 * 1024 * 1024
     assert delta_manifest["artifact_delta"]["new_files"] == 1
     assert sum(item["role"] == "artifact_cas" for item in delta_manifest["files"]) == 1
 
     applied = apply_delta(target_home, delta)
     assert applied["status"] == "applied"
+    assert applied["apply_mode"] == "precomputed", applied.get("fast_apply_error")
+    assert applied["build"]["usage"]["total_api_tokens"] == 0
+    assert (
+        imported_config.root / "semantic/chroma/state.bin"
+    ).read_bytes() == b"target-vector-state"
     assert (
         applied["target_source_generation_id"]
         == delta_export["target_source_generation_id"]
@@ -304,6 +326,46 @@ def test_canonical_baseline_and_delta_avoid_full_retransfer(
     assert closure["complete"] is True
     assert closure["indexed_files"] == 1
     assert apply_delta(target_home, delta)["status"] == "already_applied"
+
+
+    third_rows = transcript_rows(
+        "thread-delta",
+        timestamp="2026-07-16T03:00:00Z",
+        label="third-generation",
+    )[1:]
+    for row in third_rows:
+        payload = row.get("payload", {})
+        if isinstance(payload, dict):
+            for key in ("turn_id", "call_id"):
+                if key in payload:
+                    payload[key] = str(payload[key]) + "-third"
+    with transcript.open("a", encoding="utf-8") as handle:
+        handle.write(
+            "".join(
+                json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
+                for row in third_rows
+            )
+        )
+    update_incremental(config)
+    chained_delta = tmp_path / "generation-3.delta.zip"
+    chained_export = export_delta(config, chained_delta, base=delta)
+    assert chained_export["change_counts"]["appended"] == 1
+    assert verify_delta(chained_delta)["passed"] is True
+    chained_apply = apply_delta(target_home, chained_delta)
+    assert chained_apply["apply_mode"] == "precomputed"
+    assert chained_apply["build"]["usage"]["total_cost_cny"] == 0.0
+
+
+def test_oversized_legacy_delta_manifest_is_rejected_before_parsing(tmp_path: Path):
+    delta = tmp_path / "oversized-v1.zip"
+    with zipfile.ZipFile(delta, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("delta.json", b"{" + (b" " * (17 * 1024 * 1024)) + b"}")
+
+    result = verify_delta(delta)
+
+    assert result["passed"] is False
+    assert result["checked_files"] == 0
+    assert "16 MiB safety limit" in result["errors"][0]
 
 
 def test_artifact_only_delta_converges_without_transcript_generation_change(
@@ -377,6 +439,7 @@ def test_artifact_only_delta_converges_without_transcript_generation_change(
 
     applied = apply_delta(target_home, delta)
     assert applied["status"] == "applied"
+    assert applied["apply_mode"] == "precomputed"
     assert applied["source_build"] is None
     assert applied["artifact_build"]["usage"]["total_api_tokens"] == 0
     imported_config = load_config(target_home, imported["profile"])

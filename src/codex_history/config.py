@@ -135,6 +135,9 @@ class ProfileConfig:
     artifact_git_max_bytes: int = 1024 * 1024 * 1024
     artifact_git_command_timeout_seconds: int = 600
     runtime_python: str = ""
+    runtime_retained_builds: int = 2
+    runtime_min_free_bytes: int = 512 * 1024 * 1024
+    runtime_peak_headroom_ratio: float = 0.15
     path_mappings: tuple[tuple[str, str], ...] = ()
 
     @property
@@ -164,6 +167,10 @@ class ProfileConfig:
     @property
     def reports_dir(self) -> Path:
         return self.root / "reports"
+
+    @property
+    def usage_dir(self) -> Path:
+        return self.root / "usage"
 
     @property
     def active_path(self) -> Path:
@@ -263,6 +270,9 @@ git_command_timeout_seconds = 600
 
 [profiles.{profile}.runtime]
 python = ""
+retained_builds = 2
+min_free_bytes = 536870912
+peak_headroom_ratio = 0.15
 '''
     atomic_write_text(path, text)
     return path
@@ -404,6 +414,9 @@ def _profile_from_item(home: Path, profile: str, item: Mapping[str, Any]) -> Pro
             artifacts.get("git_command_timeout_seconds", 600)
         ),
         runtime_python=str(runtime.get("python", "")),
+        runtime_retained_builds=int(runtime.get("retained_builds", 2)),
+        runtime_min_free_bytes=int(runtime.get("min_free_bytes", 512 * 1024 * 1024)),
+        runtime_peak_headroom_ratio=float(runtime.get("peak_headroom_ratio", 0.15)),
         path_mappings=tuple(parsed_mappings),
     )
     _validate_profile(config)
@@ -499,6 +512,12 @@ def _validate_profile(config: ProfileConfig) -> None:
         errors.append("artifacts.git_max_bytes must be greater than zero")
     if config.artifact_git_command_timeout_seconds <= 0:
         errors.append("artifacts.git_command_timeout_seconds must be greater than zero")
+    if config.runtime_retained_builds < 1:
+        errors.append("runtime.retained_builds must be at least one")
+    if config.runtime_min_free_bytes < 0:
+        errors.append("runtime.min_free_bytes must be non-negative")
+    if config.runtime_peak_headroom_ratio < 0:
+        errors.append("runtime.peak_headroom_ratio must be non-negative")
     if errors:
         raise ValueError("Invalid Codex History profile: " + "; ".join(errors))
 
@@ -598,5 +617,6 @@ def ensure_profile_dirs(config: ProfileConfig) -> None:
         config.runs_dir,
         config.cache_dir,
         config.reports_dir,
+        config.usage_dir,
     ):
         path.mkdir(parents=True, exist_ok=True)

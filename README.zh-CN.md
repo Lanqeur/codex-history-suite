@@ -115,9 +115,9 @@ python3 scripts/codex_history.py plan --mode full --json
 
 生成配置中的价格只是可编辑的估算输入：`deepseek-v4-flash` 为输入/输出 1/2 元每百万 Token，Qwen writer 为非缓存输入/缓存输入/输出 6/1.2/18 元，`text-embedding-v4` 为输入 0.5 元。实际使用前请按所选地域和部署复核[百炼最新模型价格](https://help.aliyun.com/zh/model-studio/model-pricing)。
 
-`plan` 和 `update --dry-run` 会统计 transcript 体积、新增字节、待归纳 fact block，并分别估算 reducer/writer 的输入、缓存输入、输出、embedding Token、人民币成本和磁盘体积。内联 data-URI base64 不计入模型 Token，但仍计入 snapshot 存储。没有 Key 也能先得到完整预算。
+`plan` 和 `update --dry-run` 会统计 transcript 体积、新增字节、待归纳 fact block，并分别估算 reducer/writer 的输入、缓存输入、输出、embedding Token、人民币成本、磁盘体积和瞬时 `resource_preflight`。预检会同时给出当前文件系统真实剩余空间、候选 SQLite/语义索引副本、配置的安全余量和所需峰值；如果不通过，会在创建数 GB 候选库之前停止。内联 data-URI base64 不计入模型 Token，但仍计入 snapshot 存储。没有 Key 也能先得到完整预算。
 
-构建完成后，返回结果还会提供实际 `usage` 汇总，包括模型输入、模型提供商缓存输入、输出、embedding Token、Codex History 响应缓存命中和人民币成本；`storage` 则同时给出 active 核心组件与保留历史 build 后整个 profile 的真实占用。
+构建完成后，返回结果还会提供实际 `usage` 汇总，包括模型输入、模型提供商缓存输入、输出、embedding Token、Codex History 响应缓存命中和人民币成本；`storage` 则同时给出 active 核心组件与保留历史 build 后整个 profile 的真实占用。每次提供商调用尝试（包括失败重试）还会追加到 `usage/api-usage.jsonl`，后续计划通过 `usage_ledger` 汇总。成功提升后默认只保留当前 build 和一个回滚 build，并报告释放空间。
 
 ## 引用文件与 Git 时间点快照
 
@@ -167,7 +167,7 @@ python3 scripts/codex_history.py library list --json
 python3 scripts/codex_history.py library search '发布 决策' --deep --json
 ```
 
-下一份 delta 可以把上一份 delta 作为 `--base`。delta 保留完整的目标来源清单和 artifact 映射，但 ZIP 只携带基代中不存在的 blob。`apply-delta` 会严格检查 `library_id` 与兼容的 source generation，只重建发生变化的规范化 transcript，再走普通的审计式增量状态机；即使 transcript generation 没变，纯 artifact delta 仍会以零模型调用合并映射并校验 CAS 闭合，不会被误判为已应用。重复应用保持幂等，缺代、乱序、跨库或篡改的 delta 都会在晋升前拒绝。完整 SQLite、已有 Chroma、历史 snapshot 与 artifact CAS 因此只需传输一次。
+下一份 delta 可以把上一份 delta 作为 `--base`。默认 Delta v2 使用有上限的薄 manifest；几十万条 artifact 映射改放到逐行哈希、逐行校验的 gzip JSONL，同时携带生产端已经算好的权威知识行、语义索引文件差量和稳定模型缓存。接收端正常会返回 `apply_mode: precomputed`，直接安装同质量知识与语义状态，模型调用为零；补丁缺失、删除型变更不安全或不变量校验失败时，则返回 `rebuild_fallback` 和 `fast_apply_error`，自动走规范增量状态机。`apply-delta` 仍严格检查 `library_id` 与 source generation；纯 artifact delta、重复应用、缺代、乱序、跨库和篡改也各有明确处理。manifest 受控的旧 v1 delta 仍可校验和导入；超过 16 MiB 安全上限的旧 manifest 会在解析前被拒绝，需要重新导出为 v2。
 
 导入 profile 默认按“来源设备名 + 原 profile 名”自动命名，重名时自动追加数字。稳定的 `library_id` 会识别同一个设备库的后续版本：新 bundle 会更新对应 profile，同时把旧代保存在 `backups/imports`。bundle 内每个文件都执行 SHA-256 校验，并拒绝危险压缩路径；不可变 transcript chunk、artifact、语义索引和模型缓存会进入全局内容寻址 blob 仓库，在文件系统允许时通过硬链接实现物理去重。
 
@@ -201,13 +201,26 @@ python3 scripts/codex_history.py library merge \
 discover -> snapshot -> ingest -> lineage -> summarize -> index -> audit -> promote
 ```
 
-每个阶段都会在暂存 SQLite 数据库和 `runs/<build-id>/run.json` 中记录检查点。任何阶段失败时，上一份 active build 仍然可用。
+每个阶段都会在暂存 SQLite 数据库和 `runs/<build-id>/run.json` 中记录检查点。任何阶段失败时，上一份 active build 仍然可用。修正故障后，可用 `repair --resume-latest --max-cost-cny N` 在干净候选库中重试，同时复用不可变 snapshot/artifact CAS 和已经成功付费的模型响应缓存。
 
 付费构建必须在审阅 dry-run 后显式传入 `--max-cost-cny`。Reducer 输入的每个 Record ID 都必须进入 ledger 事实或明确的无新增事实列表；修复后仍有遗漏、Writer 引用非法、API 失败或预算耗尽都会让候选 build 失败，旧 active 库保持不变。精确模型响应缓存命中费用为零。
 
+## 历史检索污染防护
+
+历史查询命令与输出仍作为可追溯的 Core/Evidence 保存，但不能把从知识库检索出的内容再次回流到 ledger、Asset 或 Overview。纯历史研究 turn 会被隔离；其中较长的用户一手陈述仍按用户上下文保留；先查历史再继续真实编辑、测试的混合 turn 会保留后续执行事实。助手与工具输出不会再直接生成确定性 Asset；检索显示层会折叠同 tier 的完全相同文本，但不会删除任何 Record ID 或证据链。
+
+对旧库或多次增量后的库，先 dry-run，再按预算修复：
+
+```bash
+python3 scripts/codex_history.py repair --audit-pollution --json
+python3 scripts/codex_history.py repair --repair-pollution --max-cost-cny N --json
+```
+
+修复会克隆 active SQLite，仅在候选库中暂停可能漂移的 external-content FTS 触发器，移除旧式递归 Asset/ledger 及其派生引用，用模型重建受影响摘要，从权威主表恢复 FTS，并把旧导入 Overview 归一为带 `valid_to/supersedes` 的历史版本。只有 SQLite、外键、FTS、Evidence、artifact closure 与污染审计全部通过才会原子提升；原始 transcript、canonical event、Evidence 和 artifact 不会被删除。纯生命周期修复模型费用为零。
+
 ## 增量等价约束
 
-`codex-history audit --equivalence` 会根据当前源数据执行一次干净的规则式参考构建，并要求规范来源、events/turns、Evidence occurrence、确定性 core/fact 与 artifacts 完全一致。模型 ledger、Overview、claims 和 semantic documents 会随归纳代际演进，其差异单列为 `derived_layer_differences`，不会再被误判成原始证据不等价。
+`codex-history audit --equivalence --confirm-full-reference` 会根据当前源数据执行一次干净的规则式参考构建，并要求规范来源、events/turns、Evidence occurrence、确定性 core/fact 与 artifacts 完全一致。之所以要求显式确认，是因为它大约需要再占用一份 active 数据库的峰值空间。模型 ledger、Overview、claims 和 semantic documents 会随归纳代际演进，其差异单列为 `derived_layer_differences`，不会再被误判成原始证据不等价。
 
 新构建只自动生成由证据直接支持的保守事实关系：经过验证的工具输出可以验证同一个 call，完成的 goal 可以验证此前相同的目标。系统不会自动猜测含义模糊的矛盾、失效或重新打开关系。
 

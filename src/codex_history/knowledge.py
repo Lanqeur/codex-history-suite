@@ -25,6 +25,32 @@ DECISION_RE = re.compile(r"决定|采用|选择|同意|确定|保留|放弃|\b(d
 PREFERENCE_RE = re.compile(r"必须|不要|不需要|希望|偏好|要求|只允许|\b(prefer|must|should not|require)\b", re.IGNORECASE)
 CAPABILITY_RE = re.compile(r"完成|实现|通过|修复|支持|生成|成功|\b(implemented|completed|fixed|passed|supports?)\b", re.IGNORECASE)
 UNRESOLVED_RE = re.compile(r"待|仍需|尚未|未解决|不确定|计划|下一步|\b(todo|pending|unresolved|uncertain|planned)\b", re.IGNORECASE)
+HISTORY_QUERY_CALL_RE = re.compile(
+    r"(?:codex_history\.py|(?:codex[-_]history[^\s/]*/)?history\.py)\s+"
+    r"(?:search|context|trace|claims|compare|asset|unresolved|stats|conversation|library\s+search)\b",
+    re.IGNORECASE,
+)
+HISTORY_SUPPORT_CALL_RE = re.compile(
+    r"(?:"
+    r"[/\\]\.codex[/\\](?:skills|plugins)[/\\].*?codex-history.*?"
+    r"(?:SKILL\.md|references[/\\])"
+    r"|[/\\]\.local[/\\]share[/\\]codex-history[/\\]"
+    r"|CodexTranscriptArchive[/\\].*?codex[_-]history.*?\.sqlite3"
+    r")",
+    re.IGNORECASE,
+)
+HISTORY_OUTPUT_MARKERS = (
+    "# Codex History Context",
+    "# Linked knowledge",
+    '"semantic_expansions"',
+    '"retrieval_score"',
+)
+ENVIRONMENT_CONTEXT_RE = re.compile(
+    r"<environment_context>.*?</environment_context>\s*",
+    re.IGNORECASE | re.DOTALL,
+)
+MAX_DETERMINISTIC_ASSET_CHARS = 1_600
+MIN_HISTORY_USER_ASSERTION_CHARS = 800
 DEFAULT_ALIASES = (
     ("wsl2", "wsl", "technical", 1.0),
     ("visual studio code", "vscode", "technical", 1.0),
@@ -88,21 +114,98 @@ def _event_category(event: ParsedEvent) -> str:
 
 
 def _asset_types(event: ParsedEvent) -> list[str]:
+    # Tool and assistant events remain first-class Core/Evidence. Promoting their
+    # full payloads with keyword regexes creates recursive retrieval echoes and
+    # lets large command output overwhelm curated/model-authored assets.
+    if event.role not in {"user", "goal"}:
+        return []
     text = event.text
     result: list[str] = []
     if event.role == "user" and PREFERENCE_RE.search(text):
         result.append("preferences")
-    if DECISION_RE.search(text):
+    if event.role == "user" and DECISION_RE.search(text):
         result.append("decisions")
-    if FAILURE_RE.search(text):
+    if event.role == "user" and FAILURE_RE.search(text):
         result.append("failures")
-    if CAPABILITY_RE.search(text) and event.role in {"assistant", "tool_output"}:
-        result.append("capabilities")
-    if UNRESOLVED_RE.search(text):
+    if event.role == "user" and UNRESOLVED_RE.search(text):
         result.append("unresolved")
     if event.role == "goal" and "[complete]" not in text.casefold() and "[completed]" not in text.casefold():
         result.append("unresolved")
     return result
+
+
+def _deterministic_asset_text(event: ParsedEvent) -> str:
+    return truncate(normalize_text(event.text), MAX_DETERMINISTIC_ASSET_CHARS)
+
+
+def _looks_like_history_output(text: str) -> bool:
+    if any(marker in text for marker in HISTORY_OUTPUT_MARKERS):
+        return True
+    return (
+        '"record_id"' in text
+        and '"scope_id"' in text
+        and ('"evidence_refs"' in text or '"tier"' in text)
+    )
+
+
+def _history_support_call(event: ParsedEvent) -> bool:
+    return bool(
+        event.role == "tool_call"
+        and (
+            HISTORY_QUERY_CALL_RE.search(event.text)
+            or HISTORY_SUPPORT_CALL_RE.search(event.text)
+        )
+    )
+
+
+def history_retrieval_turn(events: list[ParsedEvent]) -> tuple[bool, set[str]]:
+    history_call_ids = {
+        event.call_id
+        for event in events
+        if event.call_id and _history_support_call(event)
+    }
+    history_call_ids.update(
+        event.call_id
+        for event in events
+        if event.role == "tool_output"
+        and event.call_id
+        and _looks_like_history_output(event.text)
+    )
+    history_event_ids = {
+        event.event_id
+        for event in events
+        if event.role == "tool_call"
+        and event.call_id
+        and event.call_id in history_call_ids
+    }
+    history_event_ids.update(
+        {
+            event.event_id
+            for event in events
+            if event.role == "tool_output"
+            and (
+                (event.call_id and event.call_id in history_call_ids)
+                or _looks_like_history_output(event.text)
+            )
+        }
+    )
+    if not history_event_ids:
+        return False, set()
+    non_history_calls = [
+        event
+        for event in events
+        if event.role == "tool_call"
+        and not (event.call_id and event.call_id in history_call_ids)
+    ]
+    return not non_history_calls, history_event_ids
+
+
+def history_user_assertion_eligible(user_text: str, pure_retrieval: bool) -> bool:
+    return pure_retrieval and len(_user_fact_text(user_text)) >= MIN_HISTORY_USER_ASSERTION_CHARS
+
+
+def _user_fact_text(text: str) -> str:
+    return normalize_text(ENVIRONMENT_CONTEXT_RE.sub("", text))
 
 
 def insert_source_snapshot(connection: sqlite3.Connection, snapshot: SnapshotFile) -> None:
@@ -428,6 +531,157 @@ def hydrate_parsed_thread(
     }
 
 
+def append_parsed_thread(
+    connection: sqlite3.Connection,
+    snapshot: SnapshotFile,
+    parsed: ParsedThread,
+    config: ProfileConfig,
+    *,
+    build_id: str,
+) -> dict[str, int]:
+    """Append a parsed, turn-boundary-safe suffix without rewriting prior rows."""
+    existing = connection.execute(
+        "SELECT * FROM threads WHERE thread_id=?", (parsed.thread_id,)
+    ).fetchone()
+    if existing is None:
+        raise ValueError("Append fast path requires an existing thread")
+    if not parsed.events:
+        raise ValueError("Append fast path produced no events")
+    last_line = int(
+        connection.execute(
+            "SELECT COALESCE(MAX(line_no),0) FROM canonical_events WHERE thread_id=?",
+            (parsed.thread_id,),
+        ).fetchone()[0]
+    )
+    if min(event.line_no for event in parsed.events) <= last_line:
+        raise ValueError("Append suffix overlaps existing canonical event lines")
+
+    connection.executemany(
+        """
+        INSERT INTO turns(
+            turn_id,thread_id,turn_seq,source_turn_id,started_at,completed_at,status,
+            user_text,assistant_text,tool_call_count,tool_output_count,event_count,
+            content_sha256,metadata_json
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            (
+                turn.turn_id,
+                parsed.thread_id,
+                turn.turn_seq,
+                turn.source_turn_id,
+                turn.started_at,
+                turn.completed_at,
+                turn.status,
+                turn.user_text,
+                turn.assistant_text,
+                turn.tool_call_count,
+                turn.tool_output_count,
+                turn.event_count,
+                turn.content_sha256,
+                "{}",
+            )
+            for turn in parsed.turns
+        ),
+    )
+    valid_turn_ids = {turn.turn_id for turn in parsed.turns}
+    connection.executemany(
+        """
+        INSERT INTO canonical_events(
+            event_id,content_sha256,source_id,thread_id,turn_id,line_no,byte_start,
+            byte_end,timestamp,event_type,payload_type,role,text,tool_name,call_id,
+            raw_json,metadata_json
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            (
+                event.event_id,
+                event.content_sha256,
+                snapshot.source.source_id,
+                parsed.thread_id,
+                event.turn_id if event.turn_id in valid_turn_ids else None,
+                event.line_no,
+                event.byte_start,
+                event.byte_end,
+                event.timestamp,
+                event.event_type,
+                event.payload_type,
+                event.role,
+                truncate(event.text, 16000),
+                event.tool_name,
+                event.call_id,
+                "",
+                canonical_json(event.metadata),
+            )
+            for event in parsed.events
+        ),
+    )
+    stats = parsed.stats
+    first_values = [value for value in (existing["first_activity_at"], parsed.first_activity_at) if value]
+    last_values = [value for value in (existing["last_activity_at"], parsed.last_activity_at) if value]
+    connection.execute(
+        """
+        UPDATE threads SET title=?,source_size_bytes=?,line_count=?,
+            first_activity_at=?,last_activity_at=?,event_count=event_count+?,
+            turn_count=turn_count+?,message_count=message_count+?,
+            user_message_count=user_message_count+?,
+            assistant_message_count=assistant_message_count+?,
+            tool_call_count=tool_call_count+?,tool_output_count=tool_output_count+?,
+            goal_event_count=goal_event_count+?,compacted_count=compacted_count+?,
+            indexed_at=?,parent_thread_id=COALESCE(?,parent_thread_id),source_id=?
+        WHERE thread_id=?
+        """,
+        (
+            parsed.title,
+            snapshot.source.size_bytes,
+            snapshot.line_count,
+            min(first_values) if first_values else None,
+            max(last_values) if last_values else None,
+            stats["event_count"],
+            stats["turn_count"],
+            stats["message_count"],
+            stats["user_message_count"],
+            stats["assistant_message_count"],
+            stats["tool_call_count"],
+            stats["tool_output_count"],
+            stats["goal_event_count"],
+            stats["compacted_count"],
+            utc_now(),
+            parsed.parent_thread_id,
+            snapshot.source.source_id,
+            parsed.thread_id,
+        ),
+    )
+    _insert_artifacts(connection, snapshot, parsed, config)
+    if not connection.execute(
+        "SELECT 1 FROM scopes WHERE scope_id=?", (parsed.thread_id,)
+    ).fetchone():
+        _insert_scope(connection, parsed, _thread_overview(parsed))
+    else:
+        connection.execute(
+            "UPDATE scopes SET scope_title=?,last_activity_at=MAX(COALESCE(last_activity_at,''),COALESCE(?,'')),indexed_at=? WHERE scope_id=?",
+            (parsed.title, parsed.last_activity_at, utc_now(), parsed.thread_id),
+        )
+    indexed = _insert_incremental_knowledge(
+        connection,
+        snapshot,
+        parsed,
+        event_ids={event.event_id for event in parsed.events},
+        turn_ids={turn.turn_id for turn in parsed.turns},
+        build_id=build_id,
+    )
+    return {
+        "events": len(parsed.events),
+        "turns": len(parsed.turns),
+        "evidence": indexed["evidence"],
+        "fact_blocks": indexed["fact_blocks"],
+        "parse_errors": len(parsed.parse_errors),
+        "artifacts": len(parsed.image_artifacts),
+        "preserved_curated_scope": 1,
+        "append_fast_path": 1,
+    }
+
+
 def _insert_scope(connection: sqlite3.Connection, parsed: ParsedThread, overview: str) -> None:
     connection.execute(
         """
@@ -671,16 +925,30 @@ def _semantic_projection(text: str, max_chars: int = 3_900) -> str:
 
 
 def _turn_text(turn: ParsedTurn, events: list[ParsedEvent]) -> str:
-    tools = [event.tool_name for event in events if event.role == "tool_call" and event.tool_name]
+    pure_retrieval, history_event_ids = history_retrieval_turn(events)
+    semantic_events = [event for event in events if event.event_id not in history_event_ids]
+    tools = [
+        event.tool_name
+        for event in semantic_events
+        if event.role == "tool_call" and event.tool_name
+    ]
     parts = []
-    if turn.user_text:
-        parts.append(f"Intent: {truncate(turn.user_text, 3000)}")
+    user_text = _user_fact_text(turn.user_text)
+    if user_text:
+        parts.append(f"Intent: {truncate(user_text, 3000)}")
     if tools:
         parts.append(f"Tools: {', '.join(tools[:30])}")
-    outputs = [event.text for event in events if event.role == "tool_output" and event.text]
+    outputs = [
+        event.text
+        for event in semantic_events
+        if event.role == "tool_output" and event.text
+    ]
     if outputs:
         parts.append(f"Evidence: {truncate(' | '.join(outputs), 5000)}")
-    if turn.assistant_text:
+    # A pure History lookup is derived from this same knowledge base. Preserve
+    # the user's first-party statement, but never feed the assistant's retrieved
+    # synthesis back into the promotion pipeline.
+    if turn.assistant_text and not pure_retrieval:
         parts.append(f"Outcome: {truncate(turn.assistant_text, 4000)}")
     return "\n".join(parts) or f"Turn {turn.turn_seq} contains {turn.event_count} events."
 
@@ -861,7 +1129,7 @@ def _insert_incremental_knowledge(
                 scope_type="thread",
                 scope_title=parsed.title,
                 category=asset_type,
-                text=event.text,
+                text=_deterministic_asset_text(event),
                 status=status,
                 status_group=status_group,
                 evidence_refs=[evidence_id],
@@ -871,8 +1139,9 @@ def _insert_incremental_knowledge(
                 occurred_start_at=event.timestamp,
                 occurred_end_at=event.timestamp,
                 metadata={
-                    "derived_by": "deterministic-asset-classifier-v1",
+                    "derived_by": "deterministic-user-signal-v2",
                     "event_id": event.event_id,
+                    "retrieval_eligible": True,
                     "incremental_append": True,
                     "ingest_build_id": build_id,
                 },
@@ -887,6 +1156,10 @@ def _insert_incremental_knowledge(
         if turn.turn_id not in turn_ids:
             continue
         events = events_by_turn.get(turn.turn_id, [])
+        retrieval_echo, history_event_ids = history_retrieval_turn(events)
+        user_assertion_only = history_user_assertion_eligible(
+            turn.user_text, retrieval_echo
+        )
         evidence_refs = list(
             dict.fromkeys(
                 evidence_by_event[event.event_id][0]
@@ -912,10 +1185,18 @@ def _insert_incremental_knowledge(
             scope_id=parsed.thread_id,
             scope_type="thread",
             scope_title=parsed.title,
-            category="turn_summary",
+            category="user_context" if user_assertion_only else "turn_summary",
             text=_turn_text(turn, events),
-            status="executed" if turn.status == "complete" else turn.status,
-            status_group="executed" if turn.status == "complete" else "uncertain",
+            status=(
+                "stated_intent"
+                if user_assertion_only
+                else ("executed" if turn.status == "complete" else turn.status)
+            ),
+            status_group=(
+                "planned"
+                if user_assertion_only
+                else ("executed" if turn.status == "complete" else "uncertain")
+            ),
             evidence_refs=evidence_refs,
             source_path=_source_uri(snapshot.source.source_id),
             source_locator=f"turn[{turn.turn_seq}]",
@@ -926,6 +1207,10 @@ def _insert_incremental_knowledge(
                 "turn_id": turn.turn_id,
                 "turn_seq": turn.turn_seq,
                 "source_status": turn.status,
+                "retrieval_echo": retrieval_echo,
+                "retrieval_echo_event_ids": sorted(history_event_ids),
+                "history_user_assertion_only": user_assertion_only,
+                "promotion_eligible": not retrieval_echo or user_assertion_only,
                 "incremental_append": True,
                 "ingest_build_id": build_id,
             },
@@ -1005,7 +1290,7 @@ def insert_parsed_thread(
                 scope_type="thread",
                 scope_title=parsed.title,
                 category=asset_type,
-                text=event.text,
+                text=_deterministic_asset_text(event),
                 status=status,
                 status_group=status_group,
                 evidence_refs=[evidence_id],
@@ -1015,8 +1300,9 @@ def insert_parsed_thread(
                 occurred_start_at=event.timestamp,
                 occurred_end_at=event.timestamp,
                 metadata={
-                    "derived_by": "deterministic-asset-classifier-v1",
+                    "derived_by": "deterministic-user-signal-v2",
                     "event_id": event.event_id,
+                    "retrieval_eligible": True,
                     **ingest_metadata,
                 },
             )
@@ -1029,6 +1315,10 @@ def insert_parsed_thread(
     fact_evidence: list[str] = []
     for turn in parsed.turns:
         events = events_by_turn.get(turn.turn_id, [])
+        retrieval_echo, history_event_ids = history_retrieval_turn(events)
+        user_assertion_only = history_user_assertion_eligible(
+            turn.user_text, retrieval_echo
+        )
         evidence_refs = [
             evidence_by_event[event.event_id][0]
             for event in events
@@ -1044,10 +1334,18 @@ def insert_parsed_thread(
             scope_id=parsed.thread_id,
             scope_type="thread",
             scope_title=parsed.title,
-            category="turn_summary",
+            category="user_context" if user_assertion_only else "turn_summary",
             text=_turn_text(turn, events),
-            status="executed" if turn.status == "complete" else turn.status,
-            status_group="executed" if turn.status == "complete" else "uncertain",
+            status=(
+                "stated_intent"
+                if user_assertion_only
+                else ("executed" if turn.status == "complete" else turn.status)
+            ),
+            status_group=(
+                "planned"
+                if user_assertion_only
+                else ("executed" if turn.status == "complete" else "uncertain")
+            ),
             evidence_refs=evidence_refs,
             source_path=_source_uri(snapshot.source.source_id),
             source_locator=f"turn[{turn.turn_seq}]",
@@ -1058,6 +1356,10 @@ def insert_parsed_thread(
                 "turn_id": turn.turn_id,
                 "turn_seq": turn.turn_seq,
                 "source_status": turn.status,
+                "retrieval_echo": retrieval_echo,
+                "retrieval_echo_event_ids": sorted(history_event_ids),
+                "history_user_assertion_only": user_assertion_only,
+                "promotion_eligible": not retrieval_echo or user_assertion_only,
                 **ingest_metadata,
             },
         )
@@ -1512,6 +1814,7 @@ def insert_model_ledger_items(
                 "ingest_build_id": build_id,
                 "supporting_record_ids": supporting,
                 "method": "incremental-ledger-v1",
+                "promotion_policy": "evidence-fence-v1",
             },
         )
         inserted.append(record_id)
@@ -1542,6 +1845,61 @@ def mark_model_consolidated(
         )
 
 
+def supersede_noncanonical_overviews(
+    connection: sqlite3.Connection,
+    *,
+    scope_id: str,
+    current_record_id: str,
+    build_id: str = "",
+) -> list[str]:
+    rows = connection.execute(
+        "SELECT record_id,metadata_json FROM knowledge WHERE scope_id=? "
+        "AND tier='overview' AND record_id!=? AND valid_to IS NULL",
+        (scope_id, current_record_id),
+    ).fetchall()
+    if not rows:
+        return []
+    now = utc_now()
+    superseded: list[str] = []
+    for row in rows:
+        record_id = str(row["record_id"])
+        if build_id:
+            _archive_record_version(connection, record_id, build_id)
+        metadata = _parsed_json(str(row["metadata_json"]), {})
+        metadata["superseded_by_record_id"] = current_record_id
+        metadata["superseded_at"] = now
+        connection.execute(
+            "UPDATE knowledge SET valid_to=?,indexed_at=?,metadata_json=? WHERE record_id=?",
+            (now, now, canonical_json(metadata), record_id),
+        )
+        relation_id = stable_id(
+            "relation", current_record_id, "supersedes", record_id
+        )
+        connection.execute(
+            "INSERT OR REPLACE INTO knowledge_relations("
+            "relation_id,source_record_id,relation_type,target_record_id,"
+            "evidence_refs_json,confidence,created_at,metadata_json) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (
+                relation_id,
+                current_record_id,
+                "supersedes",
+                record_id,
+                "[]",
+                "deterministic",
+                now,
+                canonical_json(
+                    {
+                        "method": "overview-lifecycle-v1",
+                        "build_id": build_id,
+                    }
+                ),
+            ),
+        )
+        superseded.append(record_id)
+    return superseded
+
+
 def apply_model_scope_summary(
     connection: sqlite3.Connection,
     *,
@@ -1557,10 +1915,17 @@ def apply_model_scope_summary(
     if scope is None:
         raise KeyError(scope_id)
     overview_record_id = stable_id("record", "overview", scope_id)
+    superseded_overviews = supersede_noncanonical_overviews(
+        connection,
+        scope_id=scope_id,
+        current_record_id=overview_record_id,
+        build_id=build_id,
+    )
     allowed_records = {
         str(row[0])
         for row in connection.execute(
-            "SELECT record_id FROM knowledge WHERE scope_id=? AND tier IN ('fact_block','core','ledger','overview')",
+            "SELECT record_id FROM knowledge WHERE scope_id=? AND valid_to IS NULL "
+            "AND tier IN ('fact_block','core','ledger','overview')",
             (scope_id,),
         )
         if str(row[0]) != overview_record_id
@@ -1572,7 +1937,8 @@ def apply_model_scope_summary(
             allowed_records.update(
                 str(row[0])
                 for row in connection.execute(
-                    f"SELECT record_id FROM knowledge WHERE scope_id IN ({placeholders}) AND tier IN ('overview','ledger','fact_block')",
+                    f"SELECT record_id FROM knowledge WHERE scope_id IN ({placeholders}) "
+                    "AND valid_to IS NULL AND tier IN ('overview','ledger','fact_block')",
                     thread_ids,
                 )
             )
@@ -1731,4 +2097,8 @@ def apply_model_scope_summary(
             },
         )
         accepted_assets += 1
-    return {"claims": len(clean_claims), "assets": accepted_assets}
+    return {
+        "claims": len(clean_claims),
+        "assets": accepted_assets,
+        "superseded_overviews": len(superseded_overviews),
+    }

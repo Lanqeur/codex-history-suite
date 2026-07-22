@@ -153,7 +153,15 @@ fork 的物化源中；Codex 可能按当前有效分支过滤已回滚或中止
 先 dry-run，告诉我新增、追加、改写和删除的会话数量；等我确认后再执行。
 ```
 
-第一次增量更新后，建议运行 `audit --equivalence`：规范来源、解析事件、Evidence、确定性 core/fact 与 artifact 必须等价；模型派生层的代际差异会单独报告。
+第一次增量更新后，建议先确认额外完整参考库的峰值空间，再运行 `audit --equivalence --confirm-full-reference`：规范来源、解析事件、Evidence、确定性 core/fact 与 artifact 必须等价；模型派生层的代际差异会单独报告。
+
+如果多次增量后发现最近工具输出、历史查询结果或重复总览挤占高层检索，先运行：
+
+```bash
+python3 scripts/codex_history.py repair --audit-pollution --json
+```
+
+审阅总费用和峰值磁盘后，再运行 `repair --repair-pollution --max-cost-cny N --json`。该流程只在候选库清理派生污染并重建索引，原始会话、Evidence 与 artifact 不会被改写。
 
 ## 9. 模型摘要与可选语义检索
 

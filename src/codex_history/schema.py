@@ -387,6 +387,12 @@ CREATE INDEX IF NOT EXISTS artifact_observations_artifact_idx
     ON artifact_observations(artifact_sha256);
 CREATE INDEX IF NOT EXISTS artifact_observations_checkpoint_idx
     ON artifact_observations(repository_checkpoint_id);
+CREATE INDEX IF NOT EXISTS artifact_paths_sha256_idx
+    ON artifact_paths(sha256);
+CREATE INDEX IF NOT EXISTS scope_threads_thread_idx
+    ON scope_threads(thread_id,ordinal,scope_id);
+CREATE INDEX IF NOT EXISTS evidence_item_idx
+    ON evidence(item_id);
 
 CREATE TABLE IF NOT EXISTS semantic_documents(
     document_id TEXT PRIMARY KEY,
@@ -719,6 +725,17 @@ def rebuild_fts(connection: sqlite3.Connection) -> None:
         connection.execute(f"INSERT INTO {name}({name}) VALUES('rebuild')")
     connection.execute("INSERT INTO artifact_fts(artifact_fts) VALUES('rebuild')")
     connection.commit()
+
+
+def suspend_knowledge_fts_triggers(connection: sqlite3.Connection) -> None:
+    """Pause external-content FTS maintenance during a controlled bulk rewrite."""
+    for name, _columns, _source_columns, _tokenizer in FTS_TABLES:
+        for suffix in ("ai", "ad", "au"):
+            connection.execute(f"DROP TRIGGER IF EXISTS {name}_{suffix}")
+
+
+def restore_knowledge_fts_triggers(connection: sqlite3.Connection) -> None:
+    _create_fts(connection)
 
 
 def schema_version(connection: sqlite3.Connection) -> int:

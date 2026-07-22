@@ -15,6 +15,7 @@ from .artifacts import inspect_artifact_closure
 from .config import ProfileConfig, config_path, ensure_profile_dirs, resolve_summarization
 from .estimate import actual_managed_storage, estimate_build
 from .knowledge import (
+    append_parsed_thread,
     delete_thread,
     hydrate_parsed_thread,
     insert_parsed_thread,
@@ -23,14 +24,27 @@ from .knowledge import (
     rebuild_family_scopes,
     refresh_evidence_rollups,
 )
+from .operations import (
+    prune_profile_builds,
+    require_resource_preflight,
+    resource_preflight,
+    usage_summary,
+)
 from .parser import parse_snapshot
-from .schema import connect, initialize, rebuild_fts
+from .schema import (
+    connect,
+    initialize,
+    rebuild_fts,
+    restore_knowledge_fts_triggers,
+    suspend_knowledge_fts_triggers,
+)
 from .source import (
     SourceCandidate,
     SourceChange,
     classify_changes,
     discover_sources,
     previous_sources,
+    snapshot_appended_source,
     snapshot_source,
 )
 from .util import (
@@ -140,6 +154,7 @@ def plan(config: ProfileConfig, *, mode: str) -> dict[str, Any]:
                 "SELECT COUNT(*),COALESCE(SUM(length(text)),0) FROM knowledge "
                 "WHERE tier='fact_block' "
                 "AND COALESCE(json_extract(metadata_json,'$.incremental_append'),0)=1 "
+                "AND COALESCE(json_extract(metadata_json,'$.promotion_eligible'),1)!=0 "
                 "AND COALESCE(json_extract(metadata_json,'$.model_consolidated_build_id'),'')=''"
             ).fetchone()
             pending_model_records = int(pending_row[0])
@@ -149,6 +164,7 @@ def plan(config: ProfileConfig, *, mode: str) -> dict[str, Any]:
                 for row in connection.execute(
                     "SELECT DISTINCT scope_id FROM knowledge WHERE tier='fact_block' "
                     "AND COALESCE(json_extract(metadata_json,'$.incremental_append'),0)=1 "
+                    "AND COALESCE(json_extract(metadata_json,'$.promotion_eligible'),1)!=0 "
                     "AND COALESCE(json_extract(metadata_json,'$.model_consolidated_build_id'),'')=''"
                 )
             }
@@ -252,6 +268,12 @@ def plan(config: ProfileConfig, *, mode: str) -> dict[str, Any]:
     token_estimate = estimate["tokens"]
     cost_estimate = estimate["cost_cny"]
     storage_estimate = estimate["storage"]
+    resources = resource_preflight(
+        config,
+        database=database,
+        estimate=estimate,
+        operation=mode,
+    )
     summary_tokens = token_estimate["summary"]
     return {
         "schema_version": "codex-history-plan-v1",
@@ -304,6 +326,8 @@ def plan(config: ProfileConfig, *, mode: str) -> dict[str, Any]:
             storage_estimate["low_bytes"],
             storage_estimate["upper_bytes"],
         ],
+        "resource_preflight": resources,
+        "usage_ledger": usage_summary(config),
         "estimate": estimate,
         "changes": [_change_public(change) for change in changes],
         "sources": [_source_public(source) for source in sources],
@@ -400,7 +424,7 @@ def _new_database(
     build_dir = config.builds_dir / build_id
     build_dir.mkdir(parents=True, exist_ok=False)
     database = build_dir / "codex_history.sqlite3"
-    if kind in {"incremental", "hydrate", "compact", "artifact"}:
+    if kind in {"incremental", "hydrate", "compact", "artifact", "delta", "repair"}:
         parent = active_database(config)
         if not parent:
             raise RuntimeError("Incremental update requires an active build")
@@ -428,6 +452,326 @@ def _new_database(
     )
     connection.commit()
     return database, connection
+
+
+def pollution_repair_plan(config: ProfileConfig) -> dict[str, Any]:
+    ensure_profile_dirs(config)
+    database = active_database(config)
+    if not database:
+        raise RuntimeError("Pollution repair requires an active build")
+    from .pollution import pollution_audit
+
+    connection = connect(database, readonly=True)
+    try:
+        audit = pollution_audit(connection)
+        pending_row = connection.execute(
+            "SELECT COUNT(*),COALESCE(SUM(length(text)),0) FROM knowledge "
+            "WHERE tier='fact_block' "
+            "AND COALESCE(json_extract(metadata_json,'$.incremental_append'),0)=1 "
+            "AND COALESCE(json_extract(metadata_json,'$.promotion_eligible'),1)!=0 "
+            "AND COALESCE(json_extract(metadata_json,'$.model_consolidated_build_id'),'')=''"
+        ).fetchone()
+        pending_threads = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT DISTINCT scope_id FROM knowledge WHERE tier='fact_block' "
+                "AND COALESCE(json_extract(metadata_json,'$.incremental_append'),0)=1 "
+                "AND COALESCE(json_extract(metadata_json,'$.promotion_eligible'),1)!=0 "
+                "AND COALESCE(json_extract(metadata_json,'$.model_consolidated_build_id'),'')=''"
+            )
+        }
+        from .summarize import _affected_scopes
+
+        affected = _affected_scopes(connection, pending_threads)
+        affected_scope_ids = [str(row["scope_id"]) for row in affected]
+        writer_context_chars = 0
+        if affected_scope_ids:
+            placeholders = ",".join("?" for _ in affected_scope_ids)
+            writer_context_chars = int(
+                connection.execute(
+                    f"SELECT COALESCE(SUM(length(text)),0) FROM knowledge "
+                    f"WHERE scope_id IN ({placeholders}) "
+                    "AND tier IN ('ledger','overview')",
+                    affected_scope_ids,
+                ).fetchone()[0]
+            )
+    finally:
+        connection.close()
+    semantic_bytes = 0
+    semantic_root = config.root / "semantic/chroma"
+    if semantic_root.is_dir():
+        semantic_bytes = sum(
+            path.stat().st_size for path in semantic_root.rglob("*") if path.is_file()
+        )
+    free_bytes = shutil.disk_usage(config.root).free
+    required_free_bytes = (
+        database.stat().st_size + semantic_bytes + config.runtime_min_free_bytes
+    )
+    pending_fact_blocks = int(pending_row[0])
+    fact_chars = int(pending_row[1])
+    estimated_summary_input_tokens = max(0, fact_chars // 3 * 2)
+    estimated_summary_output_tokens = max(0, int(estimated_summary_input_tokens * 0.10))
+    estimated_reducer_cost = (
+        estimated_summary_input_tokens / 1_000_000 * config.summary_input_price_cny
+        + estimated_summary_output_tokens / 1_000_000 * config.summary_output_price_cny
+    )
+    affected_scope_count = len(affected_scope_ids)
+    estimated_writer_input_tokens = (
+        writer_context_chars // 2
+        + estimated_summary_output_tokens
+        + affected_scope_count * 1_500
+    )
+    estimated_writer_output_tokens = affected_scope_count * 3_500
+    estimated_writer_cost = (
+        estimated_writer_input_tokens / 1_000_000 * config.writer_input_price_cny
+        + estimated_writer_output_tokens / 1_000_000 * config.writer_output_price_cny
+    )
+    estimated_embedding_tokens = (
+        estimated_summary_output_tokens + estimated_writer_output_tokens
+        if config.embedding_enabled
+        else 0
+    )
+    estimated_embedding_cost = (
+        estimated_embedding_tokens
+        / 1_000_000
+        * config.embedding_input_price_cny
+    )
+    estimated_total_cost = (
+        estimated_reducer_cost + estimated_writer_cost + estimated_embedding_cost
+    )
+    return {
+        "schema_version": "codex-history-pollution-repair-plan-v1",
+        "created_at": utc_now(),
+        "database": str(database),
+        "active_build_id": (active_info(config) or {}).get("build_id"),
+        "audit": audit,
+        "work_required": bool(audit["repair_required"]),
+        "pending_model_fact_blocks": pending_fact_blocks,
+        "estimated_summary_input_tokens_upper_bound": estimated_summary_input_tokens,
+        "estimated_summary_output_tokens": estimated_summary_output_tokens,
+        "affected_scope_count": affected_scope_count,
+        "writer_context_chars": writer_context_chars,
+        "estimated_writer_input_tokens_upper_bound": estimated_writer_input_tokens,
+        "estimated_writer_output_tokens": estimated_writer_output_tokens,
+        "estimated_reducer_cost_cny": round(estimated_reducer_cost, 6),
+        "estimated_writer_cost_cny": round(estimated_writer_cost, 6),
+        "estimated_embedding_cost_cny": round(estimated_embedding_cost, 6),
+        "estimated_summary_cost_cny": round(
+            estimated_reducer_cost + estimated_writer_cost, 6
+        ),
+        "estimated_cost_cny": round(estimated_total_cost, 6),
+        "resource_preflight": {
+            "passed": free_bytes >= required_free_bytes,
+            "free_bytes": free_bytes,
+            "required_free_bytes": required_free_bytes,
+            "database_clone_bytes": database.stat().st_size,
+            "semantic_clone_bytes": semantic_bytes,
+        },
+        "summarization": resolve_summarization(config),
+    }
+
+
+def repair_knowledge_pollution(
+    config: ProfileConfig,
+    *,
+    promote: bool = True,
+    max_cost_cny: float | None,
+) -> dict[str, Any]:
+    ensure_profile_dirs(config)
+    with file_lock(config.lock_path):
+        repair_plan = pollution_repair_plan(config)
+        if not repair_plan["work_required"]:
+            return {"status": "clean", "plan": repair_plan}
+        if not repair_plan["resource_preflight"]["passed"]:
+            raise RuntimeError("Insufficient free space for a rollback-safe pollution repair")
+        if (
+            repair_plan["pending_model_fact_blocks"]
+            and repair_plan["summarization"]["effective_mode"] != "openai-compatible"
+        ):
+            raise RuntimeError(
+                "Pollution repair requires configured model summarization; refusing a lossy extractive repair"
+            )
+        if max_cost_cny is None and repair_plan["estimated_cost_cny"] > 0:
+            raise RuntimeError(
+                "Pollution repair can call paid APIs; pass an explicit --max-cost-cny limit"
+            )
+        if (
+            max_cost_cny is not None
+            and repair_plan["estimated_cost_cny"] > max_cost_cny
+        ):
+            raise RuntimeError(
+                f"Estimated repair cost {repair_plan['estimated_cost_cny']:.6f} CNY "
+                f"exceeds limit {max_cost_cny:.6f} CNY"
+            )
+
+        current = active_info(config) or {}
+        build_id = _build_id("pollution-repair")
+        build_dir = config.builds_dir / build_id
+        manifest_path = build_dir / "source-manifest.json"
+        database, connection = _new_database(
+            config,
+            build_id,
+            "repair",
+            str(current.get("build_id") or "") or None,
+            manifest_path,
+        )
+        run = RunState(config, build_id, "repair", build_dir)
+        semantic_candidate: Path | None = None
+        try:
+            from .pollution import (
+                finalize_pollution_repair,
+                pollution_audit,
+                prepare_pollution_repair,
+            )
+            from .summarize import summarize_incremental
+
+            with run.stage(connection, "discover") as report:
+                atomic_write_json(
+                    manifest_path,
+                    {
+                        "schema_version": "codex-history-pollution-repair-manifest-v1",
+                        "build_id": build_id,
+                        "created_at": utc_now(),
+                        "parent_build_id": current.get("build_id"),
+                        "source_database": repair_plan["database"],
+                        "before": repair_plan["audit"],
+                    },
+                )
+                report.update(repair_plan["audit"])
+            with run.stage(connection, "snapshot") as report:
+                report.update(
+                    {
+                        "rollback_safe": True,
+                        "parent_build_retained": True,
+                        "database_clone": str(database),
+                    }
+                )
+            with run.stage(connection, "ingest") as report:
+                suspend_knowledge_fts_triggers(connection)
+                report["knowledge_fts_triggers_suspended"] = True
+                preparation = prepare_pollution_repair(
+                    connection, build_id=build_id
+                )
+                report.update(preparation)
+            with run.stage(connection, "lineage") as report:
+                report.update(
+                    {
+                        "preserved_raw_evidence": True,
+                        "preserved_canonical_events": True,
+                        "preserved_artifacts": True,
+                    }
+                )
+            with run.stage(connection, "summarize") as report:
+                report.update(
+                    summarize_incremental(
+                        config,
+                        connection,
+                        build_id=build_id,
+                        max_cost_cny=max_cost_cny,
+                    )
+                )
+            with run.stage(connection, "index") as report:
+                affected_scopes = list(
+                    run.data["stages"]["ingest"]["report"].get(
+                        "affected_scopes", []
+                    )
+                )
+                report.update(
+                    finalize_pollution_repair(
+                        connection,
+                        build_id=build_id,
+                        affected_scopes=affected_scopes,
+                    )
+                )
+                report["relations"] = rebuild_conservative_relations(connection)
+                restore_knowledge_fts_triggers(connection)
+                rebuild_fts(connection)
+                report["knowledge_fts_rebuilt_from_authority"] = True
+                semantic_report: dict[str, Any] = {"enabled": False}
+                if config.embedding_enabled:
+                    from .semantic import refresh_embeddings
+
+                    semantic_candidate = _prepare_semantic_candidate(config, build_dir)
+                    summary_cost = float(
+                        run.data["stages"]["summarize"]["report"].get(
+                            "cost_cny", 0.0
+                        )
+                    )
+                    semantic_report = refresh_embeddings(
+                        config,
+                        connection,
+                        max_cost_cny=(
+                            None
+                            if max_cost_cny is None
+                            else max(0.0, max_cost_cny - summary_cost)
+                        ),
+                        chroma_path=semantic_candidate,
+                    )
+                report["semantic"] = semantic_report
+                report["knowledge"] = connection.execute(
+                    "SELECT COUNT(*) FROM knowledge"
+                ).fetchone()[0]
+            with run.stage(connection, "audit") as report:
+                audit = audit_connection(connection)
+                closure, _ = inspect_artifact_closure(
+                    config, database, verify_hashes=False
+                )
+                audit["artifact_closure"] = closure
+                audit["passed"] = audit["passed"] and closure["complete"]
+                audit["pollution"] = pollution_audit(connection)
+                report.update(audit)
+                atomic_write_json(build_dir / "audit.json", audit)
+                if not audit["passed"] or audit["pollution"]["repair_required"]:
+                    raise RuntimeError("Pollution repair audit failed")
+                connection.execute(
+                    "UPDATE builds SET logical_digest=? WHERE build_id=?",
+                    (audit["logical_digest"]["sha256"], build_id),
+                )
+            with run.stage(connection, "promote") as report:
+                if promote:
+                    completion = connection.execute(
+                        "SELECT value FROM metadata WHERE key='knowledge_completion_status'"
+                    ).fetchone()
+                    report.update(
+                        _promote(
+                            config,
+                            build_id,
+                            database,
+                            semantic_candidate=semantic_candidate,
+                            completion_status=str(completion[0]) if completion else "unknown",
+                        )
+                    )
+                    promoted_at = report["promoted_at"]
+                else:
+                    report["promoted"] = False
+                    promoted_at = None
+                connection.execute(
+                    "UPDATE builds SET status='complete',completed_at=?,promoted_at=? WHERE build_id=?",
+                    (utc_now(), promoted_at, build_id),
+                )
+            run.complete()
+            summary = run.data["stages"]["summarize"]["report"]
+            semantic = run.data["stages"]["index"]["report"].get("semantic", {})
+            return {
+                "status": "complete",
+                "kind": "pollution-repair",
+                "build_id": build_id,
+                "database": str(database),
+                "promoted": promote,
+                "plan": repair_plan,
+                "usage": {
+                    "summary_input_tokens": int(summary.get("input_tokens", 0)),
+                    "summary_cached_input_tokens": int(summary.get("cached_input_tokens", 0)),
+                    "summary_output_tokens": int(summary.get("output_tokens", 0)),
+                    "embedding_input_tokens": int(semantic.get("input_tokens", 0)),
+                    "summary_cost_cny": float(summary.get("cost_cny", 0.0)),
+                    "embedding_cost_cny": float(semantic.get("actual_cost_cny", 0.0)),
+                },
+                "audit": read_json(build_dir / "audit.json"),
+                "run": read_json(run.path),
+            }
+        finally:
+            connection.close()
 
 
 def _prepare_semantic_candidate(config: ProfileConfig, build_dir: Path) -> Path:
@@ -491,7 +835,10 @@ def _promote(
         raise
     else:
         shutil.rmtree(semantic_previous, ignore_errors=True)
-    return payload
+    return {
+        **payload,
+        "retention": prune_profile_builds(config, active_build_id=build_id),
+    }
 
 
 def _build_locked(
@@ -502,6 +849,7 @@ def _build_locked(
     max_cost_cny: float | None,
 ) -> dict[str, Any]:
     build_plan = plan(config, mode="full" if kind == "full" else "incremental")
+    require_resource_preflight(build_plan["resource_preflight"])
     if max_cost_cny is None and build_plan["estimated_cost_cny"] > 0:
         raise RuntimeError(
             "This build can call paid APIs. Review `codex-history plan --json` and pass an "
@@ -568,9 +916,38 @@ def _build_locked(
             )
 
         with run.stage(connection, "snapshot") as report:
+            append_reused_prefix = 0
+            append_snapshot_fallback = 0
             for change in changes:
                 if change.kind in {"added", "appended", "rewritten"} and change.source:
-                    snapshot = snapshot_source(config, change.source)
+                    snapshot = None
+                    if (
+                        hydrated_incremental
+                        and change.kind == "appended"
+                        and change.previous
+                        and change.source.declared_size_bytes is None
+                    ):
+                        old_chunks = [
+                            dict(row)
+                            for row in connection.execute(
+                                "SELECT chunk_index,chunk_sha256,size_bytes,cas_relative_path "
+                                "FROM source_chunks WHERE source_id=? ORDER BY chunk_index",
+                                (change.source.source_id,),
+                            )
+                        ]
+                        try:
+                            snapshot = snapshot_appended_source(
+                                config,
+                                change.source,
+                                change.previous,
+                                old_chunks,
+                            )
+                        except (OSError, ValueError):
+                            append_snapshot_fallback += 1
+                        else:
+                            append_reused_prefix += 1
+                    if snapshot is None:
+                        snapshot = snapshot_source(config, change.source)
                     snapshots[change.source.source_id] = snapshot
             manifest = read_json(manifest_path)
             manifest["snapshots"] = [
@@ -596,6 +973,8 @@ def _build_locked(
                             for chunk in snapshot.chunks
                         }
                     ),
+                    "append_reused_prefix": append_reused_prefix,
+                    "append_snapshot_fallback": append_snapshot_fallback,
                 }
             )
 
@@ -609,6 +988,8 @@ def _build_locked(
                 "parse_errors": 0,
                 "artifacts": 0,
                 "preserved_curated_scopes": 0,
+                "append_fast_path": 0,
+                "append_fallback": 0,
             }
             for change in changes:
                 if change.kind == "unchanged":
@@ -624,16 +1005,66 @@ def _build_locked(
                             )
                         continue
                     snapshot = snapshots[change.source.source_id]
+                    prior_chunk = connection.execute(
+                        "SELECT cas_relative_path FROM source_chunks WHERE source_id=? ORDER BY chunk_index DESC LIMIT 1",
+                        (change.source.source_id,),
+                    ).fetchone()
                     insert_source_snapshot(connection, snapshot)
-                    parsed = parse_snapshot(snapshot, config)
-                    inserted = hydrate_parsed_thread(
-                        connection,
-                        snapshot,
-                        parsed,
-                        config,
-                        index_new_knowledge=True,
-                        build_id=build_id,
-                    )
+                    inserted = None
+                    if change.kind == "appended" and old:
+                        last_turn = connection.execute(
+                            "SELECT turn_seq,status FROM turns WHERE thread_id=? ORDER BY turn_seq DESC LIMIT 1",
+                            (change.source.thread_id,),
+                        ).fetchone()
+                        prior_ended_newline = False
+                        if prior_chunk:
+                            previous_chunk = config.snapshots_dir / str(prior_chunk[0])
+                            if previous_chunk.is_file() and previous_chunk.stat().st_size:
+                                with previous_chunk.open("rb") as handle:
+                                    handle.seek(-1, os.SEEK_END)
+                                    prior_ended_newline = handle.read(1) == b"\n"
+                        if last_turn and str(last_turn["status"]) in {"complete", "aborted"} and prior_ended_newline:
+                            prior_counts = {
+                                str(row[0]): int(row[1])
+                                for row in connection.execute(
+                                    "SELECT content_sha256,COUNT(*) FROM canonical_events WHERE thread_id=? GROUP BY content_sha256",
+                                    (change.source.thread_id,),
+                                )
+                            }
+                            connection.execute("SAVEPOINT append_fast_path")
+                            try:
+                                parsed = parse_snapshot(
+                                    snapshot,
+                                    config,
+                                    start_line=int(old.get("line_count") or 0),
+                                    start_byte=int(old.get("snapshot_size_bytes") or 0),
+                                    next_turn_seq=int(last_turn["turn_seq"]) + 1,
+                                    prior_content_occurrences=prior_counts,
+                                )
+                                inserted = append_parsed_thread(
+                                    connection,
+                                    snapshot,
+                                    parsed,
+                                    config,
+                                    build_id=build_id,
+                                )
+                            except (sqlite3.IntegrityError, ValueError):
+                                connection.execute("ROLLBACK TO append_fast_path")
+                                connection.execute("RELEASE append_fast_path")
+                                inserted = None
+                                totals["append_fallback"] += 1
+                            else:
+                                connection.execute("RELEASE append_fast_path")
+                    if inserted is None:
+                        parsed = parse_snapshot(snapshot, config)
+                        inserted = hydrate_parsed_thread(
+                            connection,
+                            snapshot,
+                            parsed,
+                            config,
+                            index_new_knowledge=True,
+                            build_id=build_id,
+                        )
                     totals["threads"] += 1
                     totals["preserved_curated_scopes"] += int(
                         inserted.pop("preserved_curated_scope", 0)
@@ -878,6 +1309,17 @@ def _build_locked(
                 (utc_now(), promoted_at, build_id),
             )
         run.complete()
+        retention = (
+            dict(run.data["stages"]["promote"].get("report", {}).get("retention") or {})
+            if promote
+            else {
+                "retained_builds": config.runtime_retained_builds,
+                "removed_build_ids": [],
+                "removed_build_count": 0,
+                "reclaimed_bytes": 0,
+                "skipped": "build was not promoted",
+            }
+        )
         summary_report = run.data["stages"]["summarize"].get("report", {})
         semantic_report = (
             run.data["stages"]["index"].get("report", {}).get("semantic", {})
@@ -915,6 +1357,7 @@ def _build_locked(
             "storage": actual_managed_storage(config, database),
             "audit": read_json(build_dir / "audit.json"),
             "run": read_json(run.path),
+            "retention": retention,
         }
     finally:
         connection.close()
@@ -1645,7 +2088,193 @@ def update_incremental(
         )
 
 
-def equivalence_audit(config: ProfileConfig, *, keep_reference: bool = False) -> dict[str, Any]:
+def resume_latest_failed(
+    config: ProfileConfig,
+    *,
+    max_cost_cny: float | None = None,
+) -> dict[str, Any]:
+    failed: list[tuple[str, dict[str, Any]]] = []
+    if config.runs_dir.is_dir():
+        for path in config.runs_dir.glob("*/run.json"):
+            value = read_json(path, {}) or {}
+            if value.get("status") == "failed":
+                failed.append((str(value.get("started_at") or ""), value))
+    if not failed:
+        raise RuntimeError("No failed build run is available to resume")
+    previous = max(failed, key=lambda item: item[0])[1]
+    result = update_incremental(config, max_cost_cny=max_cost_cny)
+    result["recovery"] = {
+        "mode": "checkpoint-assisted-retry",
+        "resumed_from_build_id": previous.get("build_id"),
+        "reused": [
+            "content-addressed transcript snapshots",
+            "artifact CAS",
+            "successful model response cache entries",
+        ],
+        "note": (
+            "Database stage transactions restart in a fresh candidate; immutable CAS and paid "
+            "model results are reused so a failed candidate cannot contaminate the active build."
+        ),
+    }
+    return result
+
+
+def apply_precomputed_delta_build(
+    config: ProfileConfig,
+    *,
+    authority_stream: Path,
+    artifact_stream: Path | None,
+    target_source_generation_id: str,
+    target_artifact_metadata_digest: str,
+    target_logical_digest: str,
+    semantic_files: list[tuple[Path, str]],
+    semantic_deleted_paths: list[str],
+    promote: bool = True,
+) -> dict[str, Any]:
+    """Apply producer-computed authority and vector state without model calls."""
+    from .artifact_transfer import apply_artifact_stream, artifact_metadata_summary
+    from .authority_transfer import apply_authority_stream
+    from .coverage import source_inventory
+
+    ensure_profile_dirs(config)
+    with file_lock(config.lock_path):
+        build_plan = plan(config, mode="incremental")
+        require_resource_preflight(build_plan["resource_preflight"])
+        parent = str((active_info(config) or {}).get("build_id") or "") or None
+        build_id = _build_id("delta")
+        build_dir = config.builds_dir / build_id
+        manifest_path = build_dir / "source-manifest.json"
+        database, connection = _new_database(
+            config,
+            build_id,
+            "delta",
+            parent,
+            manifest_path,
+        )
+        semantic_candidate: Path | None = None
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            with authority_stream.open("rb") as stream:
+                authority = apply_authority_stream(connection, stream)
+            artifact: dict[str, Any] | None = None
+            if artifact_stream is not None:
+                with artifact_stream.open("rb") as stream:
+                    artifact = apply_artifact_stream(connection, stream)
+            inventory = source_inventory(connection)
+            if inventory["generation_id"] != target_source_generation_id:
+                raise RuntimeError(
+                    "Precomputed authority patch did not converge to the target source generation"
+                )
+            artifact_summary = artifact_metadata_summary(connection)
+            if artifact_stream is not None and (
+                artifact_summary["digest"] != target_artifact_metadata_digest
+            ):
+                raise RuntimeError(
+                    "Precomputed artifact stream did not converge to the target metadata digest: "
+                    f"expected {target_artifact_metadata_digest}, observed {artifact_summary['digest']}"
+                )
+            violations = list(connection.execute("PRAGMA foreign_key_check"))
+            if violations:
+                raise RuntimeError(
+                    f"Precomputed delta introduced {len(violations)} foreign-key violations"
+                )
+            integrity = str(connection.execute("PRAGMA quick_check").fetchone()[0])
+            if integrity != "ok":
+                raise RuntimeError(f"Precomputed delta quick check failed: {integrity}")
+            connection.execute(
+                "UPDATE builds SET logical_digest=?,notes_json=? WHERE build_id=?",
+                (
+                    target_logical_digest,
+                    canonical_json(
+                        {
+                            "pipeline_version": PIPELINE_VERSION,
+                            "applied_via": "precomputed-delta-v1",
+                            "authority_digest": authority["digest"],
+                            "artifact_digest": artifact_summary["digest"],
+                        }
+                    ),
+                    build_id,
+                ),
+            )
+            connection.commit()
+
+            if semantic_files or semantic_deleted_paths:
+                semantic_candidate = _prepare_semantic_candidate(config, build_dir)
+                for archive_path in semantic_deleted_paths:
+                    prefix = "data/semantic/chroma/"
+                    if archive_path.startswith(prefix):
+                        (semantic_candidate / archive_path.removeprefix(prefix)).unlink(
+                            missing_ok=True
+                        )
+                for local_path, archive_path in semantic_files:
+                    prefix = "data/semantic/chroma/"
+                    if not archive_path.startswith(prefix):
+                        continue
+                    target = semantic_candidate / archive_path.removeprefix(prefix)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(local_path, target)
+
+            promoted_at = None
+            active_payload: dict[str, Any] = {}
+            if promote:
+                active_payload = _promote(
+                    config,
+                    build_id,
+                    database,
+                    semantic_candidate=semantic_candidate,
+                )
+                promoted_at = active_payload["promoted_at"]
+            connection.execute(
+                "UPDATE builds SET status='complete',completed_at=?,promoted_at=? WHERE build_id=?",
+                (utc_now(), promoted_at, build_id),
+            )
+            connection.commit()
+            retention = (
+                dict(active_payload.get("retention") or {})
+                if promote
+                else {"skipped": "build was not promoted", "reclaimed_bytes": 0}
+            )
+            return {
+                "status": "complete",
+                "mode": "precomputed-delta-v1",
+                "build_id": build_id,
+                "database": str(database),
+                "promoted": promote,
+                "authority": authority,
+                "artifact": artifact,
+                "artifact_metadata": artifact_summary,
+                "semantic_changed_files": len(semantic_files),
+                "semantic_deleted_files": len(semantic_deleted_paths),
+                "usage": {"total_api_tokens": 0, "total_cost_cny": 0.0},
+                "audit": {
+                    "passed": True,
+                    "mode": "quick-precomputed-delta",
+                    "sqlite_quick_check": integrity,
+                    "foreign_key_violations": 0,
+                    "declared_logical_digest": target_logical_digest,
+                },
+                "retention": retention,
+                "active": active_payload,
+            }
+        except BaseException:
+            connection.rollback()
+            shutil.rmtree(build_dir, ignore_errors=True)
+            raise
+        finally:
+            connection.close()
+
+
+def equivalence_audit(
+    config: ProfileConfig,
+    *,
+    keep_reference: bool = False,
+    confirm_full_reference: bool = False,
+) -> dict[str, Any]:
+    if not confirm_full_reference:
+        raise RuntimeError(
+            "Equivalence audit creates a complete reference database and can require roughly "
+            "one additional active-database footprint. Re-run with --confirm-full-reference."
+        )
     active = active_database(config)
     if not active:
         raise RuntimeError("No active build to compare")

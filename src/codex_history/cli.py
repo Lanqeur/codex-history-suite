@@ -31,6 +31,9 @@ from .pipeline import (
     equivalence_audit,
     hydrate_canonical_baseline,
     plan,
+    pollution_repair_plan,
+    repair_knowledge_pollution,
+    resume_latest_failed,
     update_incremental,
 )
 from .schema import connect
@@ -128,12 +131,30 @@ def _management_parser() -> argparse.ArgumentParser:
 
     audit = subparsers.add_parser("audit", help="audit integrity or full/incremental equivalence")
     audit.add_argument("--equivalence", action="store_true")
+    audit.add_argument(
+        "--confirm-full-reference",
+        action="store_true",
+        help="confirm the extra full reference build required by equivalence audit",
+    )
     audit.add_argument("--keep-reference", action="store_true")
     audit.add_argument("--verify-artifact-hashes", action="store_true")
     audit.add_argument("--json", action="store_true")
 
     repair = subparsers.add_parser("repair", help="inspect failed runs and remove stale locks")
     repair.add_argument("--clear-stale-lock", action="store_true")
+    repair.add_argument("--resume-latest", action="store_true")
+    repair.add_argument(
+        "--audit-pollution",
+        action="store_true",
+        help="inspect recursive retrieval and deterministic Asset pollution without modifying data",
+    )
+    repair.add_argument(
+        "--repair-pollution",
+        action="store_true",
+        help="build and optionally promote a rollback-safe cleaned knowledge generation",
+    )
+    repair.add_argument("--no-promote", action="store_true")
+    repair.add_argument("--max-cost-cny", type=float, default=None)
     repair.add_argument("--json", action="store_true")
 
     migrate = subparsers.add_parser("migrate", help="import a legacy Codex History SQLite database")
@@ -188,6 +209,14 @@ def _management_parser() -> argparse.ArgumentParser:
         "--artifacts", choices=("none", "referenced", "all"), default="referenced"
     )
     delta_export.add_argument("--without-model-cache", action="store_true")
+    delta_export.add_argument(
+        "--format",
+        dest="format_version",
+        choices=(1, 2),
+        type=int,
+        default=2,
+        help="delta format; v2 is streaming and includes precomputed state",
+    )
     delta_export.add_argument("--json", action="store_true")
 
     library_import = library_commands.add_parser(
@@ -713,6 +742,7 @@ def main(argv: list[str] | None = None) -> int:
                     base=args.base,
                     artifact_mode=args.artifacts,
                     include_model_cache=not args.without_model_cache,
+                    format_version=args.format_version,
                 ),
                 as_json=args.json,
             )
@@ -854,7 +884,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "audit":
         if args.equivalence:
-            value = equivalence_audit(config, keep_reference=args.keep_reference)
+            value = equivalence_audit(
+                config,
+                keep_reference=args.keep_reference,
+                confirm_full_reference=args.confirm_full_reference,
+            )
         else:
             database = active_database(config)
             if not database:
@@ -871,6 +905,24 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "repair":
         if args.clear_stale_lock and config.lock_path.exists():
             config.lock_path.unlink()
+        if args.resume_latest:
+            value = resume_latest_failed(
+                config,
+                max_cost_cny=args.max_cost_cny,
+            )
+            _print(value, as_json=args.json)
+            return 0
+        if args.audit_pollution:
+            _print(pollution_repair_plan(config), as_json=args.json)
+            return 0
+        if args.repair_pollution:
+            value = repair_knowledge_pollution(
+                config,
+                promote=not args.no_promote,
+                max_cost_cny=args.max_cost_cny,
+            )
+            _print(value, as_json=args.json)
+            return 0
         value = _status(config)
         value["repair_note"] = (
             "stale lock cleared" if args.clear_stale_lock else "no state was modified"

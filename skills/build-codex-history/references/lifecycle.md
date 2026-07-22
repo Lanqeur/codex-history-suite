@@ -23,6 +23,8 @@ Every stage is recorded in both `runs/<build-id>/run.json` and `stage_checkpoint
 
 Only affected threads are reparsed. Curated family membership is preserved; deterministic families are rebuilt when needed. New fact blocks receive ingest provenance and remain pending until every Record ID passes model coverage validation. Old ledgers remain immutable, old overviews are versioned, and only affected thread/family overviews advance. Content-addressed Evidence, model responses, artifacts, and embeddings are reused. Snapshot reads are bounded to the discovery-time byte size, so a live transcript that grows during the run becomes a clean append on the next update instead of creating an inconsistent fingerprint.
 
+History retrieval is an evidence boundary. Query calls and returned context remain in Core/Evidence for traceability but are excluded from fact-block promotion. Pure retrieval synthesis cannot recursively become new knowledge; long first-party user statements are retained without the assistant's retrieved restatement, and mixed turns retain non-History execution evidence. Model Overview updates reuse one canonical Record ID. Any imported noncanonical current Overview is versioned, assigned `valid_to`, and linked through `supersedes` instead of remaining a second current top-tier record.
+
 When `auto` lacks model configuration, ingest and promotion may still stage searchable deterministic evidence, but `active.json` and SQLite metadata report `pending_model_consolidation`. With no later source changes, `update` returns that status until both models are available; once configured, the same command processes the pending backlog.
 
 ## Artifact-Only Builds
@@ -41,6 +43,6 @@ bytes that existed at the earlier occurrence time.
 
 ## Release Invariant
 
-`audit --equivalence` performs a clean extractive full build from the same current sources and requires exact equality for canonical sources, parsed events/turns, Evidence occurrences, deterministic core/fact records, and artifacts. Model ledgers, Overview text, claims, semantic documents, and other generation-specific derived layers are reported separately as `derived_layer_differences`; they are not expected to be byte-identical between staged incremental consolidation and a one-shot rebuild.
+`audit --equivalence --confirm-full-reference` performs a clean extractive full build from the same current sources and requires exact equality for canonical sources, parsed events/turns, Evidence occurrences, deterministic core/fact records, and artifacts. The explicit flag acknowledges roughly one extra active-database footprint; resource preflight still applies. Model ledgers, Overview text, claims, semantic documents, and other generation-specific derived layers are reported separately as `derived_layer_differences`; they are not expected to be byte-identical between staged incremental consolidation and a one-shot rebuild.
 
 A mismatch is not advisory. Inspect the per-table row count and SHA-256 differences before accepting an incremental implementation change.

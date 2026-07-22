@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from .config import ProfileConfig, configured_secret, resolve_summarization
+from .operations import append_usage_event
 from .knowledge import (
     apply_model_scope_summary,
     insert_model_ledger_items,
@@ -267,6 +268,22 @@ def _call_cached(
     cache_path = config.cache_dir / "model" / f"{key}.json"
     cached = read_json(cache_path)
     if cached:
+        append_usage_event(
+            config,
+            {
+                "kind": "summary",
+                "stage": stage,
+                "provider": settings.provider,
+                "model": settings.model,
+                "cache_key": key,
+                "cache_hit": True,
+                "status": "reused",
+                "input_tokens": 0,
+                "cached_input_tokens": 0,
+                "output_tokens": 0,
+                "cost_cny": 0.0,
+            },
+        )
         return cached["response"], {"cache_key": key, "cache_hit": True, "cost_cny": 0.0}
     prompt = instruction + "\n\nINPUT:\n" + json.dumps(payload, ensure_ascii=False)
     estimated_input = max(1, len(SYSTEM_PROMPT + prompt) // 2)
@@ -298,6 +315,21 @@ def _call_cached(
                 "cost_cny": actual,
             }
             atomic_write_json(cache_path, record)
+            append_usage_event(
+                config,
+                {
+                    "kind": "summary",
+                    "stage": stage,
+                    "provider": settings.provider,
+                    "model": settings.model,
+                    "cache_key": key,
+                    "cache_hit": False,
+                    "status": "complete",
+                    "attempt": attempt,
+                    "cost_cny": actual,
+                    **usage,
+                },
+            )
             return response, {
                 "cache_key": key,
                 "cache_hit": False,
@@ -307,6 +339,22 @@ def _call_cached(
             }
         except Exception as error:
             last_error = error
+            append_usage_event(
+                config,
+                {
+                    "kind": "summary",
+                    "stage": stage,
+                    "provider": settings.provider,
+                    "model": settings.model,
+                    "cache_key": key,
+                    "cache_hit": False,
+                    "status": "failed",
+                    "attempt": attempt,
+                    "estimated_input_tokens": estimated_input,
+                    "reserved_cost_cny": reserve,
+                    "error": f"{type(error).__name__}: {error}",
+                },
+            )
             if attempt < 3:
                 time.sleep(min(8.0, 0.5 * 2 ** (attempt - 1)) + random.random() * 0.2)
     assert last_error is not None
@@ -320,7 +368,9 @@ def _scope_records(connection: sqlite3.Connection, scope_id: str) -> list[dict[s
     if scope["scope_type"] == "thread":
         rows = connection.execute(
             "SELECT record_id,text,status_group,category,occurred_start_at,occurred_end_at "
-            "FROM knowledge WHERE scope_id=? AND tier='fact_block' ORDER BY occurred_start_at,record_id",
+            "FROM knowledge WHERE scope_id=? AND tier='fact_block' "
+            "AND COALESCE(json_extract(metadata_json,'$.promotion_eligible'),1)!=0 "
+            "ORDER BY occurred_start_at,record_id",
             (scope_id,),
         )
     else:
@@ -473,6 +523,7 @@ def pending_model_fact_blocks(connection: sqlite3.Connection) -> list[dict[str, 
             "SELECT record_id,scope_id,text,status_group,category,occurred_start_at,occurred_end_at "
             "FROM knowledge WHERE tier='fact_block' "
             "AND COALESCE(json_extract(metadata_json,'$.incremental_append'),0)=1 "
+            "AND COALESCE(json_extract(metadata_json,'$.promotion_eligible'),1)!=0 "
             "AND COALESCE(json_extract(metadata_json,'$.model_consolidated_build_id'),'')='' "
             "ORDER BY occurred_start_at,record_id"
         )
@@ -572,14 +623,28 @@ def _validate_writer_response(
             if not isinstance(item, dict):
                 raise ValueError(f"incremental writer {section} item is not an object")
             refs = {str(value) for value in item.get("record_ids") or []}
-            if not refs or not refs <= allowed_ids:
-                raise ValueError(f"incremental writer {section} item has invalid references")
+            if not refs:
+                raise ValueError(
+                    f"incremental writer {section} item has no record references"
+                )
+            invalid_refs = sorted(refs - allowed_ids)
+            if invalid_refs:
+                preview = ", ".join(invalid_refs[:8])
+                suffix = "" if len(invalid_refs) <= 8 else f" (+{len(invalid_refs) - 8} more)"
+                raise ValueError(
+                    f"incremental writer {section} item references IDs outside the "
+                    f"ledger allowlist: {preview}{suffix}"
+                )
             if section == "claims":
                 claim_text = _claim_text_from_overview(
                     normalized["overview"], str(item.get("text") or "")
                 )
                 if claim_text is None:
-                    raise ValueError("incremental writer claim text is absent from overview")
+                    preview = normalize_text(str(item.get("text") or ""))[:160]
+                    raise ValueError(
+                        "incremental writer claim text is absent from overview: "
+                        f"{preview}"
+                    )
                 item["text"] = claim_text
     return normalized
 
@@ -883,9 +948,19 @@ def summarize_incremental(
                 writer_settings,
                 stage="incremental-writer-repair",
                 instruction=INCREMENTAL_WRITER_PROMPT
-                + "\nRepair the invalid response and keep every assertion evidence-linked.",
+                + "\nRepair the invalid response and keep every assertion evidence-linked. "
+                "For claims[].record_ids and assets[].record_ids, copy IDs exactly and only "
+                "from allowed_record_ids. Never reuse IDs found inside previous_overview, "
+                "ledger text, source evidence, or invalid_response. Remove an assertion when "
+                "none of the allowed ledger records supports it. Before responding, verify "
+                "that every returned record_ids array is a non-empty subset of "
+                "allowed_record_ids. Every claims[].text value must also be copied verbatim "
+                "as one contiguous substring of overview, including its punctuation; the "
+                "simplest valid structure is to compose overview by concatenating the exact "
+                "claim texts.",
                 payload={
                     **payload,
+                    "allowed_record_ids": sorted(allowed_ids),
                     "invalid_response": response,
                     "repair_error": str(first_error),
                 },

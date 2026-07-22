@@ -169,6 +169,23 @@ def test_writer_claim_reconciles_only_terminal_punctuation():
         _validate_writer_response(response, {"record-1"})
 
 
+def test_writer_validation_reports_ids_outside_ledger_allowlist():
+    import pytest
+
+    response = {
+        "overview": "The baseline was verified.",
+        "claims": [
+            {
+                "text": "The baseline was verified.",
+                "record_ids": ["record-1", "record-from-source-evidence"],
+            }
+        ],
+        "assets": [],
+    }
+    with pytest.raises(ValueError, match="record-from-source-evidence"):
+        _validate_writer_response(response, {"record-1"})
+
+
 def test_evidence_linked_model_summary_and_cache(portable_profile, monkeypatch):
     config, codex_home = portable_profile
     monkeypatch.setenv("FAKE_KEY", "test-key")
@@ -312,7 +329,12 @@ def test_model_pipeline_incremental_equals_clean_full(portable_profile, monkeypa
     second = update_incremental(model_config, max_cost_cny=1.0)
     assert second["run"]["stages"]["summarize"]["report"]["api_calls"] == 4
     assert len(calls) == 6
-    assert equivalence_audit(model_config)["passed"] is True
+    ledger = plan(model_config, mode="incremental")["usage_ledger"]
+    assert ledger["successful_attempts"] == 6
+    assert ledger["input_tokens"] == 120
+    assert ledger["output_tokens"] == 60
+    assert ledger["cost_cny"] > 0
+    assert equivalence_audit(model_config, confirm_full_reference=True)["passed"] is True
     assert len(calls) >= 6
 
 
